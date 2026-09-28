@@ -27,6 +27,7 @@ class Theme:
     def stylesheet(self):
         return f"""
 QMainWindow, QWidget {{ background: {self.panel}; color: {self.text}; }}
+QFrame#copyPeriodBanner {{ background: {self.selected}; border: 1px solid {self.marker_a}; border-radius: 5px; }}
 QToolBar {{ border: 0; spacing: 5px; padding: 6px; }}
 QToolButton, QPushButton {{ background: {self.alternate}; border: 1px solid {self.grid}; padding: 6px 10px; border-radius: 4px; }}
 QToolButton:hover, QPushButton:hover {{ background: {self.selected}; }}
@@ -41,6 +42,7 @@ QScrollBar::handle {{ background: {self.muted}; min-width: 24px; min-height: 24p
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QMenu {{ border: 1px solid {self.grid}; }}
 QMenu::item:selected {{ background: {self.selected}; }}
+QMenu::separator {{ height: 1px; background: {self.muted}; margin: 5px 0px; }}
 QToolTip {{ color: {self.text}; background: {self.panel}; border: 1px solid {self.muted}; }}
 """
 

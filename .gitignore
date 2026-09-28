@@ -4,6 +4,7 @@ __pycache__/
 artifacts/
 .viewer-settings.json
 .viewer-settings.json.tmp
+/LOCAL_CHANGES.md
 /waveform.csv
 /captures/
 /build/

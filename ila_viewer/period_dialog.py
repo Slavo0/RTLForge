@@ -1,62 +1,70 @@
 # Copyright 2026 Вячеслав Рудаков
 # SPDX-License-Identifier: Apache-2.0
 
-"""One-time, per-session sample-phase and period calibration."""
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QPushButton, QVBoxLayout
+"""Inline controls for calibrating the copy period on the waveform."""
+
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 
-class CopyPeriodDialog(QDialog):
+class CopyPeriodBanner(QFrame):
+    confirmed = Signal(int, int)
+    cancelled = Signal()
+
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self.view = view
-        self.setWindowTitle("Настройка периода копирования")
-        self.setModal(False)
-        self.resize(440, 190)
+        self.setObjectName("copyPeriodBanner")
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "Один раз за запуск отметьте на диаграмме две одинаковые точки соседних "
-            "периодов. Разница отсчётов задаст период и фазу выборки."
-        ))
-        self.marker1 = QPushButton("1. Поставить первую точку")
-        self.marker2 = QPushButton("2. Поставить вторую точку")
-        self.marker2.setEnabled(False)
-        self.marker1.clicked.connect(lambda: self.view.request_period_marker(1))
-        self.marker2.clicked.connect(lambda: self.view.request_period_marker(2))
-        layout.addWidget(self.marker1)
-        layout.addWidget(self.marker2)
-        self.status = QLabel("Сначала нажмите первую кнопку, затем щёлкните по диаграмме.")
+        layout.setContentsMargins(12, 8, 12, 8)
+        self.headline = QLabel("● РЕЖИМ ВЫБОРА ПЕРИОДА — шаг 1 из 2")
+        self.headline.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(self.headline)
+        instruction = QLabel("На диаграмме: ЛКМ — точка 1 (начало), Shift+ЛКМ — точка 2 (конец полного периода). Линии можно перетаскивать. Ctrl+колесо меняет масштаб.")
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        self.status = QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        view.periodMarkerPlaced.connect(self.marker_placed)
-        self.finished.connect(self.cleanup)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Масштаб диаграммы:"))
+        zoom_in = QPushButton("+")
+        zoom_in.clicked.connect(lambda: view.zoom_toolbar(0.5))
+        controls.addWidget(zoom_in)
+        zoom_out = QPushButton("−")
+        zoom_out.clicked.connect(lambda: view.zoom_toolbar(2))
+        controls.addWidget(zoom_out)
+        controls.addStretch(1)
+        self.confirm_button = QPushButton("Подтвердить период")
+        self.confirm_button.clicked.connect(self.confirm)
+        controls.addWidget(self.confirm_button)
+        cancel_button = QPushButton("Отмена")
+        cancel_button.clicked.connect(self.cancelled)
+        controls.addWidget(cancel_button)
+        layout.addLayout(controls)
+        view.periodMarkerPlaced.connect(self.update_status)
+        self.update_status()
 
-    def cleanup(self, _result):
-        self.view.request_period_marker(None)
+    def update_status(self, *_):
+        first, second = self.view.period_markers
+        if first is None or second is None or first == second:
+            self.status.setText("Пока не выбраны две разные точки. Нажмите ЛКМ для точки 1 и Shift+ЛКМ для точки 2.")
+            self.confirm_button.setEnabled(False)
+            return
+        period = abs(second - first)
+        self.status.setText(
+            f"Точка 1: {first:,}  →  точка 2: {second:,}  ·  ПОЛНЫЙ ПЕРИОД: {period:,} отсчётов. "
+            "После проверки нажмите «Подтвердить период»."
+        )
+        self.confirm_button.setEnabled(True)
+
+    def confirm(self):
+        first, second = self.view.period_markers
+        if first is not None and second is not None and first != second:
+            self.confirmed.emit(abs(second - first), first)
+
+    def detach(self):
         try:
-            self.view.periodMarkerPlaced.disconnect(self.marker_placed)
+            self.view.periodMarkerPlaced.disconnect(self.update_status)
         except RuntimeError:
             pass
-        self.deleteLater()
-
-    def marker_placed(self, marker, sample):
-        if marker == 1:
-            self.marker1.setText(f"1. Первая точка: отсчёт {sample:,} ✓")
-            self.marker2.setEnabled(True)
-            self.status.setText("Нажмите кнопку 2 и щёлкните в той же фазе следующего периода.")
-            return
-        first = self.view.period_markers[0]
-        if first is None or first == sample:
-            self.view.period_markers[1] = None
-            self.view.request_period_marker(2)
-            self.marker2.setText("2. Поставить вторую точку")
-            self.status.setText("Точки должны быть на разных отсчётах. Поставьте вторую точку ещё раз.")
-            self.view.viewport().update()
-            return
-        self.accepted_period = abs(sample - first)
-        self.phase = first
-        self.marker2.setText(f"2. Вторая точка: отсчёт {sample:,} ✓")
-        self.status.setText(f"Период: {self.accepted_period:,} отсчётов.")
-        self.accept()

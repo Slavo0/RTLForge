@@ -10,13 +10,14 @@ import json
 from dataclasses import replace
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QFont, QFontDatabase, QContextMenuEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QInputDialog, QSpinBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialogButtonBox, QInputDialog, QSpinBox
 
 from ila_viewer.bits import BitExpansionService
 from ila_viewer.data import LoadCancelled, load_csv
@@ -28,7 +29,8 @@ from ila_viewer.preferences import PreferencesStore, ViewerPreferences
 from ila_viewer.copying import CopyValuesService
 from ila_viewer.conditions import ConditionCompiler
 from ila_viewer.copy_dialog import CopyConditionDialog
-from ila_viewer.period_dialog import CopyPeriodDialog
+from ila_viewer.period_dialog import CopyPeriodBanner
+from ila_viewer.highlights import HighlightGroup, HighlightModel, HighlightService
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -117,6 +119,8 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(tree.move(group, b, "inside"))
         group.expanded = False
         self.assertEqual([r.node for r in tree.rows()], [group, a])
+        self.assertEqual([r.node for r in tree.rows("c")], [group])
+        group.expanded = True
         self.assertEqual([r.node for r in tree.rows("c")], [group, c])
         divider = tree.create_divider("TX", group)
         tree.remove_container(group)
@@ -130,7 +134,7 @@ class ModelTests(unittest.TestCase):
         path.write_text('{"name_width": -1, "value_width": "bad", "global_radix": "???", "fill_high": "false"}')
         prefs = store.load()
         self.assertEqual(prefs.name_width, 100)
-        self.assertEqual(prefs.value_width, 120)
+        self.assertEqual(prefs.value_width, 90)
         self.assertEqual(prefs.global_radix, "HEX")
         self.assertFalse(prefs.fill_high)
         path.write_text("invalid json")
@@ -169,8 +173,7 @@ class ModelTests(unittest.TestCase):
             view.preferences.copy_separator = key
             self.assertEqual(service.build(service.snapshot(view)).text, expected)
         view.preferences.copy_separator = "space"
-        view.preferences.copy_samples = "changes"
-        self.assertEqual(service.build(service.snapshot(view)).text, "43 A6")
+        self.assertEqual(service.build(service.snapshot(view, samples="changes")).text, "43 A6")
         with self.assertRaises(LoadCancelled):
             service.build(service.snapshot(view), cancel=lambda: True)
         service.MAX_CHARACTERS = 2
@@ -212,6 +215,73 @@ class ModelTests(unittest.TestCase):
         view.cursor_a, view.cursor_b = 0, 4
         request = service.snapshot(view, period=2, phase=1)
         self.assertEqual(service.build(request).text, "01 03")
+
+    def test_copy_without_b_per_signal_radix_bit_ranges_and_unique_sort(self):
+        cap = self.capture("bus[7:0],flag\nRadix - HEX,HEX\nA1,1\nA1,0\n23,1\n11,0\n")
+        tree = SignalTree(cap.signals)
+        bus, flag = tree.root.children
+        view = SimpleNamespace(capture=cap, cursor_a=2, cursor_b=None,
+                               selected_nodes=[bus, flag], preferences=ViewerPreferences(),
+                               display_radix=lambda trace: "HEX")
+        service = CopyValuesService()
+        options = {bus.id: {"radix": "HEX", "bits": "7-4 2-1"},
+                   flag.id: {"radix": "UNSIGNED", "bits": ""}}
+        request = service.snapshot(view, channel_options=options)
+        self.assertEqual((request.start, request.end, request.exclude_sample), (0, 3, None))
+        self.assertEqual(service.build(request).text, "28 28 09 04\n1 0 1 0")
+        unique = service.snapshot(view, channel_options=options, samples="unique", sort="ascending")
+        self.assertEqual(service.build(unique).text, "04 09 28\n0 1")
+        self.assertEqual(service.parse_bit_ranges("7-4 2-1", list(range(7, -1, -1))), (7, 6, 5, 4, 2, 1))
+        with self.assertRaisesRegex(ValueError, "вне шины"):
+            service.parse_bit_ranges("9-7", list(range(7, -1, -1)))
+
+    def test_search_wrap_can_be_disabled(self):
+        cap = self.capture("sig\nRadix - HEX\n0\n1\n0\n")
+        signal = cap.signals[0]
+        self.assertIsNone(signal.search(1, 2, 1, wrap=False))
+        self.assertEqual(signal.search(1, 2, 1, wrap=True), (1, True))
+
+    def test_period_phase_extends_back_before_first_marker(self):
+        _, view, service = self.copy_fixture("bus[7:0]\nRadix - HEX\n00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n")
+        view.cursor_a, view.cursor_b = 0, 9
+        # Markers 1=5 and 2=8 define phase 2 modulo 3, including sample 2.
+        self.assertEqual(service.build(service.snapshot(view, period=3, phase=5)).text, "02 05 08")
+
+    def test_highlight_intervals_are_disk_backed_clipped_and_cancellable(self):
+        cap = self.capture("ready,bus[7:0]\nRadix - HEX,HEX\n0,00\n1,F4\n0,00\n0,00\n0,00\n1,F4\n0,00\n0,00\n")
+        self.assertEqual([ConditionCompiler(cap.signals).compile("ready").matches(i) for i in range(cap.count)],
+                         [False, True, False, False, False, True, False, False])
+        condition = ConditionCompiler(cap.signals).compile("ready && bus = F4")
+        service = HighlightService()
+        ranges = service.build(cap, condition, 0, 7, 2, 1)
+        self.assertEqual(ranges.count, 2)
+        self.assertEqual(list(ranges.visible(2, 6)), [(2.0, 3.0), (5.0, 6.0)])
+        path = ranges.path
+        model = HighlightModel()
+        group = HighlightGroup("test", "ready && bus = F4", "#ffcc74", ranges, 0, 7, 2, 1)
+        model.add(group)
+        model.remove(group)
+        self.assertFalse(path.exists())
+        with self.assertRaises(LoadCancelled):
+            service.build(cap, condition, 0, 7, 1, 0, cancel=lambda: True)
+        self.assertFalse(list(Path(cap.storage.name).glob("highlight_*.bin")))
+
+    def test_style_and_highlight_palette_preferences_roundtrip_without_groups(self):
+        path = Path(self.temp.name) / "preferences.json"
+        store = PreferencesStore(path)
+        prefs = ViewerPreferences(separate_signal_styles=True, fill_bus=True,
+                                  signal_colors={"dark": {"bus": "#abcdef", "bit": "#123456"}},
+                                  highlight_palette=["#ff0000", "#00ff00"],
+                                  highlight_opacities=[15, 72], restore_highlight_visibility=False)
+        store.save(prefs)
+        loaded = store.load()
+        self.assertEqual(loaded.signal_colors, prefs.signal_colors)
+        self.assertEqual(loaded.highlight_palette, prefs.highlight_palette)
+        self.assertEqual(loaded.highlight_opacities, [15, 72])
+        self.assertFalse(loaded.restore_highlight_visibility)
+        self.assertFalse(hasattr(loaded, "highlight_opacity"))
+        self.assertTrue(loaded.separate_signal_styles and loaded.fill_bus)
+        self.assertNotIn("groups", json.loads(path.read_text(encoding="utf-8")))
 
     def test_multi_move_is_atomic_and_preserves_order(self):
         cap = self.capture("a,b,c,d\nRadix - HEX,HEX,HEX,HEX\n0,1,0,1\n")
@@ -295,6 +365,104 @@ class InteractionTests(unittest.TestCase):
         QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p)
         self.assertIsNone(v.cursor_b)
         self.assertNotIn("B:", self.window.readout.text())
+
+    def test_waveform_click_selects_row_and_ctrl_toggles_without_shift_selection(self):
+        v = self.window.view
+        x = v.plot_left + 100
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, self.point(1, x))
+        self.assertEqual(v.selection.ids, {v.rows[1].node.id})
+        first_a = v.cursor_a
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier, self.point(3, x + 20))
+        self.assertEqual(v.selection.ids, {v.rows[1].node.id, v.rows[3].node.id})
+        self.assertNotEqual(v.cursor_a, first_a)
+        selected = set(v.selection.ids)
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier, self.point(2, x + 40))
+        self.assertEqual(v.selection.ids, selected)
+        self.assertIsNotNone(v.cursor_b)
+
+    def test_click_rounds_to_nearest_sample_and_period_uses_shift_for_second_marker(self):
+        v = self.window.view
+        v.set_range(0, 20)
+        x = lambda sample: round(v.sample_x(sample))
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         self.point(0, x(4.6)))
+        self.assertEqual(v.cursor_a, 5)
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
+                         self.point(0, x(7.6)))
+        self.assertEqual(v.cursor_b, 8)
+        self.assertTrue(v.begin_period_setup())
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         self.point(0, x(2.6)))
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
+                         self.point(0, x(6.6)))
+        self.assertEqual(v.period_markers, [3, 7])
+        self.assertEqual((v.cursor_a, v.cursor_b), (5, 8))
+        v.end_period_setup()
+
+    def test_ctrl_a_selects_names_or_full_waveform_by_last_interaction(self):
+        v = self.window.view
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, self.point(2))
+        QTest.keyClick(v, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(v.selection.ids, {row.node.id for row in v.rows if row.node.signal or row.node.kind == "group"})
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         self.point(2, v.plot_left + 100))
+        v.set_range(300, 100)
+        original_view = (v.left, v.span)
+        QTest.keyClick(v, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual((v.cursor_a, v.cursor_b), (0, v.capture.count))
+        self.assertEqual((v.left, v.span), original_view)
+        result = CopyValuesService().build(CopyValuesService().snapshot(v))
+        self.assertEqual(result.count, v.capture.count)
+
+    def test_last_csv_folder_and_refresh_read_changed_file(self):
+        w = self.window
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "capture.csv"
+            path.write_text("sig\nRadix - HEX\n0\n1\n", encoding="utf-8")
+            w.open_file(path)
+            self.wait()
+            self.assertEqual(w.capture.count, 2)
+            self.assertEqual(w.preferences.last_csv_directory, str(Path(folder).resolve()))
+            with patch("ila_viewer.window.QFileDialog.getOpenFileName", return_value=("", "")) as chooser:
+                w.choose_file()
+                self.assertEqual(chooser.call_args.args[2], str(Path(folder).resolve()))
+            path.write_text("sig\nRadix - HEX\n0\n1\n2\n", encoding="utf-8")
+            w.refresh_csv()
+            self.wait()
+            self.assertEqual(w.capture.count, 3)
+
+    def test_copy_name_and_displayed_value_from_context_column(self):
+        w, v = self.window, self.window.view
+        clipboard = SimpleNamespace(text="")
+        clipboard.write = lambda value: setattr(clipboard, "text", value)
+        w.clipboard = clipboard
+        v.selected = 2
+        v.context_column = "name"
+        menu = v.menus.build(v)
+        next(a for a in menu.actions() if a.text() == "Copy Name").trigger()
+        self.assertEqual(clipboard.text, v.row_name(v.current_node))
+        menu.deleteLater()
+        v.context_column = "value"
+        menu = v.menus.build(v)
+        next(a for a in menu.actions() if a.text() == "Copy Value").trigger()
+        self.assertEqual(clipboard.text, v.row_value(v.current_node))
+        menu.deleteLater()
+
+    def test_filter_does_not_expand_collapsed_bus(self):
+        v = self.window.view
+        bus = v.rows[2].node
+        v.toggle_node(bus)
+        self.wait()
+        self.assertTrue(bus.expanded)
+        v.filter_signals("data")
+        self.assertTrue(any(row.node.parent is bus for row in v.rows))
+        v.toggle_node(bus)
+        self.assertFalse(bus.expanded)
+        self.assertFalse(any(row.node.parent is bus for row in v.rows))
+        v.filter_signals("")
+        v.filter_signals("data")
+        self.assertFalse(bus.expanded)
+        self.assertFalse(any(row.node.parent is bus for row in v.rows))
 
     def test_mouse_expansion_drag_reorder_and_groups(self):
         v = self.window.view
@@ -451,6 +619,193 @@ class InteractionTests(unittest.TestCase):
                 other.close()
             # setUp cleanup may close the window again after TemporaryDirectory exits.
             w.preferences_store = PreferencesStore()
+
+    def test_theme_specific_bus_bit_colors_and_fill_preferences(self):
+        w, v = self.window, self.window.view
+        colors = {"dark": {"bus": "#ff0000", "bit": "#00ff00"},
+                  "light": {"bus": "#0000ff", "bit": "#ffff00"}}
+        bus = next(row.node.signal for row in v.rows if row.node.signal and row.node.signal.is_bus)
+        bit = next(row.node.signal for row in v.rows if row.node.signal and not row.node.signal.is_bus)
+        w.apply_preferences(replace(w.preferences, separate_signal_styles=True, fill_bus=True,
+                                    fill_high=False, signal_colors=colors))
+        self.assertEqual(v.signal_color(bus).name(), "#ff0000")
+        self.assertEqual(v.signal_color(bit).name(), "#00ff00")
+        w.apply_preferences(replace(w.preferences, theme="light"))
+        self.assertEqual(v.signal_color(bus).name(), "#0000ff")
+        self.assertEqual(v.signal_color(bit).name(), "#ffff00")
+        w.apply_preferences(replace(w.preferences, separate_signal_styles=False))
+        self.assertEqual(v.signal_color(bus).name(), v.signal_color(bit).name())
+        self.assertTrue(w.preferences.fill_bus)
+
+    def test_highlight_groups_panel_visibility_and_capture_reset(self):
+        w, v = self.window, self.window.view
+        v.set_cursor(0)
+        v.set_cursor(20, True)
+        w.copy_period, w.copy_phase = 2, 0
+
+        w.create_highlight()
+        dialog = w.active_editor
+        self.assertIsNotNone(dialog)
+        self.assertIsNone(dialog.color_button)
+        self.assertIsNone(dialog.opacity_box)
+        dialog.expression.setText("port0_rx_ready")
+        dialog.accept()
+        self.wait()
+        self.assertEqual(len(w.highlights.groups), 1)
+        group = w.highlights.groups[0]
+        self.assertGreater(group.intervals.count, 0)
+        self.assertTrue(w.highlight_panel.isVisible())
+        self.assertEqual(v.viewportMargins().bottom(), w.highlight_panel.height())
+        self.app.processEvents()
+        self.assertTrue(w.highlight_panel.findChild(QCheckBox).isVisible())
+        self.assertFalse(v.viewport().grab().isNull())
+        ARTIFACTS.mkdir(exist_ok=True)
+        self.assertTrue(w.grab().save(str(ARTIFACTS / "waveform-highlight-panel.png")))
+        x, y = round(v.sample_x(10)), v.viewport().height() - 30
+        highlighted = v.viewport().grab().toImage().pixelColor(x, y)
+        old_path, old_id = group.intervals.path, group.id
+
+        w.create_highlight(group)
+        dialog = w.active_editor
+        self.assertIsNotNone(dialog.color_button)
+        self.app.processEvents()
+        buttons = dialog.findChild(QDialogButtonBox)
+        self.assertLessEqual(buttons.mapTo(dialog, QPoint(0, buttons.height())).y(), dialog.height())
+        dialog.opacity_box.setValue(51)
+        dialog.name_edit.setText("Edited")
+        dialog.expression.setText("port0_rx_ready || port0_rx_re")
+        dialog.accept()
+        self.wait()
+        group = w.highlights.groups[0]
+        self.assertEqual((group.id, group.name), (old_id, "Edited"))
+        self.assertEqual(group.opacity, 51)
+        self.assertFalse(old_path.exists())
+        self.assertTrue(w.highlight_panel.isVisible())
+        self.assertEqual(v.viewportMargins().bottom(), w.highlight_panel.height())
+        toggle = w.highlight_panel._chips[group.id].enabled_box
+        QTest.mouseClick(toggle, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+        self.assertFalse(group.visible)
+        self.assertTrue(w.highlight_panel.isVisible())
+        self.assertTrue(w.highlight_panel.findChild(QCheckBox).isVisible())
+        self.assertNotEqual(v.viewport().grab().toImage().pixelColor(x, y), highlighted)
+        path = group.intervals.path
+        w.highlights.remove(group)
+        self.assertFalse(path.exists())
+        self.assertTrue(w.highlight_panel.isVisible())
+        self.assertEqual(v.viewportMargins().bottom(), w.highlight_panel.height())
+        w.apply_preferences(replace(w.preferences, hide_empty_highlight_panel=True))
+        self.assertEqual(v.viewportMargins().bottom(), 0)
+
+    def test_highlight_without_b_covers_capture_and_has_own_opacity(self):
+        w, v = self.window, self.window.view
+        w.copy_period, w.copy_phase = 1, 0
+        v.cursor_b = None
+        w.preferences.highlight_opacities[1] = 63
+        w.create_highlight()
+        dialog = w.active_editor
+        dialog.style_box.setCurrentIndex(1)
+        dialog.accept()
+        self.wait()
+        group = w.highlights.groups[0]
+        self.assertEqual((group.marker_a, group.marker_b, group.opacity), (0, w.capture.count, 63))
+        self.assertTrue(w.highlight_panel.isVisible())
+
+    def test_master_highlight_toggle_preserves_or_resets_individual_visibility(self):
+        w = self.window
+        from ila_viewer.highlights import HighlightIntervals
+        first = HighlightGroup("one", "", "#ff0000", HighlightIntervals(), 0, 2, 1, 0)
+        second = HighlightGroup("two", "", "#00ff00", HighlightIntervals(), 0, 2, 1, 0, visible=False)
+        w.highlights.add(first)
+        w.highlights.add(second)
+        w.highlight_panel.master_box.setChecked(False)
+        self.assertFalse(w.highlights.master_enabled)
+        w.highlight_panel.master_box.setChecked(True)
+        self.assertEqual([group.visible for group in w.highlights.groups], [True, False])
+        w.apply_preferences(replace(w.preferences, restore_highlight_visibility=False))
+        w.highlight_panel.master_box.setChecked(False)
+        w.highlight_panel.master_box.setChecked(True)
+        self.assertEqual([group.visible for group in w.highlights.groups], [True, True])
+
+    def test_refresh_keeps_compatible_colors_and_highlights(self):
+        w = self.window
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "capture.csv"
+            path.write_text("data[7:0],dead\nRadix - HEX,HEX\n01,1\n02,0\n03,1\n", encoding="utf-8")
+            w.open_file(path)
+            self.wait()
+            node = w.view.tree.root.children[0]
+            node.options.color = "#ff1234"
+            w.copy_period, w.copy_phase = 1, 0
+            w.create_highlight()
+            dialog = w.active_editor
+            dialog.expression.setText("dead")
+            dialog.accept()
+            self.wait()
+            self.assertEqual(len(w.highlights.groups), 1)
+            old_id = w.highlights.groups[0].id
+            path.write_text("data[7:0],dead\nRadix - HEX,HEX\n01,1\n02,1\n03,0\n04,1\n", encoding="utf-8")
+            w.refresh_csv()
+            self.wait()
+            self.assertEqual(w.view.tree.root.children[0].options.color, "#ff1234")
+            self.assertEqual(len(w.highlights.groups), 1)
+            self.assertEqual(w.highlights.groups[0].id, old_id)
+            self.assertEqual(w.highlights.groups[0].marker_b, 4)
+            path.write_text("data[7:0]\nRadix - HEX\n01\n02\n", encoding="utf-8")
+            w.refresh_csv()
+            self.wait()
+            self.assertEqual(len(w.highlights.groups), 0)
+
+    def test_copy_editor_allows_waveform_zoom_and_adding_signal(self):
+        w, v = self.window, self.window.view
+        w.copy_period = 1
+        w.copy_values()
+        dialog = w.active_editor
+        self.assertIsNotNone(dialog)
+        self.assertFalse(dialog.isModal())
+        self.assertGreaterEqual(dialog.signal_list.minimumHeight(), 300)
+        self.app.processEvents()
+        buttons = dialog.findChild(QDialogButtonBox)
+        self.assertLessEqual(buttons.mapTo(dialog, QPoint(0, buttons.height())).y(), dialog.height())
+        ARTIFACTS.mkdir(exist_ok=True)
+        self.assertTrue(dialog.grab().save(str(ARTIFACTS / "copy-editor.png")))
+        self.assertGreater(len(dialog.targets), len(dialog.selected_targets()))
+        v.set_range(0, 200)
+        v.zoom_toolbar(0.5)
+        self.assertEqual(v.span, 100)
+        extra = next(i for i in range(len(dialog.targets))
+                     if dialog.channels.item(i, 0).checkState() == Qt.CheckState.Unchecked)
+        dialog.channels.item(extra, 0).setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(len(dialog.selected_targets()), 2)
+        dialog.reject()
+
+    def test_value_search_keeps_focus_and_respects_loop_checkbox(self):
+        w, v = self.window, self.window.view
+        v.selected = 2
+        v.set_cursor(v.capture.count - 1)
+        w.search_edit.setText("001")
+        w.search_edit.setFocus()
+        w.loop_search.setChecked(False)
+        QTest.keyClick(w.search_edit, Qt.Key.Key_Return)
+        self.wait()
+        self.assertEqual(v.cursor_a, v.capture.count - 1)
+        w.loop_search.setChecked(True)
+        QTest.keyClick(w.search_edit, Qt.Key.Key_Return)
+        self.wait()
+        self.assertEqual(v.cursor_a, 0)
+        self.assertTrue(w.search_edit.hasFocus())
+        QTest.keyClick(w.search_edit, Qt.Key.Key_Return)
+        self.wait()
+        self.assertTrue(w.search_edit.hasFocus())
+
+    def test_toolbar_zoom_centers_on_marker_interval(self):
+        v = self.window.view
+        v.set_range(0, 200)
+        v.set_cursor(350)
+        v.set_cursor(450, True)
+        v.set_range(0, 200)
+        v.zoom_toolbar(0.5)
+        self.assertAlmostEqual(v.left + v.span / 2, 400)
 
     def test_independent_column_drag_double_click_and_marker_cursor(self):
         v = self.window.view
@@ -622,9 +977,8 @@ class InteractionTests(unittest.TestCase):
         selected = set(v.selection.ids)
         def copy_from_popup():
             popup = QApplication.activePopupWidget()
-            submenu = next(a.menu() for a in popup.actions() if a.text() == "Copy Values")
-            QTimer.singleShot(0, lambda: QApplication.activeModalWidget().accept())
-            next(a for a in submenu.actions() if a.text() == "Hexadecimal").trigger()
+            next(a for a in popup.actions() if a.text() == "Copy Values…").trigger()
+            w.active_editor.accept()
             popup.close()
         QTimer.singleShot(0, copy_from_popup)
         selected_row = next(i for i, row in enumerate(v.rows) if row.node is bus.children[1])
@@ -670,17 +1024,16 @@ class InteractionTests(unittest.TestCase):
         self.assertNotEqual(off.pixelColor(x, zero_y), on.pixelColor(x, zero_y))
         self.assertEqual(off.pixelColor(x, zero_y + 1), on.pixelColor(x, zero_y + 1))
 
-    def test_copy_preferences_tab_persists(self):
+    def test_copy_options_are_in_export_dialog(self):
         w = self.window
-        def choose():
-            dialog = QApplication.activeModalWidget()
-            dialog.separator_box.setCurrentIndex(dialog.separator_box.findData("comma"))
-            dialog.samples_box.setCurrentIndex(dialog.samples_box.findData("changes"))
-            dialog.accept()
-        QTimer.singleShot(0, choose)
-        w.show_appearance()
-        saved = w.preferences_store.load()
-        self.assertEqual((saved.copy_separator, saved.copy_samples), ("comma", "changes"))
+        from ila_viewer.copy_dialog import CopyOptionsDialog
+        dialog = CopyOptionsDialog(w.capture.signals, w.condition_compiler(),
+                                   w.copy_service.selected_targets(w.view), w.copy_service, w)
+        self.assertEqual(dialog.separator_box.currentData(), "space")
+        self.assertFalse(dialog.sort_box.isEnabled())
+        dialog.unique_box.setChecked(True)
+        self.assertTrue(dialog.sort_box.isEnabled())
+        dialog.close()
 
     def test_copy_picker_filters_names_and_inserts_trailing_space(self):
         signals = self.window.capture.signals
@@ -697,20 +1050,61 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual(dialog.expression.cursorPosition(), len(dialog.expression.text()))
         dialog.close()
 
-    def test_copy_period_dialog_captures_two_points_and_phase(self):
+    def test_copy_period_banner_drag_confirm_and_phase(self):
         v = self.window.view
         v.set_range(0, 20)
-        dialog = CopyPeriodDialog(v, self.window)
-        dialog.show()
-        QTest.mouseClick(dialog.marker1, Qt.MouseButton.LeftButton)
+        self.assertTrue(v.begin_period_setup())
+        banner = CopyPeriodBanner(v, self.window)
+        banner.show()
+        first = v.period_markers[0]
+        QTest.mousePress(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         self.point(0, round(v.sample_x(first))))
+        QTest.mouseMove(v.viewport(), self.point(0, round(v.sample_x(3))))
+        QTest.mouseRelease(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                           self.point(0, round(v.sample_x(3))))
+        self.assertEqual(v.period_markers[0], 3)
         QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                          self.point(0, round(v.sample_x(2))))
         self.assertEqual(v.period_markers[0], 2)
-        QTest.mouseClick(dialog.marker2, Qt.MouseButton.LeftButton)
-        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
                          self.point(0, round(v.sample_x(7)) + 1))
-        self.assertEqual(dialog.accepted_period, 5)
-        self.assertEqual(dialog.phase, 2)
+        values = []
+        banner.confirmed.connect(lambda period, phase: values.append((period, phase)))
+        self.assertTrue(banner.confirm_button.isEnabled(), v.period_markers)
+        self.assertTrue(banner.confirm_button.isVisible(), banner.geometry())
+        banner.confirm_button.click()
+        self.assertEqual(values, [(5, 2)])
+        self.assertEqual(v.cursor_b, None)
+        banner.detach()
+        banner.close()
+        v.end_period_setup()
+
+    def test_copy_period_reselect_keeps_markers_expression_and_prior_period_on_cancel(self):
+        w, v = self.window, self.window.view
+        v.set_cursor(1)
+        v.set_cursor(12, True)
+        original_markers = (v.cursor_a, v.cursor_b)
+        w.copy_values("HEX")
+        banner = w.copy_period_banner
+        self.assertIsNotNone(banner)
+        self.assertTrue(v.period_mode)
+        self.assertEqual((v.cursor_a, v.cursor_b), original_markers)
+        v.period_markers = [5, 8]
+        banner.update_status()
+
+        banner.confirm_button.click()
+        dialog = w.active_editor
+        self.assertIsInstance(dialog, CopyConditionDialog)
+        dialog.expression.setText("tx_ready")
+        dialog.period_button.click()
+        self.assertEqual(w.copy_period, 3)
+        self.assertEqual(w.copy_phase, 5)
+        self.assertIsNotNone(w.copy_period_banner)
+        self.assertEqual(w.pending_copy_expression, "tx_ready")
+        w.cancel_period_setup()
+        self.assertEqual(w.copy_period, 3)
+        self.assertFalse(v.period_mode)
+        self.assertEqual((v.cursor_a, v.cursor_b), original_markers)
 
 
 if __name__ == "__main__":

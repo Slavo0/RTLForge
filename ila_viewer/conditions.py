@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import re
 
 
-_TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|<=|>=|[()!~<>])|(?P<quoted>`[^`]+`)|(?P<word>[A-Za-z_][\w$]*(?:\[\d+(?::\d+)?\])?|0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+|[\da-fA-F]+))")
+_TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|<=|>=|[()!~<>=])|(?P<quoted>`[^`]+`)|(?P<word>[A-Za-z_][\w$]*(?:\[\d+(?::\d+)?\])?|0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+|[\da-fA-F]+))")
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,19 @@ class Condition:
     def __init__(self, expression, root):
         self.expression, self.root = expression, root
 
+    def signal_names(self):
+        names = set()
+        def visit(node):
+            if node[0] == "signal":
+                names.add(node[1].source.name)
+            elif node[0] == "not":
+                visit(node[1])
+            elif node[0] not in {"literal"}:
+                visit(node[1])
+                visit(node[2])
+        visit(self.root)
+        return frozenset(names)
+
     def matches(self, sample):
         def value(node):
             kind = node[0]
@@ -80,7 +93,7 @@ class Condition:
                         "<=": lambda: left <= right, ">=": lambda: left >= right}[kind]()
             except (TypeError, ValueError):
                 return False
-        return bool(value(self.root))
+        return _truth(value(self.root), sample)
 
 
 class ConditionCompiler:
@@ -146,8 +159,8 @@ class ConditionCompiler:
 
     def _compare(self):
         node = self._unary()
-        if self._peek("==", "!=", "<", ">", "<=", ">="):
-            op = self._take(); node = (op, node, self._unary())
+        if self._peek("=", "==", "!=", "<", ">", "<=", ">="):
+            op = self._take(); node = ("==" if op == "=" else op, node, self._unary())
         return node
 
     def _unary(self):

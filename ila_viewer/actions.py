@@ -140,21 +140,33 @@ class StructureActions(ContextActionProvider):
 
 class CopyActions(ContextActionProvider):
     def contribute(self, menu, view):
-        copy = menu.addMenu("Copy Values")
-        copy.setToolTipsVisible(True)
-        enabled = view.capture is not None and view.cursor_b is not None and bool(view.selected_signal_nodes)
-        copy.setEnabled(enabled)
-        copy.setToolTip("Выделите сигналы/биты и установите A и B (Shift + щелчок по диаграмме)")
-        choices = [("DEFAULT", "Как у сигнала / шины")] + [(f.key, f.label) for f in FORMATS.formats.values()]
-        for key, label in choices:
-            action = copy.addAction(label)
-            action.setToolTip(f"Скопировать значения A…B в буфер обмена: {label}")
-            action.triggered.connect(lambda checked=False, k=key: view.copyRequested.emit(k))
+        action = menu.addAction("Copy Values…", lambda: view.copyRequested.emit("DEFAULT"))
+        action.setEnabled(view.capture is not None and bool(view.selected_signal_nodes))
+
+
+class CellCopyActions(ContextActionProvider):
+    """Copy exactly what the user sees in the clicked Name or Value cell."""
+
+    def contribute(self, menu, view):
+        node = view.current_node
+        if not node:
+            return
+        if view.context_column == "name":
+            menu.addAction("Copy Name", lambda: view.cellCopyRequested.emit(view.row_name(node)))
+        elif view.context_column == "value":
+            menu.addAction("Copy Value", lambda: view.cellCopyRequested.emit(view.row_value(node)))
+
+
+class HighlightActions(ContextActionProvider):
+    def contribute(self, menu, view):
+        action = menu.addAction("Подсветить участки по условию…", view.highlightRequested.emit)
+        action.setEnabled(view.capture is not None)
+        action.setToolTip("Создать подсветку A…B или всего захвата, если B не установлен")
 
 
 class ContextMenuController:
     def __init__(self, providers=None):
-        self.providers = list(providers) if providers is not None else [RadixActions(), ColorActions(), SignalActions(), CopyActions(), StructureActions()]
+        self.providers = list(providers) if providers is not None else [RadixActions(), ColorActions(), SignalActions(), CopyActions(), CellCopyActions(), HighlightActions(), StructureActions()]
 
     def build(self, view):
         menu = QMenu(view)

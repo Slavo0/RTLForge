@@ -129,22 +129,26 @@ class SignalTree:
             self.root.add(group)
 
     def rows(self, query=""):
-        query = query.casefold()
+        query = query.casefold().strip()
         rows = []
+        match_cache = {}
+
+        def matches(node):
+            if node in match_cache:
+                return match_cache[node]
+            name = node.signal.name if node.signal else node.label
+            result = not query or query in name.casefold() or any(matches(child) for child in node.children)
+            match_cache[node] = result
+            return result
 
         def visit(node, depth, inherited_match=False):
-            name = node.signal.name if node.signal else node.label
-            match = inherited_match or not query or query in name.casefold()
-            child_rows = []
-            if node.expanded or query:
-                before = len(rows)
+            if not inherited_match and not matches(node):
+                return
+            rows.append(VisibleRow(node, depth))
+            if node.expanded:
+                own_match = inherited_match or bool(query and query in (node.signal.name if node.signal else node.label).casefold())
                 for child in node.children:
-                    visit(child, depth + 1, match if query else False)
-                child_rows = rows[before:]
-                del rows[before:]
-            if match or child_rows:
-                rows.append(VisibleRow(node, depth))
-                rows.extend(child_rows)
+                    visit(child, depth + 1, own_match)
 
         for child in self.root.children:
             visit(child, 0)

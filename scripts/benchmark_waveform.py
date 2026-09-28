@@ -18,6 +18,8 @@ from ila_viewer.window import MainWindow
 from ila_viewer.themes import STYLE
 from ila_viewer.preferences import PreferencesStore
 from ila_viewer.bits import BitExpansionService
+from ila_viewer.conditions import ConditionCompiler
+from ila_viewer.highlights import HighlightGroup, HighlightService
 
 
 def main():
@@ -81,12 +83,34 @@ def main():
         copy_seconds = time.perf_counter() - start
         assert copied.count == count - 1  # B is an exclusive copy boundary.
         assert copied.text.startswith("000 000 000")
+        condition = ConditionCompiler(cap.signals).compile("fast_bit")
+        start = time.perf_counter()
+        highlighted = HighlightService().build(cap, condition, 0, count - 1, 1, 0)
+        highlight_seconds = time.perf_counter() - start
+        assert highlighted.count > 400_000
+        v.set_range(0, count)
+        start = time.perf_counter()
+        bands = list(highlighted.visible(v.left, v.left + v.span, v.plot_width))
+        highlight_visible_ms = (time.perf_counter() - start) * 1000
+        assert len(bands) <= v.plot_width
+        group = HighlightGroup("alternating", "fast_bit", "#ffcc74", highlighted, 0, count - 1, 1, 0)
+        window.highlights.add(group)
+        app.processEvents()
+        start = time.perf_counter()
+        for _ in range(10):
+            v.viewport().grab()
+        highlight_render_ms = (time.perf_counter() - start) * 100
+        window.highlights.remove(group)
         report = {"samples": count, "signals": len(cap.signals), "csv_bytes": path.stat().st_size,
                   "index_bytes": disk_bytes, "load_seconds": round(load_seconds, 3),
                   "render": render_ms, "search_ms": round(search_ms, 3),
                   "expand_9_bits_seconds": round(expand_seconds, 3),
                   "expanded_full_capture_render_ms": round(expanded_render_ms, 2),
                   "copy_million_values_seconds": round(copy_seconds, 3),
+                  "highlight_alternating_seconds": round(highlight_seconds, 3),
+                  "highlight_full_view_bands": len(bands),
+                  "highlight_visible_lookup_ms": round(highlight_visible_ms, 3),
+                  "highlight_full_view_render_ms": round(highlight_render_ms, 3),
                   "copy_characters": len(copied.text),
                   "note": "Synthetic capture with alternating bit and 9-bit bus; offscreen render on this machine."}
         artifacts = Path(__file__).resolve().parents[1] / "tests" / "artifacts"

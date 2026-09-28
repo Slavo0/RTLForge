@@ -4,6 +4,7 @@
 """Snapshot-based, cancellable text export; clipboard access stays on the GUI thread."""
 from dataclasses import dataclass, replace
 from io import StringIO
+import re
 
 import numpy as np
 from PySide6.QtWidgets import QApplication
@@ -52,6 +53,7 @@ class CopyRequest:
     condition: object = None
     phase: int = 0
     exclude_sample: int | None = None
+    sort: str = "original"
 
 
 @dataclass(frozen=True)
@@ -63,9 +65,26 @@ class CopyResult:
 class CopyValuesService:
     MAX_CHARACTERS = 32_000_000
 
-    def snapshot(self, view, radix="DEFAULT", condition=None, period=1, phase=0):
-        if not view.capture or view.cursor_b is None:
-            raise ValueError("Установите маркеры A и B для копирования диапазона")
+    @staticmethod
+    def parse_bit_ranges(expression, labels):
+        """Map inclusive physical bit labels to descending-significance offsets."""
+        available = set(labels)
+        if not expression.strip():
+            return None
+        selected = set()
+        for token in re.split(r"[\s,]+", expression.strip()):
+            match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
+            if not match:
+                raise ValueError(f"Неверный диапазон битов: {token}")
+            first = int(match[1])
+            last = int(match[2]) if match[2] is not None else first
+            selected.update(range(min(first, last), max(first, last) + 1))
+        if not selected <= available:
+            raise ValueError("Выбранный диапазон содержит биты вне шины")
+        positions = {label: len(labels) - index - 1 for index, label in enumerate(labels)}
+        return tuple(sorted((positions[label] for label in selected), reverse=True))
+
+    def selected_targets(self, view):
         selected = []
         def visit(node):
             if node.signal:
@@ -77,7 +96,7 @@ class CopyValuesService:
             visit(node)
         unique = list(dict.fromkeys(selected))
         full_buses = {n for n in unique if n.kind == "bus"}
-        channels = []
+        targets = []
         emitted = set()
         for node in unique:
             parent = node.parent if node.kind == "bit" else None
@@ -94,8 +113,24 @@ class CopyValuesService:
                 lookup = {label: trace.width - 1 - i for i, label in enumerate(labels)}
                 offsets = tuple(sorted({lookup[int(n.label[1:-1])] for n in unique
                                         if n.kind == "bit" and n.parent is parent}, reverse=True))
+            targets.append((key, offsets))
+        return targets
+
+    def snapshot(self, view, radix="DEFAULT", condition=None, period=1, phase=0,
+                 channel_options=None, separator=None, samples="all", sort="original", targets=None):
+        if not view.capture:
+            raise ValueError("Откройте CSV для копирования")
+        channels = []
+        for key, selected_offsets in (targets if targets is not None else self.selected_targets(view)):
+            trace = key.signal
+            options = (channel_options or {}).get(key.id, {})
+            offsets = selected_offsets
+            bit_range = options.get("bits", "").strip()
+            if bit_range:
+                offsets = self.parse_bit_ranges(bit_range, BitCodec.labels(trace.source))
             width = len(offsets) if offsets is not None else trace.width
-            effective = view.display_radix(trace) if radix == "DEFAULT" else radix
+            chosen_radix = options.get("radix", radix)
+            effective = view.display_radix(trace) if chosen_radix == "DEFAULT" else chosen_radix
             effective = FORMATS.effective(effective, trace.source.radix)
             real = replace(trace.options.real) if trace.options.real else RealSettings()
             if effective == "REAL" and real.mode == "float" and width not in (32, 64):
@@ -103,10 +138,15 @@ class CopyValuesService:
             channels.append(CopyChannel(trace.source, width, offsets, effective, trace.options.reverse, real))
         if not channels:
             raise ValueError("Выберите сигналы или биты для копирования")
-        start, end = sorted((view.cursor_a, view.cursor_b))
-        return CopyRequest(tuple(channels), start, end, SEPARATORS[view.preferences.copy_separator],
-                           view.preferences.copy_samples, max(1, int(period)), condition,
-                           int(phase), int(view.cursor_b))
+        if view.cursor_b is None:
+            start, end, excluded = 0, view.capture.count - 1, None
+        else:
+            start, end = sorted((view.cursor_a, view.cursor_b))
+            excluded = int(view.cursor_b)
+        separator_key = separator or view.preferences.copy_separator
+        return CopyRequest(tuple(channels), start, end, SEPARATORS[separator_key],
+                           samples, max(1, int(period)), condition,
+                           int(phase), excluded, sort)
 
     def build(self, request, progress=lambda p, n: None, cancel=lambda: False):
         output = StringIO()
@@ -122,6 +162,8 @@ class CopyValuesService:
         for channel_index, channel in enumerate(request.channels):
             first = True
             last_value = object()
+            unique_values = {} if request.samples == "unique" else None
+            unique_characters = 0
             cache = {}
             source = channel.source
             if (request.condition is None and period == 1 and request.samples == "changes"
@@ -172,10 +214,20 @@ class CopyValuesService:
                 value, label = cached
                 if request.samples == "changes" and not first and value == last_value:
                     continue
+                if unique_values is not None:
+                    key = str(value)
+                    if key not in unique_values:
+                        unique_values[key] = value, label
+                        unique_characters += len(label) + len(request.separator)
+                        if output.tell() + unique_characters > self.MAX_CHARACTERS:
+                            raise ValueError("Результат превышает 32 млн символов. Уменьшите диапазон.")
+                    if index % 4096 == 0:
+                        progress(min(99, int((processed + index) / max(1, total) * 100)), len(unique_values))
+                    continue
                 extra = len(label) + (0 if first else len(request.separator))
                 channel_separator = 1 if first and count else 0
                 if output.tell() + extra + channel_separator > self.MAX_CHARACTERS:
-                    raise ValueError("Результат превышает 32 млн символов. Уменьшите диапазон или выберите «Только изменения».")
+                    raise ValueError("Результат превышает 32 млн символов. Уменьшите диапазон или выберите уникальные значения.")
                 if first and count:
                     output.write("\n")
                 if not first:
@@ -185,6 +237,28 @@ class CopyValuesService:
                 count += 1
                 if index % 4096 == 0:
                     progress(min(99, int((processed + index) / max(1, total) * 100)), count)
+            if unique_values is not None:
+                entries = list(unique_values.values())
+                if request.sort != "original":
+                    def sort_key(item):
+                        value, label = item
+                        if channel.radix in {"SIGNED", "SIGNED_MAGNITUDE", "UNSIGNED"}:
+                            try:
+                                return 0, int(label)
+                            except ValueError:
+                                pass
+                        if channel.radix == "REAL":
+                            try:
+                                return 0, float(label)
+                            except ValueError:
+                                pass
+                        return (0, value) if isinstance(value, (int, float)) else (1, str(value))
+                    entries.sort(key=sort_key,
+                                 reverse=request.sort == "descending")
+                if entries and count:
+                    output.write("\n")
+                output.write(request.separator.join(label for _, label in entries))
+                count += len(entries)
             processed += total_samples
         if cancel():
             raise LoadCancelled()

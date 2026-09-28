@@ -37,7 +37,8 @@ class WaveformRenderer:
         polygon = QPolygonF([QPointF(x1, (hi + lo) / 2), QPointF(x1 + notch, hi),
                              QPointF(x2 - notch, hi), QPointF(x2, (hi + lo) / 2),
                              QPointF(x2 - notch, lo), QPointF(x1 + notch, lo)])
-        painter.setBrush(QColor(color.red(), color.green(), color.blue(), 16))
+        filled = v.preferences.fill_bus
+        painter.setBrush(QColor(color.red(), color.green(), color.blue(), 65) if filled else Qt.BrushStyle.NoBrush)
         painter.drawPolygon(polygon)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if x2 - x1 > 20:
@@ -118,6 +119,15 @@ class WaveformRenderer:
         for tick in ticks:
             x = v.sample_x(tick)
             self.line(painter, x, v.HEADER, x, h)
+        if v.highlight_model and v.highlight_model.master_enabled:
+            for group in v.highlight_model.groups:
+                if not group.visible:
+                    continue
+                color = QColor(group.color)
+                color.setAlpha(round(255 * group.opacity / 100))
+                for start, end in group.intervals.visible(v.left, v.left + v.span, v.plot_width):
+                    x1, x2 = v.sample_x(start), v.sample_x(end)
+                    painter.fillRect(QRectF(x1, v.HEADER, x2 - x1, h - v.HEADER), color)
         for row in range(first, last):
             item = v.rows[row]
             node, depth = item.node, item.depth
@@ -143,7 +153,7 @@ class WaveformRenderer:
                     self.line(painter, x, y, x, y + v.ROW)
                 painter.setPen(text)
             if node.expandable:
-                v.icons.arrow(painter, indent, y + v.ROW / 2, node.expanded or bool(v.filter_text), muted)
+                v.icons.arrow(painter, indent, y + v.ROW / 2, node.expanded, muted)
             icon_color = v.signal_color(sig) if sig else QColor(v.tree.inherited_color(node) or theme.muted)
             v.icons.paint(painter, node.kind, indent + 18, y + (v.ROW - 16) / 2, icon_color)
             name_rect = QRectF(indent + 40, y, max(0, v.name_width - indent - 48), v.ROW)
@@ -181,7 +191,7 @@ class WaveformRenderer:
             label = f"{tick * v.period_ns:g} ns" if v.period_ns else str(tick)
             painter.setPen(muted)
             painter.drawText(QRectF(x + 4, 0, 110, v.HEADER), Qt.AlignmentFlag.AlignVCenter, label)
-        if v.cursor_b is not None:
+        if not v.period_mode and v.cursor_b is not None:
             xa, xb = sorted((v.sample_x(v.cursor_a), v.sample_x(v.cursor_b)))
             painter.fillRect(QRectF(xa, v.HEADER, xb - xa, h - v.HEADER), QColor(255, 204, 116, 12))
         if v.zoom_band:
@@ -192,14 +202,15 @@ class WaveformRenderer:
             painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
             self.line(painter, xa, v.HEADER, xa, h)
             self.line(painter, xb, v.HEADER, xb, h)
-        for label, sample, color in (("A", v.cursor_a, QColor(theme.marker_a)), ("B", v.cursor_b, QColor(theme.marker_b))):
+        for label, sample, color in (() if v.period_mode else (("A", v.cursor_a, QColor(theme.marker_a)), ("B", v.cursor_b, QColor(theme.marker_b)))):
             if sample is not None and v.left <= sample <= v.left + v.span:
-                x = v.sample_x(sample)
+                x = min(w - 1, v.sample_x(sample))
                 painter.setPen(QPen(color, 1.4))
                 self.line(painter, x, 0, x, h)
-                painter.fillRect(QRectF(x + 1, v.HEADER - 18, 18, 18), color)
+                label_x = min(x + 1, w - 19)
+                painter.fillRect(QRectF(label_x, v.HEADER - 18, 18, 18), color)
                 painter.setPen(background)
-                painter.drawText(QRectF(x + 1, v.HEADER - 18, 18, 18), Qt.AlignmentFlag.AlignCenter, label)
+                painter.drawText(QRectF(label_x, v.HEADER - 18, 18, 18), Qt.AlignmentFlag.AlignCenter, label)
         for label, sample, color in (("1", v.period_markers[0], QColor(theme.marker_a)),
                                      ("2", v.period_markers[1], QColor(theme.marker_b))):
             if sample is not None and v.left <= sample <= v.left + v.span:

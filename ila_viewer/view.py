@@ -30,6 +30,8 @@ class WaveformView(QAbstractScrollArea):
     expansionRequested = Signal(object)
     columnsChanged = Signal()
     copyRequested = Signal(str)
+    cellCopyRequested = Signal(str)
+    highlightRequested = Signal()
     periodMarkerPlaced = Signal(int, int)
     HEADER = 38
     ROW = 48
@@ -47,6 +49,8 @@ class WaveformView(QAbstractScrollArea):
         self.source_navigator = source_navigator or UnconfiguredSourceNavigator()
         self.icons = RowIconPainter()
         self.renderer = WaveformRenderer(self)
+        self.highlight_model = None
+        self.highlight_panel = None
         self.themes.changed.connect(self.viewport().update)
         self.visible_signals = []
         self.selected = 0
@@ -60,6 +64,9 @@ class WaveformView(QAbstractScrollArea):
         self.cursor_b = None
         self.period_markers = [None, None]
         self.period_marker_target = None
+        self.period_mode = False
+        self.interaction_region = "names"
+        self.context_column = None
         self.drag = None
         self.drop_target = None
         self.drag_position = None
@@ -128,6 +135,7 @@ class WaveformView(QAbstractScrollArea):
         self.capture = capture
         self.period_markers = [None, None]
         self.period_marker_target = None
+        self.period_mode = False
         self.tree = SignalTree(capture.signals, capture.metadata)
         self.filter_text = ""
         self.selected = 0
@@ -153,6 +161,7 @@ class WaveformView(QAbstractScrollArea):
         if explicit or not self.selection.ids:
             self.selection.select(self.rows, self.selected)
         self.update_scrollbars()
+        self.ensure_value_width()
         self.selectionChanged.emit()
         self.viewport().update()
 
@@ -194,15 +203,39 @@ class WaveformView(QAbstractScrollArea):
             width = max([70] + [24 + metrics.horizontalAdvance(self.row_value(row.node)) for row in self.rows])
         self.set_column_width(column, width)
 
+    def ensure_value_width(self):
+        if not self.capture or not self.rows:
+            return
+        first = self.verticalScrollBar().value() // self.ROW
+        count = max(1, self.viewport().height() // self.ROW + 2)
+        visible = self.rows[first:first + count]
+        metrics = self.fontMetrics()
+        needed = max((metrics.horizontalAdvance(self.row_value(row.node)) + 20 for row in visible), default=0)
+        if needed <= self.value_width:
+            return
+        limit = max(self.value_width, int(self.viewport().width() * 0.45))
+        width = self.value_width
+        while width < needed and width < limit:
+            width = int(width * 1.5) + 1
+        self.set_column_width("value", min(width, limit))
+
     def marker_at(self, x):
-        if not self.capture or x < self.plot_left:
+        if not self.capture or x < self.plot_left or self.period_mode:
             return None
         hits = [(abs(x - self.sample_x(sample)), name) for name, sample in (("A", self.cursor_a), ("B", self.cursor_b))
-                if sample is not None and self.left <= sample < self.left + self.span]
+                if sample is not None and self.left <= sample <= self.left + self.span]
         return min(hits)[1] if hits and min(hits)[0] <= 6 else None
 
+    def period_marker_at(self, x):
+        if not self.period_mode or x < self.plot_left:
+            return None
+        hits = [(abs(x - self.sample_x(sample)), index + 1)
+                for index, sample in enumerate(self.period_markers) if sample is not None]
+        nearest = min(hits, key=lambda hit: (hit[0], hit[1] != self.period_marker_target)) if hits else None
+        return nearest[1] if nearest and nearest[0] <= 8 else None
+
     def hover_cursor(self, pos):
-        resize = self.column_at(pos.x()) or self.marker_at(pos.x())
+        resize = self.column_at(pos.x()) or self.marker_at(pos.x()) or self.period_marker_at(pos.x())
         self.viewport().setCursor(Qt.CursorShape.SizeHorCursor if resize else Qt.CursorShape.ArrowCursor)
 
     def set_radix(self, radix):
@@ -210,6 +243,7 @@ class WaveformView(QAbstractScrollArea):
         if nodes:
             for node in nodes:
                 node.options.radix = radix
+            self.ensure_value_width()
             self.selectionChanged.emit()
             self.viewport().update()
 
@@ -221,7 +255,11 @@ class WaveformView(QAbstractScrollArea):
 
     def signal_color(self, sig):
         theme = self.themes.current
-        return QColor(self.tree.inherited_color(sig.node) or (theme.bus if sig.is_bus else theme.bit))
+        kind = "bus" if sig.is_bus or sig.node.kind == "bus" else "bit"
+        if not self.preferences.separate_signal_styles:
+            kind = "bus"
+        saved = self.preferences.signal_colors.get(theme.key, {})
+        return QColor(self.tree.inherited_color(sig.node) or saved.get(kind) or (theme.bus if kind == "bus" else theme.bit))
 
     def reverse_bits(self, checked):
         if self.current_node and self.current_node.kind == "bus":
@@ -267,7 +305,29 @@ class WaveformView(QAbstractScrollArea):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_scrollbars()
+        self.layout_highlight_panel()
         self.columnsChanged.emit()
+
+    def attach_highlight_panel(self, model, panel):
+        self.highlight_model = model
+        self.highlight_panel = panel
+        model.changed.connect(self.layout_highlight_panel)
+        model.changed.connect(self.viewport().update)
+        self.layout_highlight_panel()
+
+    def layout_highlight_panel(self):
+        if self.highlight_panel is None:
+            return
+        show = bool(self.highlight_model.groups) or not self.preferences.hide_empty_highlight_panel
+        height = self.highlight_panel.height() if show else 0
+        if self.viewportMargins().bottom() != height:
+            self.setViewportMargins(0, 0, 0, height)
+        if height:
+            geometry = self.viewport().geometry()
+            self.highlight_panel.setGeometry(geometry.left(), geometry.bottom() + 1, geometry.width(), height)
+            self.highlight_panel.show()
+        else:
+            self.highlight_panel.hide()
 
     def set_range(self, left, span):
         if not self.capture:
@@ -290,6 +350,18 @@ class WaveformView(QAbstractScrollArea):
         new_span = max(min(2, total), min(total, self.span * factor))
         self.set_range(anchor - new_span * ratio, new_span)
 
+    def zoom_toolbar(self, factor):
+        if self.capture and self.period_mode and all(marker is not None for marker in self.period_markers):
+            midpoint = sum(self.period_markers) / 2
+            new_span = max(min(2, self.capture.count), min(self.capture.count, self.span * factor))
+            self.set_range(midpoint - new_span / 2, new_span)
+        elif self.capture and self.cursor_b is not None:
+            midpoint = (self.cursor_a + self.cursor_b) / 2
+            new_span = max(min(2, self.capture.count), min(self.capture.count, self.span * factor))
+            self.set_range(midpoint - new_span / 2, new_span)
+        else:
+            self.zoom(factor)
+
     def zoom_cursors(self):
         if self.cursor_b is not None:
             start, end = sorted((self.cursor_a, self.cursor_b))
@@ -305,6 +377,7 @@ class WaveformView(QAbstractScrollArea):
             self.cursor_a = sample
         if reveal and not self.left <= sample < self.left + self.span:
             self.set_range(sample - self.span / 2, self.span)
+        self.ensure_value_width()
         self.cursorChanged.emit()
         self.viewport().update()
 
@@ -323,6 +396,9 @@ class WaveformView(QAbstractScrollArea):
     def x_sample(self, x):
         return self.left + (x - self.plot_left) / self.plot_width * self.span
 
+    def nearest_sample(self, x):
+        return max(0, min(self.capture.count - 1, math.floor(self.x_sample(x) + 0.5)))
+
     def paintEvent(self, event):
         self.renderer.paint(event)
 
@@ -338,12 +414,15 @@ class WaveformView(QAbstractScrollArea):
     def mousePressEvent(self, event):
         self.setFocus()
         pos = event.position()
-        if (event.button() == Qt.MouseButton.LeftButton and self.period_marker_target in (1, 2)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.interaction_region = "waveform" if pos.x() >= self.plot_left else "names"
+        if (event.button() == Qt.MouseButton.LeftButton and self.period_mode
                 and pos.x() >= self.plot_left and self.capture):
-            sample = max(0, min(self.capture.count - 1, math.floor(self.x_sample(pos.x()))))
-            marker = self.period_marker_target
+            sample = self.nearest_sample(pos.x())
+            marker = 2 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
             self.period_markers[marker - 1] = sample
-            self.period_marker_target = None
+            self.period_marker_target = marker
+            self.drag = ("period", marker)
             self.periodMarkerPlaced.emit(marker, sample)
             self.viewport().update()
             event.accept()
@@ -364,6 +443,8 @@ class WaveformView(QAbstractScrollArea):
                 self._select_at(pos.y(), extended, toggled, preserve=not extended and not toggled)
             if pos.x() >= self.plot_left:
                 secondary = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if not secondary:
+                    self._select_at(pos.y(), toggle=bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier))
                 marker = self.marker_at(pos.x())
                 if not secondary:
                     self.cursor_b = None
@@ -372,7 +453,7 @@ class WaveformView(QAbstractScrollArea):
                     self.drag = ("cursor", secondary)
                 else:
                     self.drag = ("zoom_pending", pos.x(), self.x_sample(pos.x()))
-                self.set_cursor(math.floor(self.x_sample(pos.x())), secondary, False)
+                self.set_cursor(self.nearest_sample(pos.x()), secondary, False)
             elif self.current_node and self.HEADER <= pos.y() < self.HEADER + len(self.rows) * self.ROW - self.verticalScrollBar().value():
                 item = self.rows[self.selected]
                 indent = 10 + item.depth * self.INDENT
@@ -390,6 +471,13 @@ class WaveformView(QAbstractScrollArea):
                 self.set_column_width(self.drag[1], pos.x() if self.drag[1] == "name" else pos.x() - self.name_width)
             elif self.drag[0] == "pan":
                 self.set_range(self.drag[2] - (pos.x() - self.drag[1]) / self.plot_width * self.span, self.span)
+            elif self.drag[0] == "period":
+                sample = self.nearest_sample(pos.x())
+                marker = self.drag[1]
+                if self.period_markers[marker - 1] != sample:
+                    self.period_markers[marker - 1] = sample
+                    self.periodMarkerPlaced.emit(marker, sample)
+                    self.viewport().update()
             elif self.drag[0] in ("row_pending", "row"):
                 if self.drag[0] == "row_pending" and (pos - self.drag[2]).manhattanLength() < QApplication.startDragDistance():
                     return
@@ -406,7 +494,7 @@ class WaveformView(QAbstractScrollArea):
                 self.zoom_band = (self.drag[2], self.x_sample(x))
                 self.viewport().update()
             else:
-                self.set_cursor(math.floor(self.x_sample(pos.x())), self.drag[1], False)
+                self.set_cursor(self.nearest_sample(pos.x()), self.drag[1], False)
             return
         self.hover_cursor(pos)
         row = int((pos.y() - self.HEADER + self.verticalScrollBar().value()) // self.ROW)
@@ -488,7 +576,21 @@ class WaveformView(QAbstractScrollArea):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+        if key == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.interaction_region == "waveform":
+                if self.capture and not self.period_mode:
+                    self.cursor_a = 0
+                    # B marks the exclusive boundary just after the final sample.
+                    self.cursor_b = self.capture.count
+                    self.cursorChanged.emit()
+                    self.viewport().update()
+            elif self.rows:
+                self.selection.ids = {row.node.id for row in self.rows if row.node.signal or row.node.kind == "group"}
+                self.selection.anchor = self.rows[0].node.id
+                self.selectionChanged.emit()
+                self.viewport().update()
+            event.accept()
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             direction = -1 if key == Qt.Key.Key_Left else 1
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 self.set_cursor(self.cursor_a + direction)
@@ -522,7 +624,8 @@ class WaveformView(QAbstractScrollArea):
             self.drag = None
             self.drop_target = None
             self.zoom_band = None
-            self.cursor_b = None
+            if not self.period_mode:
+                self.cursor_b = None
             self.cursorChanged.emit()
             self.viewport().update()
         else:
@@ -532,10 +635,30 @@ class WaveformView(QAbstractScrollArea):
         # A right click selects a new row, or preserves a multi-selection when
         # the clicked row already belongs to it, regardless of the clicked column.
         self._select_at(event.pos().y(), preserve=True)
+        self.context_column = ("name" if event.pos().x() < self.name_width else
+                               "value" if event.pos().x() < self.plot_left else None)
         menu = self.menus.build(self)
         menu.exec(event.globalPos())
         menu.deleteLater()
 
     def request_period_marker(self, marker):
         self.period_marker_target = marker if marker in (1, 2) else None
+        self.viewport().update()
+
+    def begin_period_setup(self):
+        if not self.capture or self.capture.count < 2:
+            return False
+        first = max(0, min(self.capture.count - 2, math.floor(self.left + self.span / 3)))
+        second = max(first + 1, min(self.capture.count - 1, math.floor(self.left + 2 * self.span / 3)))
+        self.period_markers = [first, second]
+        self.period_mode = True
+        self.period_marker_target = 1
+        self.viewport().update()
+        return True
+
+    def end_period_setup(self):
+        self.period_mode = False
+        self.period_marker_target = None
+        self.period_markers = [None, None]
+        self.drag = None
         self.viewport().update()

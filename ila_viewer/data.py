@@ -83,8 +83,9 @@ class SignalData:
         return int(self.starts[index]) if 0 < index < len(self.starts) else None
 
     def search(self, value: int | str, sample: int, direction: int,
-               cancel: Callable[[], bool] = lambda: False) -> tuple[int, bool] | None:
-        """Find next matching interval start, wrapping once; scans in bounded blocks."""
+               cancel: Callable[[], bool] = lambda: False,
+               wrap: bool = True) -> tuple[int, bool] | None:
+        """Find next matching interval start in bounded blocks; wrap if requested."""
         code = self.value_ids.get(value)
         if code is None:
             return None
@@ -95,6 +96,8 @@ class SignalData:
         else:
             pivot = int(np.searchsorted(self.starts, sample, side="left"))
             ranges = [(0, pivot, False), (pivot, n, True)]
+        if not wrap:
+            ranges = ranges[:1]
         for lo, hi, wrapped in ranges:
             while lo < hi:
                 if cancel():

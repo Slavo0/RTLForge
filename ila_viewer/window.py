@@ -9,8 +9,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QDialog,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QToolBar,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QDialog, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -24,8 +24,12 @@ from .preferences import PreferencesStore
 from .settings_dialog import AppearanceDialog
 from .copying import CopyValuesService, SystemClipboard
 from .conditions import ConditionCompiler
-from .copy_dialog import CopyConditionDialog
-from .period_dialog import CopyPeriodDialog
+from .copy_dialog import CopyOptionsDialog
+from .period_dialog import CopyPeriodBanner
+from .highlights import HighlightGroup, HighlightModel, HighlightService
+from .highlights_ui import HighlightConditionDialog, HighlightPanel
+from .refresh import CaptureRefreshState
+from .tree import BusNode, SignalNode
 
 
 class MainWindow(QMainWindow):
@@ -47,17 +51,29 @@ class MainWindow(QMainWindow):
         self.themes.select(self.preferences.theme if self.preferences.theme in self.themes.themes else next(iter(self.themes.themes)))
         self.bit_expansion = BitExpansionService()
         self.copy_service = CopyValuesService()
+        self.highlight_service = HighlightService()
+        self.highlights = HighlightModel(self)
         self.copy_period = None
         self.copy_phase = 0
-        self.copy_period_dialog = None
-        self.pending_copy_radix = None
+        self.copy_period_banner = None
+        self.pending_period_action = None
+        self.pending_copy_expression = ""
+        self.active_editor = None
+        self.refresh_state = None
+        self.refresh_bit_styles = None
         self.clipboard = clipboard if clipboard is not None else SystemClipboard()
         self.view = WaveformView(themes=self.themes, menus=menus, source_navigator=source_navigator, preferences=self.preferences)
+        self.highlight_panel = HighlightPanel(self.highlights, self.view)
+        self.view.attach_highlight_panel(self.highlights, self.highlight_panel)
+        self.highlight_panel.createRequested.connect(self.create_highlight)
+        self.highlight_panel.editRequested.connect(self.create_highlight)
         self.themes.changed.connect(self.apply_theme)
         self.apply_theme()
         self.view.findRequested.connect(self.focus_search)
         self.view.expansionRequested.connect(self.expand_bus)
         self.view.copyRequested.connect(self.copy_values)
+        self.view.cellCopyRequested.connect(self.copy_cell)
+        self.view.highlightRequested.connect(self.create_highlight)
         self.view.cursorChanged.connect(self.update_status)
         self.view.selectionChanged.connect(self.update_selection)
         self.view.message.connect(lambda s: self.statusBar().showMessage(s, 5000))
@@ -68,8 +84,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         self.open_action = self.add_action(toolbar, "Открыть CSV", self.choose_file, "Ctrl+O")
         toolbar.addSeparator()
-        self.add_action(toolbar, "+", lambda: self.view.zoom(0.5), tooltip="Приблизить: + или Ctrl+колесо")
-        self.add_action(toolbar, "−", lambda: self.view.zoom(2), tooltip="Отдалить: − или Ctrl+колесо")
+        self.add_action(toolbar, "+", lambda: self.view.zoom_toolbar(0.5), tooltip="Приблизить относительно середины A↔B")
+        self.add_action(toolbar, "−", lambda: self.view.zoom_toolbar(2), tooltip="Отдалить относительно середины A↔B")
         self.add_action(toolbar, "Весь захват", self.view.fit, tooltip="F — уместить весь захват")
         self.add_action(toolbar, "A ↔ B", self.view.zoom_cursors, tooltip="Уместить диапазон между курсорами")
         toolbar.addSeparator()
@@ -77,14 +93,19 @@ class MainWindow(QMainWindow):
         self.add_action(toolbar, "Изменение →", lambda: self.view.next_transition(1), tooltip="→ — следующее изменение выбранного сигнала")
         self.add_action(toolbar, "К отсчёту…", self.goto_sample, "Ctrl+G")
         self.add_action(toolbar, "Триггер", self.goto_trigger)
-        self.add_action(toolbar, "Настройки вида…", self.show_appearance)
+        toolbar_spacer = QWidget()
+        toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(toolbar_spacer)
+        self.refresh_action = self.add_action(toolbar, "Обновить CSV", self.refresh_csv,
+                                              tooltip="Повторно открыть текущий CSV с диска")
+        self.refresh_action.setEnabled(False)
 
         tools_menu = self.menuBar().addMenu("Файл")
         tools_menu.addAction(self.open_action)
         self.add_action(tools_menu, "Сохранить вид как PNG…", self.save_image)
         self.add_action(tools_menu, "Выход", self.close, "Ctrl+Q")
-        settings = self.menuBar().addMenu("Вид")
-        self.add_action(settings, "Настройки вида…", self.show_appearance)
+        settings = self.menuBar().addMenu("Настройки")
+        self.add_action(settings, "Настройки…", self.show_appearance)
         self.add_action(settings, "Период отсчёта…", self.set_period)
         self.add_action(settings, "Убрать курсор B", self.clear_b)
         help_menu = self.menuBar().addMenu("Справка")
@@ -100,12 +121,17 @@ class MainWindow(QMainWindow):
         self.filter_edit.textChanged.connect(self.view.filter_signals)
         search_row = QHBoxLayout()
         search_row.addWidget(self.filter_edit)
-        search_row.addWidget(QLabel("Значение:"))
         self.search_edit = QLineEdit()
+        self.search_edit.setFixedWidth(self.search_edit.fontMetrics().horizontalAdvance("0" * 13) + 12)
         self.search_edit.setPlaceholderText("HEX: 0AC, 100; или 0xAC / 0b1010")
         self.search_edit.setToolTip("Точное значение целой шины. Без префикса — в выбранном формате. Enter: следующее совпадение.")
         self.search_edit.returnPressed.connect(lambda: self.find_value(1))
-        search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(self.search_edit)
+        self.loop_search = QCheckBox("↻")
+        self.loop_search.setToolTip("Кольцевой поиск: после конца продолжать с начала сигнала")
+        self.loop_search.setChecked(True)
+        search_row.addWidget(self.loop_search)
+        search_row.addStretch(1)
         self.previous_button = QPushButton("Найти ←")
         self.next_button = QPushButton("Найти →")
         self.previous_button.clicked.connect(lambda: self.find_value(-1))
@@ -113,6 +139,9 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.previous_button)
         search_row.addWidget(self.next_button)
         layout.addLayout(search_row)
+        self.period_container = QVBoxLayout()
+        self.period_container.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self.period_container)
         layout.addWidget(self.view, 1)
         self.readout = QLabel("Откройте waveform.csv")
         self.readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -157,41 +186,76 @@ class MainWindow(QMainWindow):
         self.search_edit.selectAll()
 
     def copy_values(self, radix="DEFAULT"):
+        if self.active_editor is not None:
+            self.active_editor.raise_()
+            self.active_editor.activateWindow()
+            return
+        if self.copy_period_banner is not None:
+            self.statusBar().showMessage("Сначала подтвердите или отмените настройку периода.", 5000)
+            return
         if self.worker:
             self.statusBar().showMessage("Дождитесь завершения операции или нажмите «Отмена».", 4000)
             return
         try:
-            request = self.copy_service.snapshot(self.view, radix)
+            self.copy_service.snapshot(self.view, radix)
         except ValueError as exc:
             self.statusBar().showMessage(str(exc), 7000)
             return
         if self.copy_period is None:
-            if self.copy_period_dialog is not None:
-                self.copy_period_dialog.raise_()
-                self.copy_period_dialog.activateWindow()
+            if self.copy_period_banner is not None:
                 return
-            self.pending_copy_radix = radix
-            self.view.period_markers = [None, None]
-            self.copy_period_dialog = CopyPeriodDialog(self.view, self)
-            self.copy_period_dialog.finished.connect(self.finish_period_setup)
-            self.copy_period_dialog.show()
-            self.copy_period_dialog.raise_()
-            self.statusBar().showMessage("Укажите на диаграмме две точки одного полного периода.", 6000)
+            self.start_period_setup(radix)
             return
-        radix_by_name = {}
-        stack = list(self.view.tree.root.children)
-        while stack:
-            node = stack.pop()
-            if node.signal:
-                radix_by_name[node.signal.source.name] = self.view.display_radix(node.signal)
-            stack.extend(node.children)
-        compiler = ConditionCompiler(self.capture.signals, radix_by_name)
-        dialog = CopyConditionDialog(self.capture.signals, compiler, self, full_names=self.view.full_names)
-        if not dialog.exec():
+        compiler = self.condition_compiler()
+        selected = self.copy_service.selected_targets(self.view)
+        selected_ids = {node.id for node, _ in selected}
+        available = []
+        def visit(node):
+            if node.signal and node.kind != "bit" and node.id not in selected_ids:
+                available.append((node, None))
+            for child in node.children:
+                visit(child)
+        visit(self.view.tree.root)
+        listed_names = {node.signal.source.name for node, _ in selected + available}
+        for source in self.capture.signals:
+            if source.name not in listed_names:
+                available.append(((BusNode if source.is_bus else SignalNode)(source.short_name, source), None))
+        dialog = CopyOptionsDialog(self.capture.signals, compiler,
+                                   selected, self.copy_service,
+                                   self, full_names=self.view.full_names,
+                                   expression_text=self.pending_copy_expression,
+                                   separator=self.preferences.copy_separator,
+                                   available_targets=available)
+        self.show_editor(dialog, lambda accepted: self.finish_copy_dialog(dialog, compiler, radix, accepted))
+
+    def show_editor(self, dialog, callback):
+        self.active_editor = dialog
+        source_capture = self.capture
+        dialog.setModal(False)
+        def finished(result):
+            self.active_editor = None
+            if not self.closing and self.capture is source_capture:
+                callback(result == QDialog.DialogCode.Accepted)
+            dialog.deleteLater()
+        dialog.finished.connect(finished)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def finish_copy_dialog(self, dialog, compiler, radix, accepted):
+        if not accepted:
+            if dialog.reselect_period:
+                self.pending_copy_expression = dialog.condition_text()
+                self.start_period_setup(radix)
             return
+        self.pending_copy_expression = ""
         try:
-            request = self.copy_service.snapshot(self.view, radix, compiler.compile(dialog.condition_text()),
-                                                 self.copy_period, self.copy_phase)
+            request = self.copy_service.snapshot(
+                self.view, radix, compiler.compile(dialog.condition_text()),
+                self.copy_period, self.copy_phase, dialog.channel_options(),
+                dialog.separator_box.currentData(),
+                "unique" if dialog.unique_box.isChecked() else "all",
+                dialog.sort_box.currentData(), dialog.selected_targets())
         except ValueError as exc:
             self.statusBar().showMessage(str(exc), 7000)
             return
@@ -204,20 +268,116 @@ class MainWindow(QMainWindow):
         self.start_work(lambda task: self.copy_service.build(request, task.progress.emit, task.isInterruptionRequested),
                         complete, "Подготовка значений для буфера обмена…", "значений")
 
-    def finish_period_setup(self, result):
-        dialog, self.copy_period_dialog = self.copy_period_dialog, None
-        self.view.request_period_marker(None)
-        self.view.period_markers = [None, None]
-        self.view.viewport().update()
-        if not dialog or result != QDialog.DialogCode.Accepted:
-            self.pending_copy_radix = None
-            self.statusBar().showMessage("Настройка периода отменена.", 5000)
+    def copy_cell(self, text):
+        self.clipboard.write(text)
+        self.statusBar().showMessage("Скопировано в буфер обмена.", 3000)
+
+    def condition_compiler(self):
+        radix_by_name = {}
+        stack = list(self.view.tree.root.children)
+        while stack:
+            node = stack.pop()
+            if node.signal:
+                radix_by_name[node.signal.source.name] = self.view.display_radix(node.signal)
+            stack.extend(node.children)
+        return ConditionCompiler(self.capture.signals, radix_by_name)
+
+    def create_highlight(self, group=None, draft=None):
+        if isinstance(group, bool):
+            group = None
+        if self.active_editor is not None:
+            self.active_editor.raise_()
+            self.active_editor.activateWindow()
             return
-        self.copy_period = dialog.accepted_period
-        self.copy_phase = dialog.phase
-        radix, self.pending_copy_radix = self.pending_copy_radix, None
+        if self.worker or self.copy_period_banner is not None:
+            self.statusBar().showMessage("Дождитесь окончания текущей операции.", 5000)
+            return
+        if not self.capture:
+            self.statusBar().showMessage("Откройте CSV для подсветки.", 6000)
+            return
+        if self.copy_period is None:
+            self.start_period_setup(continuation=lambda: self.create_highlight(group, draft))
+            return
+        compiler = self.condition_compiler()
+        if group is None and draft is None:
+            index = len(self.highlights.groups)
+            draft = {"name": f"Подсветка {index + 1}",
+                     "style": index % len(self.preferences.highlight_palette)}
+        dialog = HighlightConditionDialog(self.capture.signals, compiler,
+                                          self.preferences.highlight_palette,
+                                          self.preferences.highlight_opacities,
+                                          self, group, draft,
+                                          full_names=self.view.full_names)
+        self.show_editor(dialog, lambda accepted: self.finish_highlight_dialog(dialog, compiler, group, accepted))
+
+    def finish_highlight_dialog(self, dialog, compiler, group, accepted):
+        if not accepted:
+            if dialog.reselect_period:
+                new_draft = dialog.draft()
+                self.start_period_setup(continuation=lambda: self.create_highlight(group, new_draft))
+            return
+        try:
+            condition = compiler.compile(dialog.condition_text())
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+            return
+        marker_a = group.marker_a if group else (self.view.cursor_a if self.view.cursor_b is not None else 0)
+        marker_b = group.marker_b if group else (self.view.cursor_b if self.view.cursor_b is not None else self.capture.count)
+        period, phase = self.copy_period, self.copy_phase
+        name, expression, color, opacity = (dialog.name_edit.text().strip(), dialog.condition_text(),
+                                            dialog.color, dialog.opacity)
+
+        def complete(intervals):
+            new_group = HighlightGroup(name, expression, color, intervals, marker_a, marker_b,
+                                       period, phase, opacity=opacity)
+            if group and group in self.highlights.groups:
+                self.highlights.replace(group, new_group)
+            elif group:
+                intervals.close()
+                return
+            else:
+                self.highlights.add(new_group)
+            self.statusBar().showMessage(f"Подсветка «{name}»: {intervals.count:,} участков.", 6000)
+
+        self.start_work(lambda task: self.highlight_service.build(
+            self.capture, condition, marker_a, marker_b, period, phase,
+            task.progress.emit, task.isInterruptionRequested), complete,
+            "Поиск участков для подсветки…", "проверенных периодов")
+
+    def start_period_setup(self, radix="DEFAULT", continuation=None):
+        if not self.view.begin_period_setup():
+            self.statusBar().showMessage("Для задания периода нужны хотя бы два отсчёта.", 6000)
+            return
+        self.pending_period_action = continuation or (lambda: self.copy_values(radix))
+        banner = CopyPeriodBanner(self.view, self)
+        self.copy_period_banner = banner
+        banner.confirmed.connect(self.finish_period_setup)
+        banner.cancelled.connect(self.cancel_period_setup)
+        self.period_container.addWidget(banner)
+        self.view.setFocus()
+        self.statusBar().showMessage("Режим выбора периода: ЛКМ — точка 1, Shift+ЛКМ — точка 2; затем подтвердите.", 8000)
+
+    def clear_period_banner(self):
+        banner, self.copy_period_banner = self.copy_period_banner, None
+        if banner:
+            banner.detach()
+            self.period_container.removeWidget(banner)
+            banner.deleteLater()
+        self.view.end_period_setup()
+
+    def cancel_period_setup(self):
+        self.clear_period_banner()
+        self.pending_period_action = None
+        self.statusBar().showMessage("Настройка периода отменена.", 5000)
+
+    def finish_period_setup(self, period, phase):
+        self.copy_period = period
+        self.copy_phase = phase
+        action, self.pending_period_action = self.pending_period_action, None
+        self.clear_period_banner()
         self.statusBar().showMessage(f"Период копирования: {self.copy_period:,} отсчётов.", 5000)
-        self.copy_values(radix or "DEFAULT")
+        if action:
+            action()
 
     def apply_theme(self):
         self.setStyleSheet(self.themes.current.stylesheet())
@@ -243,6 +403,7 @@ class MainWindow(QMainWindow):
         self.view.preferences = preferences
         self.view.full_names = preferences.full_names
         self.themes.select(preferences.theme)
+        self.view.layout_highlight_panel()
         self.view.viewport().update()
         self.update_selection()
         self.save_preferences()
@@ -271,6 +432,9 @@ class MainWindow(QMainWindow):
         def complete(result):
             self.capture.derived.append(result)
             self.view.tree.add_bits(node, result.signals)
+            if self.refresh_bit_styles:
+                for child in node.children:
+                    self.refresh_bit_styles.apply_style(child)
             self.view.refresh_rows(node)
             self.statusBar().showMessage(f"Раскрыта шина: {node.label}", 4000)
         self.start_work(lambda task: self.bit_expansion.build(node.signal.source, self.capture.storage.name,
@@ -278,14 +442,23 @@ class MainWindow(QMainWindow):
                         complete, f"Подготовка битов {node.label}…", "битов")
 
     def choose_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть Vivado ILA CSV", str(Path.cwd()), "CSV (*.csv);;Все файлы (*)")
+        initial = self.preferences.last_csv_directory or str(Path.cwd())
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть Vivado ILA CSV", initial, "CSV (*.csv);;Все файлы (*)")
         if path:
+            self.preferences.last_csv_directory = str(Path(path).resolve().parent)
+            self.save_timer.start()
             self.open_file(path)
 
-    def open_file(self, path):
+    def refresh_csv(self):
+        if self.capture:
+            self.open_file(self.capture.path, refresh=True)
+
+    def open_file(self, path, refresh=False):
         if self.worker:
             self.statusBar().showMessage("Дождитесь завершения операции или нажмите «Отмена».", 4000)
             return
+        self.refresh_state = (CaptureRefreshState.capture(self.view, self.highlights, self.condition_compiler())
+                              if refresh and self.capture else None)
         self.start_work(lambda task: self.source.load(path, task.progress.emit, task.isInterruptionRequested),
                         self.loaded, f"Загрузка {Path(path).name}…")
 
@@ -296,6 +469,7 @@ class MainWindow(QMainWindow):
         self.worker = task
         self.progress_unit = progress_unit
         self.open_action.setEnabled(False)
+        self.refresh_action.setEnabled(False)
         self.previous_button.setEnabled(False)
         self.next_button.setEnabled(False)
         self.progress.setRange(0, 0)
@@ -314,6 +488,7 @@ class MainWindow(QMainWindow):
     def finish_work(self, task, complete):
         self.worker = None
         self.open_action.setEnabled(True)
+        self.refresh_action.setEnabled(self.capture is not None)
         self.previous_button.setEnabled(True)
         self.next_button.setEnabled(True)
         self.progress.hide()
@@ -339,16 +514,46 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Отмена операции…")
 
     def loaded(self, capture):
+        if self.active_editor is not None:
+            self.active_editor.reject()
+        if self.copy_period_banner is not None:
+            self.cancel_period_setup()
+        state, self.refresh_state = self.refresh_state, None
+        if state is None:
+            self.copy_period = None
+            self.copy_phase = 0
+            self.refresh_bit_styles = None
+        else:
+            self.refresh_bit_styles = state
+        self.pending_copy_expression = ""
         old = self.capture
+        self.highlights.reset()
         self.capture = capture
+        self.preferences.last_csv_directory = str(capture.path.resolve().parent)
+        self.save_timer.start()
+        self.refresh_action.setEnabled(True)
         self.filter_edit.clear()
         self.view.set_capture(capture)
+        if state:
+            state.apply_styles(self.view)
+            self.highlights.master_enabled = state.master_enabled
+            self.highlights.changed.emit()
         if old:
             old.close()
         self.setWindowTitle(f"{capture.path.name} — ILA Waveform Reader")
         changes = sum(len(sig.starts) - 1 for sig in capture.signals)
         self.statusBar().showMessage(f"{capture.count:,} отсчётов · {len(capture.signals)} сигналов · {changes:,} изменений")
         self.view.setFocus()
+        if state and state.highlights:
+            compiler = self.condition_compiler()
+            def restored(groups):
+                for group in groups:
+                    self.highlights.add(group)
+                self.statusBar().showMessage(f"CSV обновлён · восстановлено подсветок: {len(groups)}", 6000)
+            self.start_work(lambda task: state.rebuild_highlights(
+                capture, compiler, self.highlight_service,
+                task.progress.emit, task.isInterruptionRequested),
+                restored, "Восстановление подсветок после обновления CSV…", "подсветок")
 
     def update_selection(self):
         sig = self.view.current_signal
@@ -387,7 +592,9 @@ class MainWindow(QMainWindow):
             self.search_edit.setFocus()
             return
         sample = self.view.cursor_a
-        self.start_work(lambda task: sig.search(value, sample, direction, task.isInterruptionRequested),
+        wrap = self.loop_search.isChecked()
+        self.start_work(lambda task: sig.search(value, sample, direction, task.isInterruptionRequested,
+                                                wrap),
                         self.found, f"Поиск в {sig.short_name}…")
 
     def found(self, result):
@@ -396,7 +603,7 @@ class MainWindow(QMainWindow):
             return
         sample, wrapped = result
         self.view.set_cursor(sample)
-        self.view.setFocus()
+        self.search_edit.setFocus()
         self.statusBar().showMessage(f"Найдено: отсчёт {sample}" + (" · поиск продолжен с другого края захвата" if wrapped else ""), 6000)
 
     def goto_sample(self):
@@ -451,18 +658,24 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", "Не удалось сохранить PNG.")
 
     def show_help(self):
-        QMessageBox.information(self, "Управление", """Щелчок по сигналу — выбрать сигнал и установить курсор A.
+        QMessageBox.information(self, "Управление", """Щелчок по waveform — выбрать сигнал и установить курсор A.
+Ctrl + щелчок по waveform — добавить или убрать сигнал из выделения.
+Положение маркера округляется к ближайшему отсчёту.
 Shift + щелчок — курсор B; обычный щелчок по диаграмме — убрать B.
 Shift + щелчок в Name / Value — выделить диапазон строк без изменения B.
 Radix, Signal Color и перетаскивание применяются ко всему выделению.
 Протянуть ЛКМ по диаграмме — приблизить диапазон (от 2 отсчётов).
 Перетаскивание за линию маркера — переместить маркер; для B удерживать Shift.
-Copy Values → Radix — условие и копирование выбранных сигналов/битов от A до B.
+Copy Values… — для каждого сигнала свой Radix и диапазон битов; без B весь захват.
 Условие поддерживает &&, ||, ! / ~, сравнения и выбор сигнала из списка.
-При первом копировании за запуск выберите две точки периода; B — исключающая граница.
-Настройки вида → Копирование — разделитель и режим повторов.
-Name и Value имеют независимые границы; двойной щелчок — подобрать ширину.
-Общий Radix, тема и заливка единиц находятся в «Настройки вида» и сохраняются.
+При первом копировании передвиньте маркеры 1/2 и подтвердите период на панели.
+Во время выбора периода ЛКМ двигает 1, Shift+ЛКМ — 2.
+В окне условия можно выбрать период заново; B — исключающая граница.
+Правый щелчок в Name/Value: Copy Name / Copy Value для текущей ячейки.
+Подсветить участки по условию — группы под диаграммой с отдельной прозрачностью.
+В окне копирования доступны разделитель и уникальные значения с сортировкой.
+Name и Value имеют независимые границы; Value расширяется при длинных значениях.
+Общий Radix, тема, заливка и стили подсветки находятся в «Настройки → Настройки…».
 Стрелка слева от шины — раскрыть / свернуть биты.
 Перетаскивание имени — изменить порядок строк.
 Верх / низ строки: вставить до / после; центр группы: перенести внутрь.
@@ -478,12 +691,14 @@ Ctrl + колесо — масштаб относительно мыши; + / �
 F — весь захват; Home / End — начало / конец.
 Ctrl+F — поиск; Enter / F3 — вперёд; Shift+F3 — назад.
 Ctrl+G — перейти к индексу отсчёта; Ctrl+O — открыть CSV.
+Ctrl+A после Name/Value — все видимые сигналы; после waveform — A=начало, B=конец.
+«Обновить CSV» справа вверху перечитывает файл, сохраняя оформление совпавших сигналов и действительные подсветки.
 Перетаскивание границы столбцов — ширина области имён.
 Правый щелчок — формат значения выбранного сигнала.
 
 Поиск: точное значение целой шины; результат — начало интервала.
 Без префикса используется выбранный HEX/UNSIGNED/SIGNED/BINARY.
-Префиксы 0x и 0b задают формат явно. Поиск циклический.
+Префиксы 0x и 0b задают формат явно. Галочка ↻ включает кольцевой поиск.
 Плотные изменения на общем виде показаны заполненной полосой.
 Приблизьте участок, чтобы увидеть отдельные переходы.
 
@@ -507,7 +722,11 @@ Ctrl+G — перейти к индексу отсчёта; Ctrl+O — откр�
             self.cancel_work()
             event.ignore()
             return
+        self.closing = True
+        if self.active_editor is not None:
+            self.active_editor.reject()
         self.save_preferences()
+        self.highlights.reset()
         if self.capture:
             self.view.capture = None
             self.view.auto_scroll.stop()

@@ -1,5 +1,7 @@
+* text=auto
 *.py text eol=lf
 *.md text eol=lf
 *.csv text eol=lf
 *.bat text eol=crlf
 *.png binary
+*.gitignore text eol=lf
