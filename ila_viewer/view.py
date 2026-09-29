@@ -32,6 +32,7 @@ class WaveformView(QAbstractScrollArea):
     copyRequested = Signal(str)
     cellCopyRequested = Signal(str)
     highlightRequested = Signal()
+    advancedHighlightRequested = Signal()
     periodMarkerPlaced = Signal(int, int)
     HEADER = 38
     ROW = 48

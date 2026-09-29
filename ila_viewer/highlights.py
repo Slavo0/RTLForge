@@ -65,6 +65,7 @@ class HighlightGroup:
     visible: bool = True
     id: str = ""
     opacity: int = 28
+    mode: str = "simple"
 
     def __post_init__(self):
         if not self.id:
@@ -132,7 +133,8 @@ class HighlightService:
                         if cancel():
                             raise LoadCancelled()
                         progress(round(100 * (sample - lower) / max(1, upper - lower)), index)
-                    if sample == marker_b or (condition is not None and not condition.matches(sample)):
+                    previous = sample - period if sample >= period else None
+                    if sample == marker_b or (condition is not None and not condition.matches(sample, previous)):
                         continue
                     start = max(sample, lower + (marker_b == lower))
                     end = min(sample + period, capture.count, upper + (marker_b != upper))

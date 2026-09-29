@@ -193,7 +193,8 @@ class CopyValuesService:
                             raise LoadCancelled()
                         if sample == request.exclude_sample:
                             continue
-                        if request.condition is not None and not request.condition.matches(sample):
+                        if request.condition is not None and not request.condition.matches(
+                                sample, sample - period if sample >= period else None):
                             continue
                         code = int(source.codes[source.run_index(sample)])
                         if request.samples == "changes" and previous_candidate is not None and code == previous_value:

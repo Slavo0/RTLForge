@@ -62,7 +62,9 @@ class CopyConditionDialog(QDialog):
         self.period_button = QPushButton("Выбрать период заново")
         self.period_button.clicked.connect(self.request_period_change)
         layout.addWidget(self.period_button)
-        self.error = QLabel("Операторы: &&, ||, !, ~, = / ==, !=, <, >, <=, >= и скобки.")
+        self.error = QLabel("Операторы: &&, ||, !, ~, = / ==, !=, <, >, <=, >=. "
+                            "Число без префикса — в Radix сравниваемого сигнала; "
+                            "h334 — HEX, b010100 — Binary, d34953 — Decimal.")
         self.error.setWordWrap(True)
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)

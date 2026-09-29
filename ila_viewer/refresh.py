@@ -28,6 +28,7 @@ class HighlightSpec:
     visible: bool
     id: str
     dependencies: frozenset[str]
+    mode: str = "simple"
 
 
 @dataclass
@@ -50,7 +51,9 @@ class CaptureRefreshState:
         visit(view.tree.root)
         groups = [HighlightSpec(g.name, g.expression, g.color, g.opacity,
                                 g.marker_a, g.marker_b, g.period, g.phase, g.visible, g.id,
-                                compiler.compile(g.expression).signal_names() if g.expression else frozenset())
+                                (compiler.compile_pattern(g.expression) if g.mode == "advanced"
+                                 else compiler.compile(g.expression)).signal_names() if g.expression else frozenset(),
+                                g.mode)
                   for g in model.groups]
         return cls(view.capture.count, styles, groups, model.master_enabled)
 
@@ -74,7 +77,7 @@ class CaptureRefreshState:
             node.options.reverse = saved.options.reverse
             node.options.real = replace(saved.options.real) if saved.options.real else None
 
-    def rebuild_highlights(self, capture, compiler, service,
+    def rebuild_highlights(self, capture, compiler, service, advanced_service,
                            progress=lambda percent, count: None, cancel=lambda: False):
         rebuilt = []
         available = {signal.name for signal in capture.signals}
@@ -85,18 +88,20 @@ class CaptureRefreshState:
                 if not item.dependencies <= available:
                     continue
                 try:
-                    condition = compiler.compile(item.expression)
+                    condition = (compiler.compile_pattern(item.expression) if item.mode == "advanced"
+                                 else compiler.compile(item.expression))
                 except ValueError:
                     continue  # A referenced signal disappeared from the refreshed CSV.
                 a = min(item.marker_a, capture.count)
                 b = capture.count if item.marker_b == self.source_count else min(item.marker_b, capture.count)
                 if a == b:
                     continue
-                intervals = service.build(capture, condition, a, b, item.period, item.phase,
+                builder = advanced_service if item.mode == "advanced" else service
+                intervals = builder.build(capture, condition, a, b, item.period, item.phase,
                                           lambda percent, rows: progress(percent, rows), cancel)
                 rebuilt.append(HighlightGroup(item.name, item.expression, item.color,
                                               intervals, a, b, item.period, item.phase,
-                                              item.visible, item.id, item.opacity))
+                                              item.visible, item.id, item.opacity, item.mode))
                 progress(round((index + 1) * 100 / max(1, len(self.highlights))), len(rebuilt))
             return rebuilt
         except BaseException:

@@ -27,6 +27,7 @@ from .conditions import ConditionCompiler
 from .copy_dialog import CopyOptionsDialog
 from .period_dialog import CopyPeriodBanner
 from .highlights import HighlightGroup, HighlightModel, HighlightService
+from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
 from .refresh import CaptureRefreshState
 from .tree import BusNode, SignalNode
@@ -52,6 +53,7 @@ class MainWindow(QMainWindow):
         self.bit_expansion = BitExpansionService()
         self.copy_service = CopyValuesService()
         self.highlight_service = HighlightService()
+        self.advanced_highlight_service = AdvancedHighlightService()
         self.highlights = HighlightModel(self)
         self.copy_period = None
         self.copy_phase = 0
@@ -66,6 +68,7 @@ class MainWindow(QMainWindow):
         self.highlight_panel = HighlightPanel(self.highlights, self.view)
         self.view.attach_highlight_panel(self.highlights, self.highlight_panel)
         self.highlight_panel.createRequested.connect(self.create_highlight)
+        self.highlight_panel.advancedRequested.connect(lambda: self.create_highlight(mode="advanced"))
         self.highlight_panel.editRequested.connect(self.create_highlight)
         self.themes.changed.connect(self.apply_theme)
         self.apply_theme()
@@ -74,6 +77,7 @@ class MainWindow(QMainWindow):
         self.view.copyRequested.connect(self.copy_values)
         self.view.cellCopyRequested.connect(self.copy_cell)
         self.view.highlightRequested.connect(self.create_highlight)
+        self.view.advancedHighlightRequested.connect(lambda: self.create_highlight(mode="advanced"))
         self.view.cursorChanged.connect(self.update_status)
         self.view.selectionChanged.connect(self.update_selection)
         self.view.message.connect(lambda s: self.statusBar().showMessage(s, 5000))
@@ -282,7 +286,7 @@ class MainWindow(QMainWindow):
             stack.extend(node.children)
         return ConditionCompiler(self.capture.signals, radix_by_name)
 
-    def create_highlight(self, group=None, draft=None):
+    def create_highlight(self, group=None, draft=None, mode="simple"):
         if isinstance(group, bool):
             group = None
         if self.active_editor is not None:
@@ -296,40 +300,41 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Откройте CSV для подсветки.", 6000)
             return
         if self.copy_period is None:
-            self.start_period_setup(continuation=lambda: self.create_highlight(group, draft))
+            self.start_period_setup(continuation=lambda: self.create_highlight(group, draft, mode))
             return
         compiler = self.condition_compiler()
         if group is None and draft is None:
             index = len(self.highlights.groups)
             draft = {"name": f"Подсветка {index + 1}",
-                     "style": index % len(self.preferences.highlight_palette)}
+                     "style": index % len(self.preferences.highlight_palette), "mode": mode}
         dialog = HighlightConditionDialog(self.capture.signals, compiler,
                                           self.preferences.highlight_palette,
                                           self.preferences.highlight_opacities,
                                           self, group, draft,
-                                          full_names=self.view.full_names)
+                                          full_names=self.view.full_names, mode=mode)
         self.show_editor(dialog, lambda accepted: self.finish_highlight_dialog(dialog, compiler, group, accepted))
 
     def finish_highlight_dialog(self, dialog, compiler, group, accepted):
         if not accepted:
             if dialog.reselect_period:
                 new_draft = dialog.draft()
-                self.start_period_setup(continuation=lambda: self.create_highlight(group, new_draft))
+                self.start_period_setup(continuation=lambda: self.create_highlight(group, new_draft, dialog.mode))
             return
         try:
-            condition = compiler.compile(dialog.condition_text())
+            condition = (compiler.compile_pattern(dialog.condition_text()) if dialog.mode == "advanced"
+                         else compiler.compile(dialog.condition_text()))
         except ValueError as exc:
             self.statusBar().showMessage(str(exc), 7000)
             return
         marker_a = group.marker_a if group else (self.view.cursor_a if self.view.cursor_b is not None else 0)
         marker_b = group.marker_b if group else (self.view.cursor_b if self.view.cursor_b is not None else self.capture.count)
         period, phase = self.copy_period, self.copy_phase
-        name, expression, color, opacity = (dialog.name_edit.text().strip(), dialog.condition_text(),
-                                            dialog.color, dialog.opacity)
+        name, expression, color, opacity, highlight_mode = (dialog.name_edit.text().strip(), dialog.condition_text(),
+                                                            dialog.color, dialog.opacity, dialog.mode)
 
         def complete(intervals):
             new_group = HighlightGroup(name, expression, color, intervals, marker_a, marker_b,
-                                       period, phase, opacity=opacity)
+                                       period, phase, opacity=opacity, mode=highlight_mode)
             if group and group in self.highlights.groups:
                 self.highlights.replace(group, new_group)
             elif group:
@@ -339,7 +344,8 @@ class MainWindow(QMainWindow):
                 self.highlights.add(new_group)
             self.statusBar().showMessage(f"Подсветка «{name}»: {intervals.count:,} участков.", 6000)
 
-        self.start_work(lambda task: self.highlight_service.build(
+        service = self.advanced_highlight_service if highlight_mode == "advanced" else self.highlight_service
+        self.start_work(lambda task: service.build(
             self.capture, condition, marker_a, marker_b, period, phase,
             task.progress.emit, task.isInterruptionRequested), complete,
             "Поиск участков для подсветки…", "проверенных периодов")
@@ -551,7 +557,7 @@ class MainWindow(QMainWindow):
                     self.highlights.add(group)
                 self.statusBar().showMessage(f"CSV обновлён · восстановлено подсветок: {len(groups)}", 6000)
             self.start_work(lambda task: state.rebuild_highlights(
-                capture, compiler, self.highlight_service,
+                capture, compiler, self.highlight_service, self.advanced_highlight_service,
                 task.progress.emit, task.isInterruptionRequested),
                 restored, "Восстановление подсветок после обновления CSV…", "подсветок")
 

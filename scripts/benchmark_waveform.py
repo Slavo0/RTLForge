@@ -20,6 +20,7 @@ from ila_viewer.preferences import PreferencesStore
 from ila_viewer.bits import BitExpansionService
 from ila_viewer.conditions import ConditionCompiler
 from ila_viewer.highlights import HighlightGroup, HighlightService
+from ila_viewer.advanced import AdvancedHighlightService
 
 
 def main():
@@ -88,6 +89,12 @@ def main():
         highlighted = HighlightService().build(cap, condition, 0, count - 1, 1, 0)
         highlight_seconds = time.perf_counter() - start
         assert highlighted.count > 400_000
+        pattern = ConditionCompiler(cap.signals).compile_pattern("fast_bit -> !fast_bit")
+        start = time.perf_counter()
+        advanced = AdvancedHighlightService().build(cap, pattern, 0, count, 1, 0)
+        advanced_seconds = time.perf_counter() - start
+        assert list(advanced.visible(0, 4)) == [(1.0, 4.0)]
+        advanced.close()
         v.set_range(0, count)
         start = time.perf_counter()
         bands = list(highlighted.visible(v.left, v.left + v.span, v.plot_width))
@@ -108,6 +115,7 @@ def main():
                   "expanded_full_capture_render_ms": round(expanded_render_ms, 2),
                   "copy_million_values_seconds": round(copy_seconds, 3),
                   "highlight_alternating_seconds": round(highlight_seconds, 3),
+                  "advanced_highlight_seconds": round(advanced_seconds, 3),
                   "highlight_full_view_bands": len(bands),
                   "highlight_visible_lookup_ms": round(highlight_visible_ms, 3),
                   "highlight_full_view_render_ms": round(highlight_render_ms, 3),

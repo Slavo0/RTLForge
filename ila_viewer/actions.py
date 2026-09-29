@@ -162,6 +162,8 @@ class HighlightActions(ContextActionProvider):
         action = menu.addAction("Подсветить участки по условию…", view.highlightRequested.emit)
         action.setEnabled(view.capture is not None)
         action.setToolTip("Создать подсветку A…B или всего захвата, если B не установлен")
+        advanced = menu.addAction("Advanced Highlight: последовательность событий…", view.advancedHighlightRequested.emit)
+        advanced.setEnabled(view.capture is not None)
 
 
 class ContextMenuController:

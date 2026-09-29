@@ -31,6 +31,7 @@ from ila_viewer.conditions import ConditionCompiler
 from ila_viewer.copy_dialog import CopyConditionDialog
 from ila_viewer.period_dialog import CopyPeriodBanner
 from ila_viewer.highlights import HighlightGroup, HighlightModel, HighlightService
+from ila_viewer.advanced import AdvancedHighlightService
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -265,6 +266,44 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(LoadCancelled):
             service.build(cap, condition, 0, 7, 1, 0, cancel=lambda: True)
         self.assertFalse(list(Path(cap.storage.name).glob("highlight_*.bin")))
+
+    def test_condition_ordering_radix_prefixes_and_previous_sample(self):
+        cap = self.capture("tx_data[7:0],tx_valid\nRadix - HEX,HEX\n09,1\n0A,1\n10,0\n")
+        hex_compiler = ConditionCompiler(cap.signals, {cap.signals[0].name: "HEX"})
+        decimal_compiler = ConditionCompiler(cap.signals, {cap.signals[0].name: "UNSIGNED"})
+        cases = (("tx_data >= 0A", [False, True, True]),
+                 ("tx_data <= h0A", [True, True, False]),
+                 ("h0A <= tx_data", [False, True, True]),
+                 ("tx_data < b0010000", [True, True, False]),
+                 ("tx_data == d10", [False, True, False]))
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                self.assertEqual([hex_compiler.compile(expression).matches(i) for i in range(3)], expected)
+        self.assertEqual([decimal_compiler.compile("tx_data >= 10").matches(i) for i in range(3)],
+                         [False, True, True])
+        self.assertEqual([hex_compiler.compile("tx_data >= 10").matches(i) for i in range(3)],
+                         [False, False, True])
+        condition = hex_compiler.compile("tx_data != prev(tx_data) && tx_valid")
+        self.assertEqual([condition.matches(i, i - 1 if i else None) for i in range(3)],
+                         [False, True, False])
+        self.assertTrue(hex_compiler.compile("tx_data != tx_data_prev").matches(1, 0))
+        signed = self.capture("signed[7:0]\nRadix - SIGNED\n-1\n0\n")
+        signed_compiler = ConditionCompiler(signed.signals, {signed.signals[0].name: "SIGNED"})
+        self.assertTrue(signed_compiler.compile("signed == d-1").matches(0))
+
+    def test_advanced_highlight_matches_event_sequences_on_period_phase(self):
+        cap = self.capture("tx_valid,tx_ready,tx_data[7:0]\nRadix - HEX,HEX,HEX\n"
+                           "0,0,00\n1,0,A0\n0,0,00\n1,0,A1\n0,0,00\n0,1,A2\n"
+                           "0,0,00\n1,0,B0\n0,0,00\n1,0,B1\n0,0,00\n")
+        compiler = ConditionCompiler(cap.signals)
+        pattern = compiler.compile_pattern("tx_valid && !tx_ready -> tx_valid && tx_data != prev(tx_data)")
+        service = AdvancedHighlightService()
+        intervals = service.build(cap, pattern, 0, cap.count, 2, 1)
+        self.addCleanup(intervals.close)
+        self.assertEqual(list(intervals.visible(0, cap.count)), [(1.0, 5.0), (7.0, 11.0)])
+        with self.assertRaises(LoadCancelled):
+            service.build(cap, pattern, 0, cap.count, 2, 1, cancel=lambda: True)
+        self.assertEqual(len(list(Path(cap.storage.name).glob("advanced_*.bin"))), 1)
 
     def test_style_and_highlight_palette_preferences_roundtrip_without_groups(self):
         path = Path(self.temp.name) / "preferences.json"
@@ -744,13 +783,22 @@ class InteractionTests(unittest.TestCase):
             self.wait()
             self.assertEqual(len(w.highlights.groups), 1)
             old_id = w.highlights.groups[0].id
+            w.create_highlight(mode="advanced")
+            advanced_dialog = w.active_editor
+            self.assertEqual(advanced_dialog.mode, "advanced")
+            advanced_dialog.stage_edit.setPlainText("dead\ndead && data != prev(data)")
+            advanced_dialog.validate_and_accept()
+            self.wait()
+            self.assertEqual(len(w.highlights.groups), 2)
+            self.assertEqual(w.highlights.groups[1].mode, "advanced")
             path.write_text("data[7:0],dead\nRadix - HEX,HEX\n01,1\n02,1\n03,0\n04,1\n", encoding="utf-8")
             w.refresh_csv()
             self.wait()
             self.assertEqual(w.view.tree.root.children[0].options.color, "#ff1234")
-            self.assertEqual(len(w.highlights.groups), 1)
+            self.assertEqual(len(w.highlights.groups), 2)
             self.assertEqual(w.highlights.groups[0].id, old_id)
             self.assertEqual(w.highlights.groups[0].marker_b, 4)
+            self.assertEqual(w.highlights.groups[1].mode, "advanced")
             path.write_text("data[7:0]\nRadix - HEX\n01\n02\n", encoding="utf-8")
             w.refresh_csv()
             self.wait()

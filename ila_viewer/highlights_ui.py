@@ -6,19 +6,39 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QScrollArea, QSpinBox, QWidget)
+                               QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QWidget)
 
 from .copy_dialog import CopyConditionDialog
 
 
 class HighlightConditionDialog(CopyConditionDialog):
-    def __init__(self, signals, compiler, palette, opacities, parent=None, group=None, draft=None, full_names=True):
+    def __init__(self, signals, compiler, palette, opacities, parent=None, group=None, draft=None, full_names=True, mode="simple"):
         draft = draft or {}
+        mode = draft.get("mode", group.mode if group else mode)
         super().__init__(signals, compiler, parent, full_names,
-                         expression_text=draft.get("expression", group.expression if group else ""),
+                         expression_text=draft.get("expression", group.expression if group else "") if mode == "simple" else "",
                          title="Редактировать подсветку" if group else "Новая подсветка",
                          description="Условие проверяется в выбранной фазе периода. Совпавшие участки закрашиваются на диаграмме.")
         self.name_edit = QLineEdit(draft.get("name", group.name if group else "Подсветка"))
+        self.mode_box = QComboBox()
+        self.mode_box.addItem("Обычное условие", "simple")
+        self.mode_box.addItem("Advanced Highlight · последовательность событий", "advanced")
+        self.mode_box.setCurrentIndex(1 if mode == "advanced" else 0)
+        self.layout().insertWidget(1, self.mode_box)
+        self.stage_hint = QLabel("Каждая строка — следующий отсчёт заданного периода. Подсвечивается вся совпавшая последовательность.")
+        self.stage_hint.setWordWrap(True)
+        self.stage_edit = QPlainTextEdit()
+        self.stage_edit.setPlaceholderText("tx_valid && !tx_ready\ntx_valid && tx_data != prev(tx_data)")
+        self.stage_edit.setMinimumHeight(100)
+        self.stage_edit.setPlainText("\n".join(compiler.split_sequence(draft.get("expression", group.expression if group else ""))) if mode == "advanced" else "")
+        self.template_button = QPushButton("Пример: нарушение AXI Stream")
+        self.template_button.clicked.connect(lambda: self.stage_edit.setPlainText(
+            "tx_valid && !tx_ready\ntx_valid && tx_data != prev(tx_data)"))
+        self.layout().insertWidget(2, self.stage_hint)
+        self.layout().insertWidget(3, self.stage_edit)
+        self.layout().insertWidget(4, self.template_button)
+        self.mode_box.currentIndexChanged.connect(self.update_mode)
+        self.update_mode()
         self.layout().insertWidget(1, QLabel("Название группы:"))
         self.layout().insertWidget(2, self.name_edit)
         self.palette = palette
@@ -72,14 +92,48 @@ class HighlightConditionDialog(CopyConditionDialog):
 
     def draft(self):
         return {"name": self.name_edit.text().strip(), "expression": self.condition_text(),
-                "style": self.style_box.currentIndex(), "color": self.color, "opacity": self.opacity}
+                "style": self.style_box.currentIndex(), "color": self.color, "opacity": self.opacity,
+                "mode": self.mode}
+
+    @property
+    def mode(self):
+        return self.mode_box.currentData()
+
+    def update_mode(self):
+        advanced = self.mode == "advanced"
+        self.expression.setVisible(not advanced)
+        self.stage_hint.setVisible(advanced)
+        self.stage_edit.setVisible(advanced)
+        self.template_button.setVisible(advanced)
+
+    def condition_text(self):
+        if self.mode == "advanced":
+            return " -> ".join(line.strip() for line in self.stage_edit.toPlainText().splitlines())
+        return super().condition_text()
+
+    def insert_signal(self, signal):
+        if self.mode != "advanced":
+            return super().insert_signal(signal)
+        cursor = self.stage_edit.textCursor()
+        cursor.insertText(self.compiler.token_for(signal) + " ")
+        self.stage_edit.setTextCursor(cursor)
+        self.stage_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def validate_and_accept(self):
         if not self.name_edit.text().strip():
             self.error.setText("Введите название группы.")
             self.name_edit.setFocus()
             return
-        super().validate_and_accept()
+        if self.mode == "advanced":
+            try:
+                self.compiler.compile_pattern(self.condition_text())
+            except ValueError as exc:
+                self.error.setText(str(exc))
+                self.stage_edit.setFocus()
+                return
+            self.accept()
+        else:
+            super().validate_and_accept()
 
 
 class HighlightChip(QFrame):
@@ -115,7 +169,8 @@ class HighlightChip(QFrame):
         self.enabled_box.blockSignals(False)
         foreground = "#111111" if QColor(group.color).lightness() > 140 else "#ffffff"
         self.color_button.setStyleSheet(f"background: {group.color}; color: {foreground}")
-        self.setToolTip(f"{group.expression or '(без условия)'} · {group.intervals.count} участков · {group.opacity} %")
+        title = "Advanced Highlight · " if group.mode == "advanced" else ""
+        self.setToolTip(f"{title}{group.expression or '(без условия)'} · {group.intervals.count} участков · {group.opacity} %")
 
     def set_visible(self, checked):
         self.group.visible = checked
@@ -130,6 +185,7 @@ class HighlightChip(QFrame):
 
 class HighlightPanel(QWidget):
     createRequested = Signal()
+    advancedRequested = Signal()
     editRequested = Signal(object)
 
     def __init__(self, model, parent=None):
@@ -148,6 +204,10 @@ class HighlightPanel(QWidget):
         button = QPushButton("+ Подсветка")
         button.clicked.connect(self.createRequested.emit)
         outer.addWidget(button)
+        advanced = QPushButton("+ Advanced")
+        advanced.setToolTip("Подсветить последовательность событий на соседних отсчётах периода")
+        advanced.clicked.connect(self.advancedRequested.emit)
+        outer.addWidget(advanced)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)

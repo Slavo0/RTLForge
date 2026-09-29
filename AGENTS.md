@@ -43,6 +43,11 @@ The user requires object-oriented, extensible design for this application.
 - Build conditional highlights in cancellable background work with disk-backed,
   merged intervals. Render only intervals intersecting the visible viewport;
   dispose indices when a group or capture is removed.
+- Numeric condition literals inherit the compared signal's display radix unless
+  prefixed with h/b/d. Preserve operand order for relational comparisons.
+  Advanced Highlight stages match consecutive calibrated samples; prev(signal)
+  refers to the preceding sample on that period grid. Keep overlapping matches
+  and rebuild advanced groups after CSV refresh when their signals still exist.
 - CSV refresh reconciles signal styling by source name and recompiles highlight
   conditions against the new capture; opening another CSV starts fresh. Keep
   copy/highlight editors nonmodal so navigation and zoom remain available.
