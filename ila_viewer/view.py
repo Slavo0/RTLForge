@@ -137,7 +137,7 @@ class WaveformView(QAbstractScrollArea):
         self.period_markers = [None, None]
         self.period_marker_target = None
         self.period_mode = False
-        self.tree = SignalTree(capture.signals, capture.metadata)
+        self.tree = SignalTree(capture.signals, capture.metadata, capture.split_buses)
         self.filter_text = ""
         self.selected = 0
         self.selection = RowSelection()
@@ -392,9 +392,17 @@ class WaveformView(QAbstractScrollArea):
                 self.set_cursor(sample)
 
     def sample_x(self, sample):
+        if self.capture and self.capture.times is not None:
+            left = self.capture.time_at(self.left)
+            right = self.capture.time_at(self.left + self.span)
+            return self.plot_left + (self.capture.time_at(sample) - left) / max(1, right - left) * self.plot_width
         return self.plot_left + (sample - self.left) / self.span * self.plot_width
 
     def x_sample(self, x):
+        if self.capture and self.capture.times is not None:
+            left = self.capture.time_at(self.left)
+            right = self.capture.time_at(self.left + self.span)
+            return self.capture.sample_at_time(left + (x - self.plot_left) / self.plot_width * (right - left))
         return self.left + (x - self.plot_left) / self.plot_width * self.span
 
     def nearest_sample(self, x):

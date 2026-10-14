@@ -142,7 +142,7 @@ class CopyValuesService:
             start, end, excluded = 0, view.capture.count - 1, None
         else:
             start, end = sorted((view.cursor_a, view.cursor_b))
-            excluded = int(view.cursor_b)
+            excluded = end
         separator_key = separator or view.preferences.copy_separator
         return CopyRequest(tuple(channels), start, end, SEPARATORS[separator_key],
                            samples, max(1, int(period)), condition,

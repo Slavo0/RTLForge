@@ -129,6 +129,56 @@ class Capture:
     metadata: dict[str, np.ndarray]
     storage: tempfile.TemporaryDirectory
     derived: list = field(default_factory=list)
+    times: np.ndarray | None = None
+    timescale: str = ""
+    split_buses: dict[str, list[SignalData]] = field(default_factory=dict)
+
+    def time_at(self, sample):
+        """Interpolate a simulator timestamp at an event index, including the end boundary."""
+        if self.times is None:
+            return sample
+        index = float(sample)
+        if self.count == 1:
+            return float(self.times[0]) + index
+        if index >= self.count - 1:
+            return float(self.times[-1]) + (index - self.count + 1)
+        low = max(0, int(index))
+        return float(self.times[low]) + (index - low) * int(self.times[low + 1] - self.times[low])
+
+    def sample_at_time(self, timestamp):
+        if self.times is None:
+            return float(timestamp)
+        if self.count == 1:
+            return float(timestamp) - float(self.times[0])
+        if timestamp >= self.times[-1]:
+            return self.count - 1 + (timestamp - float(self.times[-1]))
+        index = max(0, int(np.searchsorted(self.times, timestamp, side="right")) - 1)
+        return index + (timestamp - float(self.times[index])) / int(self.times[index + 1] - self.times[index])
+
+    def samples_at_times(self, timestamps):
+        """Vectorized inverse for viewport-width rendering only."""
+        ticks = np.asarray(timestamps, dtype=np.float64)
+        if self.count == 1:
+            return ticks - float(self.times[0])
+        indices = np.clip(np.searchsorted(self.times, ticks, side="right") - 1, 0, self.count - 2)
+        low = self.times[indices].astype(np.float64)
+        high = self.times[indices + 1].astype(np.float64)
+        result = indices + (ticks - low) / (high - low)
+        beyond = ticks >= self.times[-1]
+        if np.any(beyond):
+            result[beyond] = self.count - 1 + (ticks[beyond] - float(self.times[-1]))
+        return result
+
+    def format_time(self, sample):
+        if self.times is None:
+            return str(sample)
+        return self.format_ticks(self.time_at(sample))
+
+    def format_ticks(self, ticks):
+        match = re.fullmatch(r"(\d+)(fs|ps|ns|us|ms|s)", self.timescale)
+        if match:
+            return f"{ticks * int(match[1]):g} {match[2]}"
+        return f"{ticks:g} × {self.timescale}"
 
     def close(self):
         for result in self.derived:
@@ -141,6 +191,8 @@ class Capture:
         for data in self.metadata.values():
             if isinstance(data, np.memmap):
                 data._mmap.close()
+        if isinstance(self.times, np.memmap):
+            self.times._mmap.close()
         self.storage.cleanup()
 
 

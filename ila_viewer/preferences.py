@@ -24,6 +24,7 @@ class ViewerPreferences:
     maximized: bool = False
     copy_separator: str = "space"
     last_csv_directory: str = ""
+    wlf2vcd_path: str = ""
     separate_signal_styles: bool = False
     fill_bus: bool = False
     signal_colors: dict = field(default_factory=dict)

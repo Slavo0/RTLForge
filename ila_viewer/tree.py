@@ -116,10 +116,25 @@ class VisibleRow:
 
 
 class SignalTree:
-    def __init__(self, signals=(), metadata=None):
+    def __init__(self, signals=(), metadata=None, split_buses=None):
         self.root = GroupNode("root")
         self.root.expanded = True
+        split_buses = split_buses or {}
+        parents = {signal.name: signal for signal in signals if signal.name in split_buses}
+        children = {child.name: parent for parent, bits in split_buses.items() for child in bits}
+        inserted = set()
         for signal in signals:
+            parent = children.get(signal.name)
+            if parent is not None:
+                if parent not in inserted:
+                    bus = BusNode(parents[parent].short_name, parents[parent])
+                    for bit in split_buses[parent]:
+                        bus.add(BitNode(re.search(r"\[\d+\]$", bit.name).group(), bit))
+                    self.root.add(bus)
+                    inserted.add(parent)
+                continue
+            if signal.name in inserted:
+                continue
             cls = BusNode if signal.is_bus else SignalNode
             self.root.add(cls(signal.short_name, signal))
         if metadata:

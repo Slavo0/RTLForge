@@ -11,6 +11,9 @@ The user requires object-oriented, extensible design for this application.
   signals. Keep these changes in the presentation model.
 - Preserve disk-backed indexing, viewport-bounded rendering and cancellation for
   expensive operations. Expanded bits need their own actual transition indices.
+- Route CSV, VCD and WLF through CaptureSource implementations. WLF uses the
+  vendor wlf2vcd utility; never guess its binary layout. Keep VCD timestamps
+  disk-backed and draw simulator captures proportional to their real time axis.
 - A plain left click on the waveform removes B; Shift+left click creates/moves B.
 - A plain waveform click selects its row and moves A; Ctrl+click toggles that row;
   Shift+click moves B without changing row selection.
@@ -32,7 +35,8 @@ The user requires object-oriented, extensible design for this application.
   context-menu clicks. Validate multi-row moves before modifying the tree.
 - Plain drag on the waveform zooms a range; dragging a marker moves it. Ignore
   zoom gestures smaller than two samples. Shift+drag still controls B.
-- Copy from A to B with B excluded. Pack selected bits by physical significance, using the
+- Copy between A and B with the earlier boundary included and the later boundary excluded,
+  regardless of marker order. Pack selected bits by physical significance, using the
   parent bus radix by default. Clipboard writes happen on the GUI thread only
   after successful background export. Tests must inject an isolated clipboard.
 - With no B, copy or highlight the entire capture. The copy dialog owns per-channel

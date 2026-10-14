@@ -5,7 +5,7 @@
 from dataclasses import replace
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
-                              QFormLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
+                              QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
                               QTabWidget, QVBoxLayout, QWidget)
 from .formats import FORMATS
 
@@ -89,6 +89,21 @@ class AppearanceDialog(QDialog):
         self.refresh_highlight_colors()
         highlight_form.addRow(QLabel("Цвет и прозрачность стилей сохраняются. Созданную группу можно дополнительно настроить отдельно."))
         tabs.addTab(highlight_page, "Подсветка")
+        sources_page = QWidget()
+        sources_form = QFormLayout(sources_page)
+        converter_row = QHBoxLayout()
+        self.wlf_converter_edit = QLineEdit(preferences.wlf2vcd_path)
+        self.wlf_converter_edit.setPlaceholderText("Из PATH, если поле пустое")
+        converter_row.addWidget(self.wlf_converter_edit, 1)
+        browse_converter = QPushButton("Обзор…")
+        browse_converter.clicked.connect(self.choose_wlf_converter)
+        converter_row.addWidget(browse_converter)
+        sources_form.addRow("Questa wlf2vcd", converter_row)
+        sources_note = QLabel("Для открытия .wlf выберите wlf2vcd.exe из установленного Questa/ModelSim. "
+                              "Файлы .vcd открываются без дополнительных программ.")
+        sources_note.setWordWrap(True)
+        sources_form.addRow(sources_note)
+        tabs.addTab(sources_page, "Источники")
         layout.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -103,7 +118,14 @@ class AppearanceDialog(QDialog):
                        highlight_opacities=[box.value() for box in self.highlight_opacity_boxes],
                        restore_highlight_visibility=self.restore_highlight_box.isChecked(),
                        hide_empty_highlight_panel=self.hide_empty_highlights_box.isChecked(),
-                       full_names=self.names_box.isChecked())
+                       full_names=self.names_box.isChecked(),
+                       wlf2vcd_path=self.wlf_converter_edit.text().strip())
+
+    def choose_wlf_converter(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать wlf2vcd", self.wlf_converter_edit.text(),
+                                              "Программы (*.exe);;Все файлы (*)")
+        if path:
+            self.wlf_converter_edit.setText(path)
 
     def refresh_signal_colors(self, *_):
         theme = self.themes.themes[self.theme_box.currentData()]

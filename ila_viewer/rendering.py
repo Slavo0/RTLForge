@@ -60,7 +60,12 @@ class WaveformRenderer:
         else:
             # Preserve subpixel activity: shade any pixel containing transitions.
             # Work is bounded by viewport width, regardless of capture length.
-            edges = np.linspace(v.left, v.left + v.span, v.plot_width + 1)
+            if v.capture.times is not None:
+                time_edges = np.linspace(v.capture.time_at(v.left),
+                                         v.capture.time_at(v.left + v.span), v.plot_width + 1)
+                edges = v.capture.samples_at_times(time_edges)
+            else:
+                edges = np.linspace(v.left, v.left + v.span, v.plot_width + 1)
             indices = np.maximum(0, np.searchsorted(sig.starts, edges, side="right") - 1)
             run_start = 0
             while run_start < v.plot_width:
@@ -110,14 +115,22 @@ class WaveformRenderer:
                 painter.fillRect(QRectF(0, y, w, v.ROW), QColor(theme.alternate))
             painter.setPen(grid)
             self.line(painter, 0, y + v.ROW, w, y + v.ROW)
-        # Tick spacing uses 1/2/5 decades and never goes below one sample.
-        ideal = v.span / max(1, v.plot_width / 100)
+        # Tick spacing uses 1/2/5 decades in samples or simulator time.
+        if v.capture.times is not None:
+            axis_left = v.capture.time_at(v.left)
+            axis_right = v.capture.time_at(v.left + v.span)
+            ideal = (axis_right - axis_left) / max(1, v.plot_width / 100)
+        else:
+            axis_left, axis_right = v.left, v.left + v.span
+            ideal = v.span / max(1, v.plot_width / 100)
         decade = 10 ** math.floor(math.log10(max(1, ideal)))
         step = next((v * decade for v in (1, 2, 5, 10) if v * decade >= ideal), 10 * decade)
-        ticks = list(range(max(0, math.ceil(v.left / step) * step), math.ceil(v.left + v.span), step))
+        time_ticks = range(max(0, math.ceil(axis_left / step) * step), math.ceil(axis_right), step)
+        ticks = [(v.capture.sample_at_time(tick) if v.capture.times is not None else tick, tick)
+                 for tick in time_ticks]
         painter.setPen(grid)
-        for tick in ticks:
-            x = v.sample_x(tick)
+        for sample, _ in ticks:
+            x = v.sample_x(sample)
             self.line(painter, x, v.HEADER, x, h)
         if v.highlight_model and v.highlight_model.master_enabled:
             for group in v.highlight_model.groups:
@@ -186,9 +199,10 @@ class WaveformRenderer:
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "Value")
         painter.save()
         painter.setClipRect(QRectF(split, 0, v.plot_width, h))
-        for tick in ticks:
-            x = v.sample_x(tick)
-            label = f"{tick * v.period_ns:g} ns" if v.period_ns else str(tick)
+        for sample, tick in ticks:
+            x = v.sample_x(sample)
+            label = (v.capture.format_time(sample) if v.capture.times is not None else
+                     f"{tick * v.period_ns:g} ns" if v.period_ns else str(tick))
             painter.setPen(muted)
             painter.drawText(QRectF(x + 4, 0, 110, v.HEADER), Qt.AlignmentFlag.AlignVCenter, label)
         if not v.period_mode and v.cursor_b is not None:

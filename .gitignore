@@ -17,3 +17,5 @@ artifacts/
 .vscode/
 .DS_Store
 Thumbs.db
+*.wlf
+*.vcd

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 
 from .workers import BackgroundTask
 from .themes import ThemeManager
-from .sources import VivadoCsvSource
+from .sources import AutoCaptureSource, WlfCaptureSource, QuestaWlfConverter, WlfExportService
 from .bits import BitExpansionService
 from .formats import FORMATS
 from .view import WaveformView
@@ -30,7 +30,6 @@ from .highlights import HighlightGroup, HighlightModel, HighlightService
 from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
 from .refresh import CaptureRefreshState
-from .tree import BusNode, SignalNode
 
 
 class MainWindow(QMainWindow):
@@ -47,7 +46,8 @@ class MainWindow(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(300)
         self.save_timer.timeout.connect(self.save_preferences)
-        self.source = source or VivadoCsvSource()
+        self.source = source or AutoCaptureSource(wlf=WlfCaptureSource(
+            converter=QuestaWlfConverter(self.preferences.wlf2vcd_path or None)))
         self.themes = themes or ThemeManager()
         self.themes.select(self.preferences.theme if self.preferences.theme in self.themes.themes else next(iter(self.themes.themes)))
         self.bit_expansion = BitExpansionService()
@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Навигация", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        self.open_action = self.add_action(toolbar, "Открыть CSV", self.choose_file, "Ctrl+O")
+        self.open_action = self.add_action(toolbar, "Открыть захват", self.choose_file, "Ctrl+O")
         toolbar.addSeparator()
         self.add_action(toolbar, "+", lambda: self.view.zoom_toolbar(0.5), tooltip="Приблизить относительно середины A↔B")
         self.add_action(toolbar, "−", lambda: self.view.zoom_toolbar(2), tooltip="Отдалить относительно середины A↔B")
@@ -100,12 +100,13 @@ class MainWindow(QMainWindow):
         toolbar_spacer = QWidget()
         toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(toolbar_spacer)
-        self.refresh_action = self.add_action(toolbar, "Обновить CSV", self.refresh_csv,
-                                              tooltip="Повторно открыть текущий CSV с диска")
+        self.refresh_action = self.add_action(toolbar, "Обновить файл", self.refresh_csv,
+                                              tooltip="Повторно открыть текущий захват с диска")
         self.refresh_action.setEnabled(False)
 
         tools_menu = self.menuBar().addMenu("Файл")
         tools_menu.addAction(self.open_action)
+        self.add_action(tools_menu, "Сохранить WLF как VCD…", self.export_wlf)
         self.add_action(tools_menu, "Сохранить вид как PNG…", self.save_image)
         self.add_action(tools_menu, "Выход", self.close, "Ctrl+Q")
         settings = self.menuBar().addMenu("Настройки")
@@ -214,17 +215,16 @@ class MainWindow(QMainWindow):
         selected = self.copy_service.selected_targets(self.view)
         selected_ids = {node.id for node, _ in selected}
         available = []
+        picker_signals = []
         def visit(node):
-            if node.signal and node.kind != "bit" and node.id not in selected_ids:
-                available.append((node, None))
+            if node.signal and node.kind != "bit":
+                picker_signals.append(node.signal.source)
+                if node.id not in selected_ids:
+                    available.append((node, None))
             for child in node.children:
                 visit(child)
         visit(self.view.tree.root)
-        listed_names = {node.signal.source.name for node, _ in selected + available}
-        for source in self.capture.signals:
-            if source.name not in listed_names:
-                available.append(((BusNode if source.is_bus else SignalNode)(source.short_name, source), None))
-        dialog = CopyOptionsDialog(self.capture.signals, compiler,
+        dialog = CopyOptionsDialog(picker_signals, compiler,
                                    selected, self.copy_service,
                                    self, full_names=self.view.full_names,
                                    expression_text=self.pending_copy_expression,
@@ -406,6 +406,10 @@ class MainWindow(QMainWindow):
 
     def apply_preferences(self, preferences):
         self.preferences = preferences
+        if isinstance(self.source, AutoCaptureSource):
+            converter = self.source.readers[".wlf"].converter
+            if isinstance(converter, QuestaWlfConverter):
+                converter.executable = preferences.wlf2vcd_path or None
         self.view.preferences = preferences
         self.view.full_names = preferences.full_names
         self.themes.select(preferences.theme)
@@ -449,11 +453,32 @@ class MainWindow(QMainWindow):
 
     def choose_file(self):
         initial = self.preferences.last_csv_directory or str(Path.cwd())
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть Vivado ILA CSV", initial, "CSV (*.csv);;Все файлы (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть захват", initial,
+                                              "Захваты (*.csv *.vcd *.wlf);;Vivado CSV (*.csv);;VCD (*.vcd);;Questa WLF (*.wlf);;Все файлы (*)")
         if path:
             self.preferences.last_csv_directory = str(Path(path).resolve().parent)
             self.save_timer.start()
             self.open_file(path)
+
+    def export_wlf(self):
+        if self.worker:
+            self.statusBar().showMessage("Дождитесь окончания текущей операции.", 5000)
+            return
+        initial = str(self.capture.path) if self.capture and self.capture.path.suffix.lower() == ".wlf" else self.preferences.last_csv_directory
+        source, _ = QFileDialog.getOpenFileName(self, "Выбрать WLF", initial, "Questa WLF (*.wlf)")
+        if not source:
+            return
+        destination, _ = QFileDialog.getSaveFileName(self, "Сохранить VCD", str(Path(source).with_suffix(".vcd")),
+                                                      "VCD (*.vcd)")
+        if not destination:
+            return
+        if Path(destination).suffix.lower() != ".vcd":
+            destination += ".vcd"
+        converter = QuestaWlfConverter(self.preferences.wlf2vcd_path or None)
+        service = WlfExportService(converter)
+        self.start_work(lambda task: service.export(source, destination, task.isInterruptionRequested),
+                        lambda result: self.open_file(result),
+                        "Конвертация WLF в VCD…", "отсчётов")
 
     def refresh_csv(self):
         if self.capture:
@@ -555,7 +580,7 @@ class MainWindow(QMainWindow):
             def restored(groups):
                 for group in groups:
                     self.highlights.add(group)
-                self.statusBar().showMessage(f"CSV обновлён · восстановлено подсветок: {len(groups)}", 6000)
+                self.statusBar().showMessage(f"Захват обновлён · восстановлено подсветок: {len(groups)}", 6000)
             self.start_work(lambda task: state.rebuild_highlights(
                 capture, compiler, self.highlight_service, self.advanced_highlight_service,
                 task.progress.emit, task.isInterruptionRequested),
@@ -576,11 +601,16 @@ class MainWindow(QMainWindow):
             return
         v = self.view
         parts = [f"A: {v.cursor_a:,}"]
-        if v.period_ns:
+        if self.capture.times is not None:
+            parts.append(f"tA: {self.capture.format_time(v.cursor_a)}")
+        elif v.period_ns:
             parts.append(f"tA: {v.cursor_a * v.period_ns:g} ns")
         if v.cursor_b is not None:
             parts.extend([f"B: {v.cursor_b:,}", f"Δ: {abs(v.cursor_b - v.cursor_a):,} отсч."])
-            if v.period_ns:
+            if self.capture.times is not None:
+                delta = abs(self.capture.time_at(v.cursor_b) - self.capture.time_at(v.cursor_a))
+                parts.append(f"Δt: {self.capture.format_ticks(delta)}")
+            elif v.period_ns:
                 parts.append(f"Δt: {abs(v.cursor_b - v.cursor_a) * v.period_ns:g} ns")
         for name, data in self.capture.metadata.items():
             parts.append(f"{name}: {int(data[v.cursor_a])}")
@@ -696,9 +726,9 @@ Ctrl + колесо — масштаб относительно мыши; + / �
 Средняя кнопка мыши + движение — прокрутка времени.
 F — весь захват; Home / End — начало / конец.
 Ctrl+F — поиск; Enter / F3 — вперёд; Shift+F3 — назад.
-Ctrl+G — перейти к индексу отсчёта; Ctrl+O — открыть CSV.
+Ctrl+G — перейти к индексу отсчёта; Ctrl+O — открыть CSV, VCD или WLF.
 Ctrl+A после Name/Value — все видимые сигналы; после waveform — A=начало, B=конец.
-«Обновить CSV» справа вверху перечитывает файл, сохраняя оформление совпавших сигналов и действительные подсветки.
+«Обновить файл» справа вверху перечитывает захват, сохраняя оформление совпавших сигналов и действительные подсветки.
 Перетаскивание границы столбцов — ширина области имён.
 Правый щелчок — формат значения выбранного сигнала.
 
@@ -710,7 +740,10 @@ Ctrl+A после Name/Value — все видимые сигналы; посл�
 
 Ось X — порядок строк CSV, начиная с 0. Sample in Buffer/Window
 показываются отдельно. Время вычисляется только из введённого
-периода: при захвате с пропусками это не реальное время.""")
+периода: при захвате с пропусками это не реальное время.
+Для VCD/WLF ось пропорциональна времени симуляции; индекс отсчёта означает
+порядковый номер временной отметки с событиями. WLF требует wlf2vcd из Questa/ModelSim.
+«Файл → Сохранить WLF как VCD…» создаёт VCD для просмотра без Questa.""")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and any(u.isLocalFile() for u in event.mimeData().urls()):

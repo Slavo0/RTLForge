@@ -171,9 +171,11 @@ class ConditionCompiler:
         self.signals = list(signals)
         self.radix_by_name = radix_by_name or {}
         self.by_full = {s.name.casefold(): s for s in self.signals}
+        self.by_exact = {}
         self.by_short = {}
         for signal in self.signals:
             short = signal.short_name
+            self.by_exact.setdefault(short.casefold(), []).append(signal)
             aliases = {short, re.sub(r"\[\d+(?::\d+)?\]$", "", short)}
             stem = re.sub(r"\[\d+(?::\d+)?\]$", "", short)
             aliases.update(stem[index + 1:] for index, char in enumerate(stem) if char == "_")
@@ -181,11 +183,24 @@ class ConditionCompiler:
                 self.by_short.setdefault(alias.casefold(), []).append(signal)
 
     def token_for(self, signal):
-        matches = self.by_short.get(signal.short_name.casefold(), [])
+        matches = self.choices_for(signal.short_name)
         simple = re.fullmatch(r"[A-Za-z_]\w*(?:\[\d+(?::\d+)?\])?", signal.short_name)
         if simple and len(matches) == 1:
             return signal.short_name
         return f"`{signal.name}`"
+
+    def choices_for(self, name):
+        """Prefer an exact short name over suffix aliases from other signals."""
+        key = name.casefold()
+        exact = self.by_exact.get(key, [])
+        if exact:
+            return exact
+        choices = self.by_short.get(key, [])
+        # A split VCD bus has physical bit declarations plus the assembled bus.
+        # Its bare stem should name the bus, not an ambiguous set of bits.
+        buses = [signal for signal in choices if signal.width > 1 and
+                 re.sub(r"\[\d+:\d+\]$", "", signal.short_name).casefold() == key]
+        return buses or choices
 
     def compile(self, expression):
         self.tokens = []
@@ -300,13 +315,13 @@ class ConditionCompiler:
         signal = self.by_full.get(name.casefold()) if quoted else None
         lag = 0
         if not quoted:
-            choices = self.by_short.get(name.casefold(), [])
+            choices = self.choices_for(name)
             if len(choices) == 1:
                 signal = choices[0]
             elif len(choices) > 1:
                 raise ValueError(f"Имя {name} неоднозначно; выберите его в списке сигналов")
             if signal is None and name.casefold().endswith("_prev"):
-                choices = self.by_short.get(name[:-5].casefold(), [])
+                choices = self.choices_for(name[:-5])
                 if len(choices) == 1:
                     signal, lag = choices[0], 1
                 elif len(choices) > 1:

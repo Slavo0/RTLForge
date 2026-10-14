@@ -19,7 +19,11 @@ class CopyConditionDialog(QDialog):
         self.reselect_period = False
         self.setWindowTitle(title)
         screen = self.screen()
-        self.resize(760, min(780, screen.availableGeometry().height() - 80) if screen else 780)
+        available = screen.availableGeometry() if screen else None
+        if available:
+            self.setMaximumSize(max(1, available.width() - 40), max(1, available.height() - 40))
+        self.resize(min(900, available.width() - 40) if available else 900,
+                    min(700, available.height() - 60) if available else 700)
         self.compiler = compiler
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(description or "Условие проверяется в заданной фазе через каждый период. Пустое условие копирует всё."))
@@ -45,7 +49,7 @@ class CopyConditionDialog(QDialog):
         picker.addLayout(filters)
         picker.addWidget(QLabel("Двойной щелчок добавит имя и пробел в позицию курсора:"))
         self.signal_list = QListWidget()
-        self.signal_list.setMinimumHeight(300)
+        self.signal_list.setMinimumHeight(min(300, max(120, available.height() - 460)) if available else 300)
         self.signals = list(signals)
         self.name_filter.textChanged.connect(self.refresh_signal_list)
         self.full_names.toggled.connect(self.refresh_signal_list)
@@ -126,10 +130,14 @@ class CopyOptionsDialog(CopyConditionDialog):
                          title="Копирование значений")
         self.service = service
         self.targets = list(targets)
+        screen = self.screen()
+        if screen:
+            self.signal_list.setMinimumHeight(min(300, max(120, screen.availableGeometry().height() - 560)))
         selected_ids = {node.id for node, _ in targets}
         if available_targets:
             self.targets.extend((node, offsets) for node, offsets in available_targets if node.id not in selected_ids)
-        self.resize(900, self.height())
+        self.resize(min(1040, screen.availableGeometry().width() - 40) if screen else 1040,
+                    self.height())
         self.channels = QTableWidget(len(self.targets), 4)
         self.channels.setHorizontalHeaderLabels(("Копировать", "Сигнал", "Radix", "Биты шины (например 7-4 2-1)"))
         self.channels.horizontalHeader().setStretchLastSection(True)
@@ -165,11 +173,9 @@ class CopyOptionsDialog(CopyConditionDialog):
             self.channel_bits.append(bits)
         self.layout().insertWidget(self.layout().count() - 2, QLabel("Формат для каждого выбранного сигнала:"))
         self.layout().insertWidget(self.layout().count() - 2, self.channels)
-        self.channels.setMinimumHeight(320)
+        self.channels.setMinimumHeight(120)
         self.picker_panel.hide()
         self.picker_toggle.setText("Сигналы для условия ▾")
-        self.picker_toggle.clicked.connect(lambda: self.channels.setMinimumHeight(
-            120 if self.picker_panel.isVisible() else 320))
         options = QHBoxLayout()
         options.addWidget(QLabel("Разделитель:"))
         self.separator_box = QComboBox()

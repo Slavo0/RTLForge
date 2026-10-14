@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,12 +15,15 @@ import numpy as np
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
 from ila_viewer.data import LoadCancelled, load_csv, parse_value
 from ila_viewer.window import MainWindow
 from ila_viewer.themes import STYLE
 from ila_viewer.preferences import PreferencesStore
+from ila_viewer.sources import AutoCaptureSource, WlfCaptureSource, QuestaWlfConverter, WlfExportService
+from ila_viewer.vcd import VcdCaptureReader
+from ila_viewer.tree import SignalTree
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -37,6 +41,125 @@ class ReaderTests(unittest.TestCase):
         capture = load_csv(path)
         self.addCleanup(capture.close)
         return capture
+
+    def test_vcd_event_index_preserves_simulator_time_and_aliases(self):
+        vcd = ("$timescale 1 ns $end\n$scope module top $end\n"
+               "$var wire 8 ! data [7:0] $end\n$var wire 1 \" ready $end\n"
+               "$var wire 1 \" ready_alias $end\n$upscope $end\n"
+               "$enddefinitions $end\n$dumpvars\nb00000001 !\n0\"\n$end\n"
+               "#0\n#10\nb00000010 !\n1\"\n#100\n0\"\n")
+        path = Path(self.directory.name) / "simulation.vcd"
+        path.write_text(vcd, encoding="utf-8")
+        capture = VcdCaptureReader().load(path)
+        self.addCleanup(capture.close)
+        self.assertEqual(capture.count, 3)
+        self.assertEqual(capture.times.tolist(), [0, 10, 100])
+        self.assertEqual(capture.timescale, "1ns")
+        self.assertEqual([s.name for s in capture.signals],
+                         ["top/data[7:0]", "top/ready", "top/ready_alias"])
+        self.assertEqual([capture.signals[0].value_at(i) for i in range(3)], [1, 2, 2])
+        self.assertEqual([capture.signals[1].value_at(i) for i in range(3)], [0, 1, 0])
+        self.assertEqual([capture.signals[2].value_at(i) for i in range(3)], [0, 1, 0])
+        self.assertEqual(capture.format_time(2), "100 ns")
+        self.assertAlmostEqual(capture.sample_at_time(55), 1.5)
+
+    def test_vcd_scalar_bits_form_expandable_bus_with_original_transitions(self):
+        lines = ["$timescale 1 ns $end", "$scope module top $end"]
+        for bit in range(8, -1, -1):
+            lines.append(f"$var wire 1 {chr(33 + 8 - bit)} rx_data [{bit}] $end")
+        lines += ["$var wire 48 z status_out [47:0] $end",
+                  "$var wire 1 A partial [7] $end", "$var wire 1 B partial [5] $end",
+                  "$upscope $end", "$enddefinitions $end", "#0"]
+        lines += [f"0{chr(33 + 8 - bit)}" for bit in range(8, -1, -1)]
+        lines += ["b0 z", "0A", "0B", "#10", "1!", "1)", "#20", "x!", "#30", "0!"]
+        path = Path(self.directory.name) / "split.vcd"
+        path.write_text("\n".join(lines) + "\n", encoding="ascii")
+        capture = VcdCaptureReader().load(path)
+        self.addCleanup(capture.close)
+        bus = next(sig for sig in capture.signals if sig.name == "top/rx_data[8:0]")
+        self.assertEqual([bus.value_at(i) for i in range(4)], [0, 257, "X00000001", 1])
+        self.assertEqual(bus.starts.tolist(), [0, 1, 2, 3])
+        tree = SignalTree(capture.signals, split_buses=capture.split_buses)
+        self.assertEqual([node.label for node in tree.root.children],
+                         ["rx_data[8:0]", "status_out[47:0]", "partial[7]", "partial[5]"])
+        node = tree.root.children[0]
+        self.assertEqual([child.label for child in node.children], [f"[{i}]" for i in range(8, -1, -1)])
+        self.assertEqual(node.children[0].signal.value_at(1), 1)
+        self.assertEqual(node.children[-1].signal.value_at(1), 1)
+        self.assertEqual(node.children[0].signal.starts.tolist(), [0, 1, 2, 3])
+        self.assertEqual(len(tree.rows()), 4)
+        node.expanded = True
+        self.assertEqual(len(tree.rows()), 13)
+
+    def test_wlf_source_uses_converter_and_keeps_original_path(self):
+        source = Path(self.directory.name) / "vsim.wlf"
+        source.write_bytes(b"WLF placeholder")
+        vcd = "$timescale 1 ps $end\n$var wire 1 ! clk $end\n$enddefinitions $end\n#0\n0!\n#5\n1!\n"
+        class FakeConverter:
+            def convert(self, original, target, cancel):
+                self.assert_source = original
+                target.write_text(vcd, encoding="utf-8")
+        capture = AutoCaptureSource(wlf=WlfCaptureSource(converter=FakeConverter())).load(source)
+        self.addCleanup(capture.close)
+        self.assertEqual(capture.path, source.resolve())
+        self.assertEqual(capture.times.tolist(), [0, 5])
+        self.assertEqual([capture.signals[0].value_at(i) for i in range(2)], [0, 1])
+
+    def test_missing_wlf_converter_explains_prerequisite(self):
+        with patch.dict(os.environ, {"WLF2VCD": ""}), patch("ila_viewer.sources.shutil.which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "wlf2vcd"):
+                QuestaWlfConverter().convert("capture.wlf", "out.vcd")
+
+    def test_wlf_converter_recovers_only_a_temporary_copy(self):
+        source = Path(self.directory.name) / "damaged.wlf"
+        target = Path(self.directory.name) / "converted.vcd"
+        source.write_bytes(b"original WLF bytes")
+        calls = []
+        def runner(command, cancel):
+            calls.append(command)
+            if command[0] == "wlfrecover":
+                self.assertEqual(Path(command[1]).read_bytes(), source.read_bytes())
+                return 0, "recovered"
+            if command[1] == str(source):
+                return 7, 'Unable to open WLF file "damaged.wlf"'
+            self.assertEqual(Path(command[1]).read_bytes(), source.read_bytes())
+            target.write_text("$enddefinitions $end\n", encoding="ascii")
+            return 0, ""
+        converter = QuestaWlfConverter("wlf2vcd", "wlfrecover", runner)
+        converter.convert(source, target)
+        self.assertEqual([command[0] for command in calls],
+                         ["wlf2vcd", "wlfrecover", "wlf2vcd"])
+        self.assertEqual(source.read_bytes(), b"original WLF bytes")
+        self.assertFalse(list(target.parent.glob("wlf-recovery-*.wlf")))
+
+    def test_wlf_export_persists_vcd_and_preserves_previous_file_on_error(self):
+        source = Path(self.directory.name) / "source.wlf"
+        destination = Path(self.directory.name) / "saved.vcd"
+        source.write_bytes(b"original")
+        destination.write_text("old", encoding="ascii")
+        class Converter:
+            fail = False
+            def convert(self, original, target, cancel):
+                target.write_text("new VCD", encoding="ascii")
+                if self.fail:
+                    raise RuntimeError("failed")
+        converter = Converter()
+        service = WlfExportService(converter)
+        converter.fail = True
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            service.export(source, destination)
+        self.assertEqual(destination.read_text(encoding="ascii"), "old")
+        converter.fail = False
+        self.assertEqual(service.export(source, destination), destination.resolve())
+        self.assertEqual(destination.read_text(encoding="ascii"), "new VCD")
+        self.assertEqual(source.read_bytes(), b"original")
+
+    def test_vcd_cancel_removes_disk_index(self):
+        path = Path(self.directory.name) / "cancel.vcd"
+        path.write_text("$timescale 1 ns $end\n$var wire 1 ! bit $end\n"
+                        "$enddefinitions $end\n#0\n0!\n#1\n1!\n", encoding="utf-8")
+        with self.assertRaises(LoadCancelled):
+            VcdCaptureReader().load(path, cancel=lambda: True)
 
     def test_actual_capture_matches_every_csv_cell(self):
         path = FIXTURE_CSV
@@ -192,6 +315,49 @@ class GuiTests(unittest.TestCase):
         self.window.close()
         self.wait_for_worker()
         self.assertIsNone(self.window.capture)
+
+    def test_open_vcd_draws_time_proportional_waveform(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "timed.vcd"
+            path.write_text("$timescale 1 ns $end\n$var wire 1 ! bit $end\n"
+                            "$enddefinitions $end\n#0\n0!\n#10\n1!\n#100\n0!\n", encoding="utf-8")
+            self.window.open_file(path)
+            self.wait_for_worker()
+            view = self.window.view
+            self.assertEqual(self.window.capture.times.tolist(), [0, 10, 100])
+            self.assertAlmostEqual((view.sample_x(1) - view.sample_x(0)) / view.plot_width, 10 / 101)
+            self.assertAlmostEqual(view.x_sample(view.sample_x(1)), 1)
+            view.set_cursor(1)
+            self.assertIn("tA: 10 ns", self.window.readout.text())
+            self.assertFalse(view.viewport().grab().isNull())
+
+    def test_copy_dialog_lists_rebuilt_bus_and_stays_within_screen(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "split.vcd"
+            lines = ["$timescale 1 ns $end"]
+            lines += [f"$var wire 1 {chr(33 + i)} rx_data [{8 - i}] $end" for i in range(9)]
+            lines += ["$var wire 1 A rx_we $end", "$var wire 1 B skid_rx_we $end",
+                      "$enddefinitions $end", "#0"]
+            lines += [f"0{chr(33 + i)}" for i in range(9)]
+            lines += ["1A", "0B", "#10", "1!", "1)"]
+            path.write_text("\n".join(lines) + "\n", encoding="ascii")
+            self.window.loaded(VcdCaptureReader().load(path))
+            self.window.copy_period, self.window.copy_phase = 1, 0
+            self.window.copy_values()
+            dialog = self.window.active_editor
+            self.assertIsNotNone(dialog)
+            self.assertEqual(dialog.signal_list.count(), 3)
+            self.assertEqual([node.signal.short_name for node, _ in dialog.targets],
+                             ["rx_data[8:0]", "rx_we", "skid_rx_we"])
+            self.assertTrue(self.window.condition_compiler().compile("rx_we && rx_data == h101").matches(1))
+            dialog.picker_toggle.click()
+            self.app.processEvents()
+            self.assertTrue(dialog.picker_panel.isVisible())
+            self.assertLessEqual(dialog.height(), dialog.screen().availableGeometry().height() - 40,
+                                 (dialog.minimumSizeHint(), dialog.maximumSize(),
+                                  dialog.channels.minimumSizeHint(), dialog.picker_panel.minimumSizeHint()))
+            self.assertTrue(dialog.findChild(QDialogButtonBox).isVisible())
+            dialog.close()
 
     def test_scrollbar_large_sample_counts(self):
         # Scrollbars use Qt's signed 32-bit range even when capture indices do not.

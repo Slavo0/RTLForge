@@ -168,9 +168,9 @@ class ModelTests(unittest.TestCase):
     def test_copy_separators_changes_reversed_markers_and_cancel(self):
         bus, view, service = self.copy_fixture("bus[8:0]\nRadix - HEX\n043\n143\n1A6\n1A6\n")
         view.cursor_a, view.cursor_b = 3, 0
-        for key, expected in (("space", "43 A6 A6"), ("comma", "43,A6,A6"),
-                              ("text", "43A6A6"), ("tab", "43\tA6\tA6"),
-                              ("newline", "43\nA6\nA6")):
+        for key, expected in (("space", "43 43 A6"), ("comma", "43,43,A6"),
+                              ("text", "4343A6"), ("tab", "43\t43\tA6"),
+                              ("newline", "43\n43\nA6")):
             view.preferences.copy_separator = key
             self.assertEqual(service.build(service.snapshot(view)).text, expected)
         view.preferences.copy_separator = "space"
@@ -207,12 +207,21 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Не закрыта скобка"):
             compiler.compile("(tx_ready && tx_we")
 
+    def test_exact_short_name_wins_over_suffix_alias(self):
+        cap = self.capture("rx_we,skid_rx_we,rx_data[8:0],skid_rx_data[8:0]\n"
+                           "Radix - HEX,HEX,HEX,HEX\n1,0,0FE,000\n")
+        compiler = ConditionCompiler(cap.signals)
+        self.assertTrue(compiler.compile("rx_we && rx_data == FE").matches(0))
+        self.assertEqual(compiler.token_for(cap.signals[0]), "rx_we")
+        self.assertEqual(compiler.token_for(cap.signals[2]), "rx_data[8:0]")
+
     def test_copy_range_excludes_b_and_period_uses_marker_phase(self):
         bus, view, service = self.copy_fixture("bus[7:0]\nRadix - HEX\n00\n01\n02\n03\n04\n")
         view.cursor_a, view.cursor_b = 0, 4
         self.assertEqual(service.build(service.snapshot(view)).text, "00 01 02 03")
         view.cursor_a, view.cursor_b = 4, 0
-        self.assertEqual(service.build(service.snapshot(view)).text, "01 02 03 04")
+        self.assertEqual(service.build(service.snapshot(view)).text, "00 01 02 03")
+        self.assertEqual(service.snapshot(view).exclude_sample, 4)
         view.cursor_a, view.cursor_b = 0, 4
         request = service.snapshot(view, period=2, phase=1)
         self.assertEqual(service.build(request).text, "01 03")
@@ -811,7 +820,8 @@ class InteractionTests(unittest.TestCase):
         dialog = w.active_editor
         self.assertIsNotNone(dialog)
         self.assertFalse(dialog.isModal())
-        self.assertGreaterEqual(dialog.signal_list.minimumHeight(), 300)
+        self.assertGreaterEqual(dialog.signal_list.minimumHeight(),
+                                min(300, max(120, dialog.screen().availableGeometry().height() - 560)))
         self.app.processEvents()
         buttons = dialog.findChild(QDialogButtonBox)
         self.assertLessEqual(buttons.mapTo(dialog, QPoint(0, buttons.height())).y(), dialog.height())
@@ -927,10 +937,13 @@ class InteractionTests(unittest.TestCase):
             dialog.theme_box.setCurrentIndex(dialog.theme_box.findData("dark"))
             dialog.radix_box.setCurrentIndex(dialog.radix_box.findData("HEX"))
             dialog.fill_box.setChecked(True)
+            dialog.wlf_converter_edit.setText("C:/Questa/wlf2vcd.exe")
             dialog.accept()
         QTimer.singleShot(0, choose)
         w.show_appearance()
         self.assertTrue(v.preferences.fill_high)
+        self.assertEqual(w.preferences.wlf2vcd_path, "C:/Questa/wlf2vcd.exe")
+        self.assertEqual(w.source.readers[".wlf"].converter.executable, "C:/Questa/wlf2vcd.exe")
         bus = v.rows[2].node
         v.tree.create_group("RX", bus)
         v.refresh_rows(bus)

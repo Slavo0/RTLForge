@@ -21,6 +21,7 @@ from ila_viewer.bits import BitExpansionService
 from ila_viewer.conditions import ConditionCompiler
 from ila_viewer.highlights import HighlightGroup, HighlightService
 from ila_viewer.advanced import AdvancedHighlightService
+from ila_viewer.vcd import VcdCaptureReader
 
 
 def main():
@@ -108,6 +109,22 @@ def main():
             v.viewport().grab()
         highlight_render_ms = (time.perf_counter() - start) * 100
         window.highlights.remove(group)
+        vcd_path = Path(folder) / "events.vcd"
+        with vcd_path.open("w", encoding="ascii") as stream:
+            stream.write("$timescale 1 ns $end\n$var wire 1 ! fast_bit $end\n$enddefinitions $end\n")
+            for index in range(200_000):
+                stream.write(f"#{index * 101 // 2}\n{index % 2}!\n")
+        start = time.perf_counter()
+        vcd_capture = VcdCaptureReader().load(vcd_path)
+        vcd_load_seconds = time.perf_counter() - start
+        assert vcd_capture.count == 200_000
+        window.loaded(vcd_capture)
+        v.fit()
+        app.processEvents()
+        start = time.perf_counter()
+        for _ in range(10):
+            v.viewport().grab()
+        vcd_render_ms = (time.perf_counter() - start) * 100
         report = {"samples": count, "signals": len(cap.signals), "csv_bytes": path.stat().st_size,
                   "index_bytes": disk_bytes, "load_seconds": round(load_seconds, 3),
                   "render": render_ms, "search_ms": round(search_ms, 3),
@@ -116,6 +133,9 @@ def main():
                   "copy_million_values_seconds": round(copy_seconds, 3),
                   "highlight_alternating_seconds": round(highlight_seconds, 3),
                   "advanced_highlight_seconds": round(advanced_seconds, 3),
+                  "vcd_events": vcd_capture.count,
+                  "vcd_load_seconds": round(vcd_load_seconds, 3),
+                  "vcd_full_view_render_ms": round(vcd_render_ms, 3),
                   "highlight_full_view_bands": len(bands),
                   "highlight_visible_lookup_ms": round(highlight_visible_ms, 3),
                   "highlight_full_view_render_ms": round(highlight_render_ms, 3),
