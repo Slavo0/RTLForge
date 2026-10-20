@@ -19,6 +19,7 @@ from .icons import RowIconPainter
 from .rendering import WaveformRenderer
 from .preferences import ViewerPreferences
 from .selection import RowSelection
+from .timebase import capture_axis
 from .bookmarks import BookmarkModel
 
 
@@ -76,12 +77,13 @@ class WaveformView(QAbstractScrollArea):
         self.context_sample = None
         self.drag = None
         self.drop_target = None
+        self.drop_line = None
         self.drag_position = None
         self.zoom_band = None
         self.auto_scroll = QTimer(self)
         self.auto_scroll.setInterval(40)
         self.auto_scroll.timeout.connect(self._drag_scroll)
-        self.period_ns = 0.0
+        self.period_ns = self.preferences.sample_period_ns
         self.full_names = self.preferences.full_names
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.viewport().setMouseTracking(True)
@@ -161,7 +163,7 @@ class WaveformView(QAbstractScrollArea):
     def refresh_rows(self, selected=None):
         explicit = selected is not None
         selected = selected or self.current_node
-        self.rows = self.tree.rows(self.filter_text)
+        self.rows = self.tree.rows(self.filter_text, reverse_bits=self.preferences.reverse_bit_rows)
         self.visible_signals = [row.node for row in self.rows]
         self._selected = next((i for i, row in enumerate(self.rows) if row.node is selected), 0)
         self.selection.retain_visible(self.rows)
@@ -276,11 +278,19 @@ class WaveformView(QAbstractScrollArea):
         saved = self.preferences.signal_colors.get(theme.key, {})
         return QColor(self.tree.inherited_color(sig.node) or saved.get(kind) or (theme.bus if kind == "bus" else theme.bit))
 
+    def bit_rows_reversed(self, bus):
+        return bool(bus is not None and bus.kind == "bus" and bus.options.reverse
+                    and self.preferences.reverse_bit_rows)
+
+    def time_axis(self):
+        """Simulator time, or the ILA sample period entered by the user; None means samples only."""
+        return capture_axis(self.capture, self.period_ns)
+
     def reverse_bits(self, checked):
         if self.current_node and self.current_node.kind == "bus":
             self.current_node.options.reverse = bool(checked)
-            self.viewport().update()
-            self.selectionChanged.emit()
+            # Bit rows follow the displayed order when the preference asks for it.
+            self.refresh_rows(self.current_node)
 
     def toggle_node(self, node):
         if not node or not node.expandable:
@@ -571,6 +581,10 @@ class WaveformView(QAbstractScrollArea):
         node = self.rows[row].node
         offset = coordinate - row * self.ROW
         position = "inside" if node.kind == "group" and self.ROW * .25 <= offset <= self.ROW * .75 else ("before" if offset < self.ROW / 2 else "after")
+        self.drop_line = position
+        if node.kind == "bit" and self.bit_rows_reversed(node.parent) and position != "inside":
+            # Reversed bit rows are drawn in the opposite order of the stored children.
+            position = "after" if position == "before" else "before"
         self.drop_target = (node, position)
         self.viewport().update()
 

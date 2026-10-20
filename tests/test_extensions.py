@@ -35,6 +35,8 @@ from ila_viewer.advanced import AdvancedHighlightService
 from ila_viewer.bookmarks import BookmarkModel
 from ila_viewer.measurements import EdgeMeasurementService, MeasurementFormatter
 from ila_viewer.vcd import VcdCaptureReader
+from ila_viewer.sampling import EdgeSampling, clock_candidates
+from ila_viewer.timebase import capture_axis, format_ruler, format_seconds, parse_clock
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -260,6 +262,101 @@ class ModelTests(unittest.TestCase):
         # Markers 1=5 and 2=8 define phase 2 modulo 3, including sample 2.
         self.assertEqual(service.build(service.snapshot(view, period=3, phase=5)).text, "02 05 08")
 
+    SPI = ("sck,data[7:0]\nRadix - HEX,HEX\n"
+           "0,00\n0,11\n1,11\n0,22\n1,22\n0,33\n1,33\n0,44\n0,44\n0,55\n0,55\n1,66\n0,66\n")
+
+    def spi_view(self):
+        cap = self.capture(self.SPI)
+        tree = SignalTree(cap.signals)
+        view = SimpleNamespace(capture=cap, cursor_a=0, cursor_b=None, selected_nodes=[tree.root.children[1]],
+                               preferences=ViewerPreferences(), display_radix=lambda trace: "HEX")
+        return cap, view
+
+    def test_clock_edges_sample_gated_clock_before_or_at_edge(self):
+        cap, view = self.spi_view()
+        sck = cap.signals[0]
+        service = CopyValuesService()
+        rising_before = EdgeSampling(sck, "rising", before_edge=True)
+        self.assertEqual([p[0] for p in rising_before.points(0, cap.count, cap.count)], [2, 4, 6, 11])
+        self.assertEqual(service.build(service.snapshot(view, period=rising_before)).text, "11 22 33 55")
+        at_edge = EdgeSampling(sck, "rising", before_edge=False)
+        self.assertEqual(service.build(service.snapshot(view, period=at_edge)).text, "11 22 33 66")
+        falling = EdgeSampling(sck, "falling")
+        self.assertEqual(service.build(service.snapshot(view, period=falling)).text, "11 22 33 66")
+        both = EdgeSampling(sck, "both")
+        self.assertEqual(len(list(both.points(0, cap.count, cap.count))), 8)
+        compiler = ConditionCompiler(cap.signals)
+        condition = compiler.compile("data != prev(data)")
+        self.assertEqual(service.build(service.snapshot(view, "HEX", condition, rising_before)).text, "22 33 55")
+        view.cursor_a, view.cursor_b = 3, 11  # B is exclusive: edge 11 is not copied
+        self.assertEqual(service.build(service.snapshot(view, period=rising_before)).text, "22 33")
+
+    def test_clock_edge_highlights_do_not_paint_idle_gaps(self):
+        cap, _ = self.spi_view()
+        sck = cap.signals[0]
+        grid = EdgeSampling(sck, "rising")
+        everything = HighlightService().build(cap, None, 0, cap.count, grid)
+        self.assertEqual(list(everything.visible(0, cap.count)), [(2.0, 8.0), (11.0, 13.0)])
+        compiler = ConditionCompiler(cap.signals)
+        late = HighlightService().build(cap, compiler.compile("data == 55"), 0, cap.count, grid)
+        self.assertEqual(list(late.visible(0, cap.count)), [(11.0, 13.0)])
+        pattern = compiler.compile_pattern("data == 11 -> data == 22")
+        sequence = AdvancedHighlightService().build(cap, pattern, 0, cap.count, grid)
+        self.assertEqual(list(sequence.visible(0, cap.count)), [(2.0, 6.0)])
+        for intervals in (everything, late, sequence):
+            intervals.close()
+
+    def test_clock_candidates_prefer_clock_names(self):
+        cap = self.capture("valid,spi_sck,data[3:0],clk_i,CLK\nRadix - HEX,HEX,HEX,HEX,HEX\n0,0,0,0,0\n")
+        names = [signal.name for signal in clock_candidates(cap.signals)]
+        self.assertEqual(names, ["clk_i", "CLK", "spi_sck", "valid"])
+
+    def test_time_text_matches_vivado_style(self):
+        self.assertEqual(format_seconds(1.0031e-3, 1e-9), "1,003,100 ns")
+        self.assertEqual(format_seconds(1.0031005e-3, 1e-12), "1,003,100.5 ns")
+        self.assertEqual(format_seconds(2e-6, 1e-6), "2 us")
+        self.assertEqual(format_ruler(1.0032e-3, 200e-9), "1,003,200 ns")
+        self.assertEqual(format_ruler(1.004e-3, 2e-6), "1,004 us")
+        self.assertEqual(parse_clock("100 MHz"), 10.0)
+        self.assertEqual(parse_clock("25MHz"), 40.0)
+        self.assertEqual(parse_clock("8 ns"), 8.0)
+        self.assertEqual(parse_clock("1,5 us"), 1500.0)
+        with self.assertRaises(ValueError):
+            parse_clock("fast")
+        cap = self.capture(self.SPI)
+        axis = capture_axis(cap, 10.0)
+        self.assertEqual(axis.readout(100_310), "1,003,100 ns")
+        labels = [label for _, label in axis.ruler(100_300, 100_330, 600)]
+        self.assertTrue(labels and all(label.endswith(" ns") and "e+" not in label for label in labels), labels)
+        self.assertIsNone(capture_axis(cap, 0.0))
+
+    def test_reverse_bit_order_reverses_expanded_rows_when_enabled(self):
+        cap = self.capture("bus[3:0]\nRadix - HEX\n0\n5\n")
+        tree = SignalTree(cap.signals)
+        bus = tree.root.children[0]
+        bits = BitExpansionService().build(cap.signals[0], cap.storage.name)
+        cap.derived.append(bits)
+        tree.add_bits(bus, bits.signals)
+        labels = lambda **kwargs: [row.node.label for row in tree.rows(**kwargs)][1:]
+        self.assertEqual(labels(reverse_bits=True), ["[3]", "[2]", "[1]", "[0]"])
+        bus.options.reverse = True
+        self.assertEqual(labels(reverse_bits=True), ["[0]", "[1]", "[2]", "[3]"])
+        self.assertEqual(labels(reverse_bits=False), ["[3]", "[2]", "[1]", "[0]"])
+        self.assertEqual([child.label for child in bus.children], ["[3]", "[2]", "[1]", "[0]"])
+
+    def test_new_preferences_default_and_round_trip(self):
+        path = Path(self.temp.name) / "settings.json"
+        store = PreferencesStore(path)
+        defaults = store.load()
+        self.assertTrue(defaults.reverse_bit_rows)
+        self.assertEqual(defaults.sample_period_ns, 0.0)
+        store.save(replace(defaults, reverse_bit_rows=False, sample_period_ns=6.4, clock_edge="falling"))
+        loaded = PreferencesStore(path).load()
+        self.assertEqual((loaded.reverse_bit_rows, loaded.sample_period_ns, loaded.clock_edge), (False, 6.4, "falling"))
+        path.write_text('{"sample_period_ns": 10, "clock_edge": "sideways"}', encoding="utf-8")
+        loaded = PreferencesStore(path).load()
+        self.assertEqual((loaded.sample_period_ns, loaded.clock_edge), (10.0, "rising"))
+
     def test_highlight_intervals_are_disk_backed_clipped_and_cancellable(self):
         cap = self.capture("ready,bus[7:0]\nRadix - HEX,HEX\n0,00\n1,F4\n0,00\n0,00\n0,00\n1,F4\n0,00\n0,00\n")
         self.assertEqual([ConditionCompiler(cap.signals).compile("ready").matches(i) for i in range(cap.count)],
@@ -420,7 +517,7 @@ class ModelTests(unittest.TestCase):
         mixed = service.measure(flag, 0, cap.count)
         self.assertEqual((mixed.rising, mixed.first_rise, mixed.last_rise), (2, 2, 6))
         self.assertEqual(MeasurementFormatter().parts(full, cap, 10.0, "clk"),
-                         ["↑clk A…B: 6", "T≈ 2 отсч.", "f≈ 50 MHz"])
+                         ["↑clk A…B: 6", "T≈ 2 отсч.", "T≈ 20 ns", "f≈ 50 MHz"])
         bus = self.capture("bus[3:0]\nRadix - HEX\n0\n1\n")
         self.assertIsNone(service.measure(bus.signals[0], 0, 2))
 

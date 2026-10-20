@@ -143,7 +143,8 @@ class SignalTree:
                 group.add(ParameterNode(name, values))
             self.root.add(group)
 
-    def rows(self, query=""):
+    def rows(self, query="", reverse_bits=False):
+        """Visible rows; with ``reverse_bits`` a reversed bus lists its bits in display order."""
         query = query.casefold().strip()
         rows = []
         match_cache = {}
@@ -162,7 +163,10 @@ class SignalTree:
             rows.append(VisibleRow(node, depth))
             if node.expanded:
                 own_match = inherited_match or bool(query and query in (node.signal.name if node.signal else node.label).casefold())
-                for child in node.children:
+                children = node.children
+                if reverse_bits and node.kind == "bus" and node.options.reverse:
+                    children = children[::-1]
+                for child in children:
                     visit(child, depth + 1, own_match)
 
         for child in self.root.children:

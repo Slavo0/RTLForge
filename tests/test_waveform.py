@@ -411,6 +411,53 @@ class GuiTests(unittest.TestCase):
         self.window.loaded(load_csv(FIXTURE_CSV))
         self.assertTrue(self.window.trigger_action.isVisible())
 
+    def test_clock_banner_offers_clk_and_samples_on_its_edges(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "clocked.vcd"
+            lines = ["$timescale 1 ps $end", "$var wire 1 ! valid $end", "$var wire 1 \" clk $end",
+                     "$var wire 4 # data [3:0] $end", "$enddefinitions $end", "#0", "0!", "0\"", "b0000 #"]
+            for cycle in range(1, 9):
+                # Registers update at the rising edge, in the same time step as the clock.
+                lines += [f"#{cycle * 5_000_000 - 2_500_000}", "0\"",
+                          f"#{cycle * 5_000_000}", "1\"", f"b{cycle:04b} #", f"{cycle % 2}!"]
+            path.write_text("\n".join(lines) + "\n", encoding="ascii")
+            w = self.window
+            w.loaded(VcdCaptureReader().load(path))
+            w.view.selection.ids = {next(r.node.id for r in w.view.rows if r.node.label.startswith("data"))}
+            w.copy_values()
+            banner = w.copy_period_banner
+            self.assertIsNotNone(banner)
+            self.assertEqual(banner.source_box.currentData().name, "clk")
+            self.assertFalse(banner.clock_edit.isVisible())  # VCD already has real time
+            self.assertIn("f ≈ 200 kHz", banner.status.text())
+            banner.confirm_button.click()
+            self.assertEqual(w.clock_sampling.signal.name, "clk")
+            dialog = w.active_editor
+            self.assertIsNotNone(dialog)
+            dialog.close()
+            self.app.processEvents()
+            request = w.copy_service.snapshot(w.view, "HEX", None, w.current_sampling())
+            # Before the edge the register still holds the previous cycle's value.
+            self.assertEqual(w.copy_service.build(request).text, "0 1 2 3 4 5 6 7")
+            axis = w.view.time_axis()
+            self.assertEqual(axis.readout(w.view.cursor_a), "0 ns")
+            labels = [label for _, label in axis.ruler(0, w.capture.count - 1, 800)]
+            self.assertTrue(labels and not any("e+" in label for label in labels), labels)
+            self.assertTrue(any(label.endswith(" us") for label in labels), labels)
+
+    def test_csv_time_base_is_derived_from_marker_period_and_saved(self):
+        w, v = self.window, self.window.view
+        v.set_cursor(1)
+        w.recalibrate_period()
+        banner = w.copy_period_banner
+        self.assertTrue(banner.clock_edit.isVisibleTo(banner))
+        v.period_markers = [10, 14]
+        banner.clock_edit.setText("25 MHz")  # one clock period spans 4 ILA samples
+        self.assertIn("1 отсчёт = 10 ns", banner.status.text())
+        banner.confirm_button.click()
+        self.assertEqual(w.preferences.sample_period_ns, 10.0)
+        self.assertIn("tA: 10 ns", w.readout.text())
+
     def test_find_buttons_follow_value_search_field(self):
         w = self.window
         self.assertLess(w.search_edit.geometry().right(), w.previous_button.geometry().left())

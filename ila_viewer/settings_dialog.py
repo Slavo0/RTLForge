@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                               QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 from .formats import FORMATS
 from .preferences import ViewerPreferences
+from .timebase import parse_clock
 
 
 def _paint_swatch(button, color):
@@ -72,6 +73,11 @@ class AppearanceDialog(QDialog):
         self.names_box = QCheckBox("Показывать полные иерархические имена сигналов")
         self.names_box.setChecked(self.preferences.full_names)
         form.addRow(self.names_box)
+        self.sample_clock_edit = QLineEdit(self._format_period(self.preferences.sample_period_ns))
+        self.sample_clock_edit.setPlaceholderText("например 100 MHz или 10 ns; пусто — только отсчёты")
+        self.sample_clock_edit.setToolTip("Такт выборки ILA: задаёт шкалу времени для CSV. "
+                                          "VCD и WLF всегда используют время симуляции.")
+        form.addRow("Такт выборки ILA (CSV)", self.sample_clock_edit)
         form.addRow(_note("Radix из меню сигнала применяется к выделенным строкам; "
                           "пункт Default возвращает сигнал к этому общему формату. "
                           "Общие параметры сохраняются для следующего запуска."))
@@ -106,6 +112,12 @@ class AppearanceDialog(QDialog):
         fill_form.addWidget(self.fill_box)
         fill_form.addWidget(self.fill_bus_box)
         column.addWidget(fill)
+        bits = QGroupBox("Биты шины")
+        bits_layout = QVBoxLayout(bits)
+        self.reverse_rows_box = QCheckBox("Reverse Bit Order также переставляет строки раскрытых битов")
+        self.reverse_rows_box.setChecked(self.preferences.reverse_bit_rows)
+        bits_layout.addWidget(self.reverse_rows_box)
+        column.addWidget(bits)
         column.addStretch(1)
         self.theme_box.currentIndexChanged.connect(self.refresh_signal_colors)
         self.separate_box.toggled.connect(self.refresh_signal_colors)
@@ -170,7 +182,28 @@ class AppearanceDialog(QDialog):
                        restore_highlight_visibility=self.restore_highlight_box.isChecked(),
                        hide_empty_highlight_panel=self.hide_empty_highlights_box.isChecked(),
                        full_names=self.names_box.isChecked(),
+                       reverse_bit_rows=self.reverse_rows_box.isChecked(),
+                       sample_period_ns=self.sample_period_ns(),
                        wlf2vcd_path=self.wlf_converter_edit.text().strip())
+
+    @staticmethod
+    def _format_period(period_ns):
+        return f"{period_ns:g} ns" if period_ns else ""
+
+    def sample_period_ns(self):
+        text = self.sample_clock_edit.text().strip()
+        return parse_clock(text) if text else 0.0
+
+    def accept(self):
+        try:
+            self.sample_period_ns()
+        except ValueError as exc:
+            self.tabs.setCurrentIndex(0)
+            self.sample_clock_edit.setFocus()
+            self.sample_clock_edit.setToolTip(str(exc))
+            self.sample_clock_edit.selectAll()
+            return
+        super().accept()
 
     def restore_defaults(self):
         defaults = ViewerPreferences()
@@ -179,11 +212,13 @@ class AppearanceDialog(QDialog):
             self.theme_box.setCurrentIndex(max(0, self.theme_box.findData(defaults.theme)))
             self.radix_box.setCurrentIndex(max(0, self.radix_box.findData(defaults.global_radix)))
             self.names_box.setChecked(defaults.full_names)
+            self.sample_clock_edit.clear()
         elif page == 1:
             self.signal_colors.clear()
             self.separate_box.setChecked(defaults.separate_signal_styles)
             self.fill_box.setChecked(defaults.fill_high)
             self.fill_bus_box.setChecked(defaults.fill_bus)
+            self.reverse_rows_box.setChecked(defaults.reverse_bit_rows)
             self.refresh_signal_colors()
         elif page == 2:
             self.hide_empty_highlights_box.setChecked(defaults.hide_empty_highlight_panel)

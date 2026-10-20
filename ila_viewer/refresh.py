@@ -7,6 +7,14 @@ from dataclasses import dataclass, replace
 
 from .data import LoadCancelled
 from .highlights import HighlightGroup
+from .sampling import PeriodicSampling, as_sampling
+
+
+def legacy_period(sampling):
+    """Store fixed periods as (period, phase); clock grids travel as objects."""
+    if isinstance(sampling, PeriodicSampling):
+        return sampling.period, sampling.phase
+    return sampling, 0
 
 
 @dataclass(frozen=True)
@@ -23,7 +31,7 @@ class HighlightSpec:
     opacity: int
     marker_a: int
     marker_b: int
-    period: int
+    period: object  # SamplingGrid or a legacy sample count
     phase: int
     visible: bool
     id: str
@@ -96,11 +104,15 @@ class CaptureRefreshState:
                 b = capture.count if item.marker_b == self.source_count else min(item.marker_b, capture.count)
                 if a == b:
                     continue
+                # A clock-edge grid follows its clock signal into the refreshed capture.
+                sampling = as_sampling(item.period, item.phase).rebind(capture)
+                if sampling is None:
+                    continue
                 builder = advanced_service if item.mode == "advanced" else service
-                intervals = builder.build(capture, condition, a, b, item.period, item.phase,
+                intervals = builder.build(capture, condition, a, b, sampling, 0,
                                           lambda percent, rows: progress(percent, rows), cancel)
                 rebuilt.append(HighlightGroup(item.name, item.expression, item.color,
-                                              intervals, a, b, item.period, item.phase,
+                                              intervals, a, b, *legacy_period(sampling),
                                               item.visible, item.id, item.opacity, item.mode))
                 progress(round((index + 1) * 100 / max(1, len(self.highlights))), len(rebuilt))
             return rebuilt

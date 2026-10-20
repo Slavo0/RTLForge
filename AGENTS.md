@@ -25,7 +25,8 @@ The user requires object-oriented, extensible design for this application.
 - Name filtering must not change bus/group expansion state or visually force it open.
 - Shift+click in Name/Value selects the inclusive row range and never changes markers.
 - Persist only general preferences, not capture state. Tests must inject an isolated
-  PreferencesStore. Per-signal Default inherits the general radix.
+  PreferencesStore. Per-signal Default inherits the general radix. The ILA sample
+  period (CSV time scale), clock edge choice and reverse-bit-rows option are general.
 - Remember the last CSV directory and theme-specific bus/bit colors in general
   preferences. Highlight palette persists, but group opacity and groups never do.
 - Name and Value widths are independent and persistent; Name auto-fit is explicit;
@@ -44,13 +45,20 @@ The user requires object-oriented, extensible design for this application.
 - Calibrate copy period in an inline banner with draggable markers 1/2 while A/B
   are hidden. Sampling uses the first marker's phase modulo the period, including
   samples before that marker. The condition editor can reopen calibration.
+- The same banner can choose a 1-bit clock signal (clk-like names first). Clock
+  sampling uses only real rising/falling/both edges (gated clocks such as SPI SCK),
+  reads values just before the edge by default, and caps highlight intervals at one
+  typical clock period so idle gaps stay unpainted. Route all sampling through
+  SamplingGrid implementations in sampling.py.
+- Time text follows Vivado: grouped digits, a unit chosen from the ruler step, no
+  exponent notation. Reverse Bit Order also reverses expanded bit rows by default.
 - Build conditional highlights in cancellable background work with disk-backed,
   merged intervals. Render only intervals intersecting the visible viewport;
   dispose indices when a group or capture is removed.
 - Numeric condition literals inherit the compared signal's display radix unless
   prefixed with h/b/d. Preserve operand order for relational comparisons.
   Advanced Highlight stages match consecutive calibrated samples; prev(signal)
-  refers to the preceding sample on that period grid. Keep overlapping matches
+  refers to the preceding sample on that period grid or clock-edge grid. Keep overlapping matches
   and rebuild advanced groups after CSV refresh when their signals still exist.
 - CSV refresh reconciles signal styling by source name and recompiles highlight
   conditions against the new capture; opening another CSV starts fresh. Keep

@@ -14,6 +14,7 @@ from typing import Callable
 
 import numpy as np
 from .formats import FORMATS
+from .timebase import format_seconds, group_digits, unit_seconds
 
 
 class LoadCancelled(Exception):
@@ -175,10 +176,10 @@ class Capture:
         return self.format_ticks(self.time_at(sample))
 
     def format_ticks(self, ticks):
-        match = re.fullmatch(r"(\d+)(fs|ps|ns|us|ms|s)", self.timescale)
-        if match:
-            return f"{ticks * int(match[1]):g} {match[2]}"
-        return f"{ticks:g} × {self.timescale}"
+        seconds = unit_seconds(self.timescale)
+        if seconds:
+            return format_seconds(ticks * seconds, seconds)
+        return f"{group_digits(ticks, 3)} × {self.timescale}"
 
     def close(self):
         for result in self.derived:

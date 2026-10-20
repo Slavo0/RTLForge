@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .timebase import format_seconds, group_digits
+
 
 @dataclass(frozen=True)
 class EdgeMeasurement:
@@ -111,8 +113,9 @@ class MeasurementFormatter:
                 parts.append(f"f≈ {format_frequency(1 / (ticks * seconds))}")
         else:
             samples = measurement.period_samples
-            parts.append(f"T≈ {samples:g} отсч.")
+            parts.append(f"T≈ {group_digits(samples, 3)} отсч.")
             if period_ns and samples > 0:
+                parts.append(f"T≈ {format_seconds(samples * period_ns * 1e-9)}")
                 parts.append(f"f≈ {format_frequency(1e9 / (samples * period_ns))}")
         return parts
 

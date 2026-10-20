@@ -33,6 +33,10 @@ class ViewerPreferences:
     highlight_opacities: list = field(default_factory=lambda: [28, 28, 28, 28])
     restore_highlight_visibility: bool = True
     hide_empty_highlight_panel: bool = False
+    reverse_bit_rows: bool = True
+    sample_period_ns: float = 0.0
+    clock_edge: str = "rising"
+    clock_before_edge: bool = True
 
 
 class PreferencesStore:
@@ -65,6 +69,8 @@ class PreferencesStore:
         for field in fields(result):
             value = data.get(field.name)
             expected = type(getattr(result, field.name))
+            if expected is float and type(value) is int:
+                value = float(value)  # JSON writes 10.0 as 10 in hand-edited files
             if type(value) is expected:
                 setattr(result, field.name, value)
         if data.get("layout_version") != 2 and data.get("value_width") == 120:
@@ -84,6 +90,10 @@ class PreferencesStore:
         result.highlight_opacities.extend([28] * (len(result.highlight_palette) - len(result.highlight_opacities)))
         if result.global_radix not in {"DEFAULT", *FORMATS.formats} or result.global_radix == "REAL":
             result.global_radix = "HEX"
+        if not 0 <= result.sample_period_ns <= 1e12:
+            result.sample_period_ns = 0.0
+        if result.clock_edge not in {"rising", "falling", "both"}:
+            result.clock_edge = "rising"
         if result.copy_separator not in {"space", "comma", "text", "tab", "newline"}:
             result.copy_separator = "space"
         if result.last_csv_directory and not Path(result.last_csv_directory).is_dir():

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from .bits import BitCodec
 from .data import LoadCancelled
 from .formats import FORMATS, RealSettings
+from .sampling import PeriodicSampling, as_sampling
 
 
 SEPARATORS = {"space": " ", "comma": ",", "text": "", "tab": "\t", "newline": "\n"}
@@ -54,6 +55,12 @@ class CopyRequest:
     phase: int = 0
     exclude_sample: int | None = None
     sort: str = "original"
+    sampling: object = None
+    capture_count: int = 0
+
+    @property
+    def grid(self):
+        return self.sampling if self.sampling is not None else PeriodicSampling(self.period, self.phase)
 
 
 @dataclass(frozen=True)
@@ -144,19 +151,30 @@ class CopyValuesService:
             start, end = sorted((view.cursor_a, view.cursor_b))
             excluded = end
         separator_key = separator or view.preferences.copy_separator
+        # ``period`` may be a SamplingGrid such as clock-edge sampling.
+        grid = as_sampling(period, phase)
+        periodic = isinstance(grid, PeriodicSampling)
         return CopyRequest(tuple(channels), start, end, SEPARATORS[separator_key],
-                           samples, max(1, int(period)), condition,
-                           int(phase), excluded, sort)
+                           samples, grid.period if periodic else 1, condition,
+                           grid.phase if periodic else 0, excluded, sort,
+                           None if periodic else grid, view.capture.count)
 
     def build(self, request, progress=lambda p, n: None, cancel=lambda: False):
         output = StringIO()
         count = 0
-        period = max(1, request.period)
-        first_sample = request.start + ((request.phase - request.start) % period)
-        total_samples = max(0, (request.end - first_sample) // period + 1) if first_sample <= request.end else 0
-        if request.exclude_sample is not None and request.start <= request.exclude_sample <= request.end:
-            if request.exclude_sample >= first_sample and (request.exclude_sample - first_sample) % period == 0:
-                total_samples = max(0, total_samples - 1)
+        grid = request.grid
+        periodic = isinstance(grid, PeriodicSampling)
+        # Fast paths below only apply to the period-1 grid; clock edges use ``sampled``.
+        period = grid.period if periodic else 0
+        if periodic:
+            first_sample = request.start + ((request.phase - request.start) % period)
+            total_samples = max(0, (request.end - first_sample) // period + 1) if first_sample <= request.end else 0
+            if request.exclude_sample is not None and request.start <= request.exclude_sample <= request.end:
+                if request.exclude_sample >= first_sample and (request.exclude_sample - first_sample) % period == 0:
+                    total_samples = max(0, total_samples - 1)
+        else:
+            first_sample = request.start
+            total_samples = max(1, request.end - request.start + 1)
         total = len(request.channels) * total_samples
         processed = 0
         for channel_index, channel in enumerate(request.channels):
@@ -188,15 +206,15 @@ class CopyValuesService:
                 def sampled():
                     previous_candidate = None
                     previous_value = None
-                    for offset, sample in enumerate(range(first_sample, request.end + 1, period)):
+                    points = grid.points(request.start, request.end + 1, request.capture_count, cancel)
+                    for offset, (sample, _, at, previous) in enumerate(points):
                         if offset % 4096 == 0 and cancel():
                             raise LoadCancelled()
                         if sample == request.exclude_sample:
                             continue
-                        if request.condition is not None and not request.condition.matches(
-                                sample, sample - period if sample >= period else None):
+                        if request.condition is not None and not request.condition.matches(at, previous):
                             continue
-                        code = int(source.codes[source.run_index(sample)])
+                        code = int(source.codes[source.run_index(at)])
                         if request.samples == "changes" and previous_candidate is not None and code == previous_value:
                             continue
                         previous_candidate, previous_value = sample, code

@@ -7,6 +7,8 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 
+from .timebase import sample_axis_ruler
+
 
 class WaveformRenderer:
     def __init__(self, view):
@@ -130,19 +132,11 @@ class WaveformRenderer:
                 painter.fillRect(QRectF(0, y, w, v.ROW), QColor(theme.alternate))
             painter.setPen(grid)
             self.line(painter, 0, y + v.ROW, w, y + v.ROW)
-        # Tick spacing uses 1/2/5 decades in samples or simulator time.
-        if v.capture.times is not None:
-            axis_left = v.capture.time_at(v.left)
-            axis_right = v.capture.time_at(v.left + v.span)
-            ideal = (axis_right - axis_left) / max(1, v.plot_width / 100)
-        else:
-            axis_left, axis_right = v.left, v.left + v.span
-            ideal = v.span / max(1, v.plot_width / 100)
-        decade = 10 ** math.floor(math.log10(max(1, ideal)))
-        step = next((v * decade for v in (1, 2, 5, 10) if v * decade >= ideal), 10 * decade)
-        time_ticks = range(max(0, math.ceil(axis_left / step) * step), math.ceil(axis_right), step)
-        ticks = [(v.capture.sample_at_time(tick) if v.capture.times is not None else tick, tick)
-                 for tick in time_ticks]
+        # Tick spacing uses 1/2/5 decades in time (Vivado-style labels) or in samples.
+        axis = v.time_axis()
+        spacing = 140
+        ticks = (axis.ruler(v.left, v.left + v.span, v.plot_width, spacing) if axis else
+                 sample_axis_ruler(v.left, v.left + v.span, v.plot_width, spacing))
         painter.setPen(grid)
         for sample, _ in ticks:
             x = v.sample_x(sample)
@@ -196,7 +190,8 @@ class WaveformRenderer:
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, value)
             painter.restore()
         if v.drop_target:
-            target, position = v.drop_target
+            target, _ = v.drop_target
+            position = v.drop_line  # where the line is drawn, even for reversed bit rows
             drop_row = next((i for i, item in enumerate(v.rows) if item.node is target), None)
             if drop_row is not None:
                 y = v.HEADER + drop_row * v.ROW - scroll
@@ -214,12 +209,10 @@ class WaveformRenderer:
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "Value")
         painter.save()
         painter.setClipRect(QRectF(split, 0, v.plot_width, h))
-        for sample, tick in ticks:
+        for sample, label in ticks:
             x = v.sample_x(sample)
-            label = (v.capture.format_time(sample) if v.capture.times is not None else
-                     f"{tick * v.period_ns:g} ns" if v.period_ns else str(tick))
             painter.setPen(muted)
-            painter.drawText(QRectF(x + 4, 0, 110, v.HEADER), Qt.AlignmentFlag.AlignVCenter, label)
+            painter.drawText(QRectF(x + 4, 0, spacing - 8, v.HEADER), Qt.AlignmentFlag.AlignVCenter, label)
         if not v.period_mode and v.cursor_b is not None:
             xa, xb = sorted((v.sample_x(v.cursor_a), v.sample_x(v.cursor_b)))
             painter.fillRect(QRectF(xa, v.HEADER, xb - xa, h - v.HEADER), QColor(255, 204, 116, 12))

@@ -14,6 +14,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .data import LoadCancelled
+from .sampling import as_sampling
 
 
 class HighlightIntervals:
@@ -71,6 +72,11 @@ class HighlightGroup:
         if not self.id:
             self.id = uuid4().hex
 
+    @property
+    def sampling(self):
+        """``period`` holds a SamplingGrid, or a legacy sample count used with ``phase``."""
+        return as_sampling(self.period, self.phase)
+
 
 class HighlightModel(QObject):
     changed = Signal()
@@ -117,27 +123,27 @@ class HighlightModel(QObject):
 class HighlightService:
     """Evaluate one condition at each period phase without touching CSV samples."""
 
-    def build(self, capture, condition, marker_a, marker_b, period, phase,
+    def build(self, capture, condition, marker_a, marker_b, period, phase=0,
               progress=lambda percent, rows: None, cancel=lambda: False):
-        period = max(1, int(period))
+        """``period`` is a SamplingGrid, or a sample count combined with ``phase``."""
+        sampling = as_sampling(period, phase)
         lower, upper = sorted((marker_a, marker_b))
-        first = lower + ((phase - lower) % period)
         path = None
         count = 0
         pending = None
         try:
             with tempfile.NamedTemporaryFile(dir=capture.storage.name, prefix="highlight_", suffix=".bin", delete=False) as stream:
                 path = Path(stream.name)
-                for index, sample in enumerate(range(first, upper + 1, period)):
+                points = sampling.points(lower, upper + 1, capture.count, cancel)
+                for index, (sample, next_start, at, previous) in enumerate(points):
                     if index % 4096 == 0:
                         if cancel():
                             raise LoadCancelled()
                         progress(round(100 * (sample - lower) / max(1, upper - lower)), index)
-                    previous = sample - period if sample >= period else None
-                    if sample == marker_b or (condition is not None and not condition.matches(sample, previous)):
+                    if sample == marker_b or (condition is not None and not condition.matches(at, previous)):
                         continue
                     start = max(sample, lower + (marker_b == lower))
-                    end = min(sample + period, capture.count, upper + (marker_b != upper))
+                    end = min(next_start, capture.count, upper + (marker_b != upper))
                     if end <= start:
                         continue
                     if pending and start <= pending[1]:

@@ -29,7 +29,9 @@ from .period_dialog import CopyPeriodBanner
 from .highlights import HighlightGroup, HighlightModel, HighlightService
 from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
-from .refresh import CaptureRefreshState
+from .refresh import CaptureRefreshState, legacy_period
+from .sampling import PeriodicSampling
+from .timebase import parse_clock
 from .bookmarks_ui import BookmarkController
 from .measurements import EdgeMeasurementService, MeasurementFormatter
 
@@ -63,6 +65,7 @@ class MainWindow(QMainWindow):
         self.highlights = HighlightModel(self)
         self.copy_period = None
         self.copy_phase = 0
+        self.clock_sampling = None  # EdgeSampling chosen from a clock signal, if any
         self.copy_period_banner = None
         self.pending_period_action = None
         self.pending_copy_expression = ""
@@ -235,9 +238,9 @@ class MainWindow(QMainWindow):
         self.add_action(analysis, "Подсветить участки по условию…", lambda: self.create_highlight())
         self.add_action(analysis, "Advanced Highlight…", lambda: self.create_highlight(mode="advanced"))
         analysis.addSeparator()
-        self.add_action(analysis, "Выбрать период выборки заново…", self.recalibrate_period,
+        self.add_action(analysis, "Такт выборки: сигнал clk или маркеры…", self.recalibrate_period,
                         tooltip="Маркеры 1/2 задают шаг, с которым проверяются условия копирования и подсветки")
-        self.clock_period_action = self.add_action(analysis, "Период такта ILA (ns)…", self.set_period)
+        self.clock_period_action = self.add_action(analysis, "Шкала времени CSV: такт ILA…", self.set_period)
 
         settings = bar.addMenu("Настройки")
         self.add_action(settings, "Параметры…", self.show_appearance, "Ctrl+,")
@@ -319,7 +322,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.statusBar().showMessage(str(exc), 7000)
             return
-        if self.copy_period is None:
+        if self.current_sampling() is None:
             if self.copy_period_banner is not None:
                 return
             self.start_period_setup(radix)
@@ -360,7 +363,7 @@ class MainWindow(QMainWindow):
         try:
             request = self.copy_service.snapshot(
                 self.view, radix, compiler.compile(dialog.condition_text()),
-                self.copy_period, self.copy_phase, dialog.channel_options(),
+                self.current_sampling(), 0, dialog.channel_options(),
                 dialog.separator_box.currentData(),
                 "unique" if dialog.unique_box.isChecked() else "all",
                 dialog.sort_box.currentData(), dialog.selected_targets())
@@ -417,7 +420,7 @@ class MainWindow(QMainWindow):
         if not self.capture:
             self.statusBar().showMessage("Откройте захват для подсветки.", 6000)
             return
-        if self.copy_period is None:
+        if self.current_sampling() is None:
             self.start_period_setup(continuation=lambda: self.create_highlight(group, draft, mode))
             return
         compiler = self.condition_compiler()
@@ -446,7 +449,7 @@ class MainWindow(QMainWindow):
             return
         marker_a = group.marker_a if group else (self.view.cursor_a if self.view.cursor_b is not None else 0)
         marker_b = group.marker_b if group else (self.view.cursor_b if self.view.cursor_b is not None else self.capture.count)
-        period, phase = self.copy_period, self.copy_phase
+        period, phase = legacy_period(self.current_sampling())
         name, expression, color, opacity, highlight_mode = (dialog.name_edit.text().strip(), dialog.condition_text(),
                                                             dialog.color, dialog.opacity, dialog.mode)
 
@@ -473,13 +476,17 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Для задания периода нужны хотя бы два отсчёта.", 6000)
             return
         self.pending_period_action = continuation or (lambda: self.copy_values(radix))
-        banner = CopyPeriodBanner(self.view, self)
+        banner = CopyPeriodBanner(self.view, self, signals=self.condition_signals(),
+                                  current=self.clock_sampling, edge=self.preferences.clock_edge,
+                                  before_edge=self.preferences.clock_before_edge,
+                                  sample_period_ns=self.view.period_ns)
         self.copy_period_banner = banner
         banner.confirmed.connect(self.finish_period_setup)
+        banner.clockConfirmed.connect(self.finish_clock_setup)
         banner.cancelled.connect(self.cancel_period_setup)
         self.period_container.addWidget(banner)
         self.view.setFocus()
-        self.statusBar().showMessage("Режим выбора периода: ЛКМ — точка 1, Shift+ЛКМ — точка 2; затем подтвердите.", 8000)
+        self.statusBar().showMessage("Выбор такта: сигнал clk в списке или маркеры (ЛКМ — точка 1, Shift+ЛКМ — точка 2); затем подтвердите.", 8000)
 
     def clear_period_banner(self):
         banner, self.copy_period_banner = self.copy_period_banner, None
@@ -494,12 +501,43 @@ class MainWindow(QMainWindow):
         self.pending_period_action = None
         self.statusBar().showMessage("Настройка периода отменена.", 5000)
 
+    def current_sampling(self):
+        """The grid copy and highlight sample on: clock edges, else markers 1/2, else None."""
+        if self.clock_sampling is not None:
+            return self.clock_sampling
+        if self.copy_period is not None:
+            return PeriodicSampling(self.copy_period, self.copy_phase)
+        return None
+
+    def apply_banner_time_base(self):
+        banner = self.copy_period_banner
+        try:
+            period = banner.sample_period_ns() if banner else None
+        except ValueError:
+            period = None
+        if period:
+            self.set_sample_period(period)
+
     def finish_period_setup(self, period, phase):
+        self.apply_banner_time_base()
         self.copy_period = period
         self.copy_phase = phase
+        self.clock_sampling = None
         action, self.pending_period_action = self.pending_period_action, None
         self.clear_period_banner()
-        self.statusBar().showMessage(f"Период копирования: {self.copy_period:,} отсчётов.", 5000)
+        self.statusBar().showMessage(f"Период выборки: {self.copy_period:,} отсчётов.", 5000)
+        if action:
+            action()
+
+    def finish_clock_setup(self, sampling):
+        self.apply_banner_time_base()
+        self.clock_sampling = sampling
+        self.preferences.clock_edge = sampling.edge
+        self.preferences.clock_before_edge = sampling.before_edge
+        self.save_timer.start()
+        action, self.pending_period_action = self.pending_period_action, None
+        self.clear_period_banner()
+        self.statusBar().showMessage(f"Выборка по такту: {sampling.describe()}.", 6000)
         if action:
             action()
 
@@ -532,7 +570,9 @@ class MainWindow(QMainWindow):
                 converter.executable = preferences.wlf2vcd_path or None
         self.view.preferences = preferences
         self.view.full_names = preferences.full_names
+        self.view.period_ns = preferences.sample_period_ns
         self.full_names_action.setChecked(preferences.full_names)
+        self.view.refresh_rows()
         self.themes.select(preferences.theme)
         self.view.layout_highlight_panel()
         self.view.viewport().update()
@@ -674,9 +714,12 @@ class MainWindow(QMainWindow):
         if state is None:
             self.copy_period = None
             self.copy_phase = 0
+            self.clock_sampling = None
             self.refresh_bit_styles = None
         else:
             self.refresh_bit_styles = state
+            # The clock follows its signal by name; without it, ask for the clock again.
+            self.clock_sampling = self.clock_sampling.rebind(capture) if self.clock_sampling else None
         self.pending_copy_expression = ""
         old = self.capture
         self.highlights.reset()
@@ -732,18 +775,14 @@ class MainWindow(QMainWindow):
         if not self.capture or not hasattr(self, "readout"):
             return
         v = self.view
+        axis = v.time_axis()
         parts = [f"A: {v.cursor_a:,}"]
-        if self.capture.times is not None:
-            parts.append(f"tA: {self.capture.format_time(v.cursor_a)}")
-        elif v.period_ns:
-            parts.append(f"tA: {v.cursor_a * v.period_ns:g} ns")
+        if axis is not None:
+            parts.append(f"tA: {axis.readout(v.cursor_a)}")
         if v.cursor_b is not None:
             parts.extend([f"B: {v.cursor_b:,}", f"Δ: {abs(v.cursor_b - v.cursor_a):,} отсч."])
-            if self.capture.times is not None:
-                delta = abs(self.capture.time_at(v.cursor_b) - self.capture.time_at(v.cursor_a))
-                parts.append(f"Δt: {self.capture.format_ticks(delta)}")
-            elif v.period_ns:
-                parts.append(f"Δt: {abs(v.cursor_b - v.cursor_a) * v.period_ns:g} ns")
+            if axis is not None:
+                parts.append(f"Δt: {axis.delta(v.cursor_a, v.cursor_b)}")
             sig = v.current_signal
             measurement = self.edge_measurements.measure(sig, v.cursor_a, v.cursor_b)
             parts.extend(self.measurement_formatter.parts(measurement, self.capture, v.period_ns,
@@ -809,12 +848,24 @@ class MainWindow(QMainWindow):
                         "Поиск триггера…")
 
     def set_period(self):
-        period, ok = QInputDialog.getDouble(self, "Период отсчёта", "Период ILA clock, ns (0 — только отсчёты):",
-                                           self.view.period_ns, 0, 1e12, 6)
-        if ok:
-            self.view.period_ns = period
-            self.view.viewport().update()
-            self.update_status()
+        current = f"{self.view.period_ns:g} ns" if self.view.period_ns else ""
+        text, ok = QInputDialog.getText(self, "Шкала времени CSV",
+                                        "Такт выборки ILA: частота (100 MHz) или период (10 ns).\n"
+                                        "Пусто — ось только в отсчётах. Значение сохраняется.", text=current)
+        if not ok:
+            return
+        try:
+            self.set_sample_period(parse_clock(text) if text.strip() else 0.0)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+
+    def set_sample_period(self, period_ns):
+        """ILA sample period in ns; a general preference, since it describes the ILA setup."""
+        self.view.period_ns = period_ns
+        self.preferences.sample_period_ns = period_ns
+        self.save_timer.start()
+        self.view.viewport().update()
+        self.update_status()
 
     def toggle_names(self, checked):
         self.view.full_names = checked
@@ -848,6 +899,12 @@ Copy Values… — для каждого сигнала свой Radix и диа
 При первом копировании передвиньте маркеры 1/2 и подтвердите период на панели.
 Во время выбора периода ЛКМ двигает 1, Shift+ЛКМ — 2.
 В окне условия можно выбрать период заново; B — исключающая граница.
+Такт выборки — сигнал clk (передний, задний или оба фронта) или маркеры 1/2.
+По сигналу такта выборка идёт только по реальным фронтам (подходит для SPI SCK);
+«до фронта» берёт значения, которые видит регистр в момент фронта.
+Частота такта в панели выбора задаёт шкалу времени CSV; её можно изменить в
+«Анализ → Шкала времени CSV» и в настройках, значение сохраняется.
+Reverse Bit Order переставляет и строки раскрытых битов (отключается в настройках).
 Правый щелчок в Name/Value: Copy Name / Copy Value для текущей ячейки.
 Подсветить участки по условию — группы под диаграммой с отдельной прозрачностью.
 В окне копирования доступны разделитель и уникальные значения с сортировкой.
