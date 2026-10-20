@@ -89,6 +89,21 @@ class WaveformRenderer:
                     self.draw_segment(painter, sig, code, x1, x2, y)
                 run_start = run_end
 
+    def draw_bookmarks(self, painter, w, h, color, background):
+        """Named bookmarks: dashed lines labelled at the top of the time axis."""
+        v = self.view
+        metrics = painter.fontMetrics()
+        for bookmark in v.bookmarks.visible(v.left, v.left + v.span):
+            x = min(w - 1, v.sample_x(bookmark.sample))
+            painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
+            self.line(painter, x, 18, x, h)
+            label = metrics.elidedText(bookmark.name, Qt.TextElideMode.ElideRight, 96)
+            width = metrics.horizontalAdvance(label) + 8
+            label_x = min(x + 1, w - width - 1)
+            painter.fillRect(QRectF(label_x, 0, width, 18), color)
+            painter.setPen(background)
+            painter.drawText(QRectF(label_x, 0, width, 18), Qt.AlignmentFlag.AlignCenter, label)
+
     def paint(self, event):
         v = self.view
         theme = v.themes.current
@@ -216,6 +231,8 @@ class WaveformRenderer:
             painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
             self.line(painter, xa, v.HEADER, xa, h)
             self.line(painter, xb, v.HEADER, xb, h)
+        if not v.period_mode:
+            self.draw_bookmarks(painter, w, h, QColor(theme.text), background)
         for label, sample, color in (() if v.period_mode else (("A", v.cursor_a, QColor(theme.marker_a)), ("B", v.cursor_b, QColor(theme.marker_b)))):
             if sample is not None and v.left <= sample <= v.left + v.span:
                 x = min(w - 1, v.sample_x(sample))

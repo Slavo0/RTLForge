@@ -19,6 +19,7 @@ from .icons import RowIconPainter
 from .rendering import WaveformRenderer
 from .preferences import ViewerPreferences
 from .selection import RowSelection
+from .bookmarks import BookmarkModel
 
 
 class WaveformView(QAbstractScrollArea):
@@ -39,7 +40,8 @@ class WaveformView(QAbstractScrollArea):
     SCROLL_STEPS = 1_000_000
     INDENT = 28
 
-    def __init__(self, parent=None, themes=None, menus=None, source_navigator=None, preferences=None):
+    def __init__(self, parent=None, themes=None, menus=None, source_navigator=None, preferences=None,
+                 bookmarks=None):
         super().__init__(parent)
         self.capture: Capture | None = None
         self.tree = SignalTree()
@@ -52,6 +54,9 @@ class WaveformView(QAbstractScrollArea):
         self.renderer = WaveformRenderer(self)
         self.highlight_model = None
         self.highlight_panel = None
+        # Named bookmarks are capture state owned by the presentation layer.
+        self.bookmarks = bookmarks if bookmarks is not None else BookmarkModel(self)
+        self.bookmarks.changed.connect(self.viewport().update)
         self.themes.changed.connect(self.viewport().update)
         self.visible_signals = []
         self.selected = 0
@@ -68,6 +73,7 @@ class WaveformView(QAbstractScrollArea):
         self.period_mode = False
         self.interaction_region = "names"
         self.context_column = None
+        self.context_sample = None
         self.drag = None
         self.drop_target = None
         self.drag_position = None
@@ -226,6 +232,14 @@ class WaveformView(QAbstractScrollArea):
         hits = [(abs(x - self.sample_x(sample)), name) for name, sample in (("A", self.cursor_a), ("B", self.cursor_b))
                 if sample is not None and self.left <= sample <= self.left + self.span]
         return min(hits)[1] if hits and min(hits)[0] <= 6 else None
+
+    def bookmark_at(self, x):
+        if not self.capture or x < self.plot_left or self.period_mode:
+            return None
+        hits = [(abs(x - self.sample_x(item.sample)), item)
+                for item in self.bookmarks.visible(self.left, self.left + self.span)]
+        nearest = min(hits, key=lambda hit: hit[0]) if hits else None
+        return nearest[1] if nearest and nearest[0] <= 6 else None
 
     def period_marker_at(self, x):
         if not self.period_mode or x < self.plot_left:
@@ -646,6 +660,8 @@ class WaveformView(QAbstractScrollArea):
         self._select_at(event.pos().y(), preserve=True)
         self.context_column = ("name" if event.pos().x() < self.name_width else
                                "value" if event.pos().x() < self.plot_left else None)
+        in_plot = self.capture is not None and event.pos().x() >= self.plot_left
+        self.context_sample = self.nearest_sample(event.pos().x()) if in_plot else None
         menu = self.menus.build(self)
         menu.exec(event.globalPos())
         menu.deleteLater()

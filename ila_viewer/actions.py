@@ -166,9 +166,32 @@ class HighlightActions(ContextActionProvider):
         advanced.setEnabled(view.capture is not None)
 
 
+class BookmarkActions(ContextActionProvider):
+    """Bookmark commands for a right click on the waveform plot."""
+
+    def contribute(self, menu, view):
+        sample = view.context_sample
+        if view.capture is None or sample is None or view.period_mode:
+            return
+        menu.addSeparator()
+        existing = view.bookmarks.at(sample)
+        if existing is None:
+            menu.addAction(f"Поставить маркер здесь ({sample:,})", lambda: view.bookmarks.add(sample))
+        x = view.sample_x(sample)
+        bookmark = existing or view.bookmark_at(x)
+        if bookmark is not None:
+            menu.addAction(f"Переименовать маркер «{bookmark.name}»…", lambda: self.rename(view, bookmark))
+            menu.addAction(f"Удалить маркер «{bookmark.name}»", lambda: view.bookmarks.remove(bookmark.id))
+
+    def rename(self, view, bookmark):
+        text, ok = QInputDialog.getText(view, "Переименовать маркер", "Имя:", text=bookmark.name)
+        if ok:
+            view.bookmarks.rename(bookmark.id, text)
+
+
 class ContextMenuController:
     def __init__(self, providers=None):
-        self.providers = list(providers) if providers is not None else [RadixActions(), ColorActions(), SignalActions(), CopyActions(), CellCopyActions(), HighlightActions(), StructureActions()]
+        self.providers = list(providers) if providers is not None else [RadixActions(), ColorActions(), SignalActions(), CopyActions(), CellCopyActions(), HighlightActions(), BookmarkActions(), StructureActions()]
 
     def build(self, view):
         menu = QMenu(view)

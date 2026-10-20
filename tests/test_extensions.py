@@ -32,6 +32,9 @@ from ila_viewer.copy_dialog import CopyConditionDialog
 from ila_viewer.period_dialog import CopyPeriodBanner
 from ila_viewer.highlights import HighlightGroup, HighlightModel, HighlightService
 from ila_viewer.advanced import AdvancedHighlightService
+from ila_viewer.bookmarks import BookmarkModel
+from ila_viewer.measurements import EdgeMeasurementService, MeasurementFormatter
+from ila_viewer.vcd import VcdCaptureReader
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -374,6 +377,69 @@ class ModelTests(unittest.TestCase):
                 self.assertGreaterEqual(palette.contrast(color, theme.background), 3)
                 self.assertGreaterEqual(palette.contrast(color, theme.selected), 3)
         self.assertNotIn("#da9cff", palette.recommended(DARK, [DARK.bus]))
+
+    def test_bookmark_model_orders_names_navigates_and_clamps(self):
+        model = BookmarkModel()
+        changes = []
+        model.changed.connect(lambda: changes.append(1))
+        late = model.add(30)
+        early = model.add(5, "  start  ")
+        self.assertEqual((late.name, early.name), ("M1", "start"))
+        self.assertEqual([b.id for b in model.items], [early.id, late.id])
+        self.assertIs(model.at(30), late)
+        self.assertIs(model.next_after(5), late)
+        self.assertIsNone(model.next_after(30))
+        self.assertIs(model.previous_before(30), early)
+        self.assertIsNone(model.previous_before(5))
+        self.assertFalse(model.rename(late.id, "   "))
+        self.assertTrue(model.rename(late.id, "irq"))
+        self.assertEqual(model.get(late.id).name, "irq")
+        self.assertEqual([b.name for b in model.visible(0, 10)], ["start"])
+        model.clamp(10)
+        self.assertEqual(model.get(late.id).sample, 9)
+        self.assertTrue(model.remove(early.id))
+        self.assertFalse(model.remove(early.id))
+        model.clear()
+        self.assertEqual(len(model), 0)
+        self.assertEqual(model.add(1).name, "M1")
+        self.assertGreaterEqual(len(changes), 7)
+
+    def test_rising_edges_between_markers_and_unknown_states(self):
+        rows = "".join(f"{i % 2},{'X' if i == 4 else (1 if i in (2, 6) else 0)}\n" for i in range(12))
+        cap = self.capture("clk,flag\nRadix - HEX,BINARY\n" + rows)
+        clk, flag = cap.signals
+        service = EdgeMeasurementService()
+        # clk = 0,1,0,1,...: rising edges at odd samples; range is (start, end].
+        full = service.measure(clk, 0, cap.count)
+        self.assertEqual((full.rising, full.falling, full.first_rise, full.last_rise), (6, 5, 1, 11))
+        self.assertEqual(full.period_samples, 2)
+        self.assertEqual(service.measure(clk, 7, 3).rising, 2)
+        self.assertEqual(service.measure(clk, 3, 4).rising, 0)
+        self.assertEqual(service.measure(clk, 5, 5).rising, 0)
+        # flag = 0,0,1,0,X,0,1,0,...: X -> 0 -> 1 counts once, X itself is never an edge.
+        mixed = service.measure(flag, 0, cap.count)
+        self.assertEqual((mixed.rising, mixed.first_rise, mixed.last_rise), (2, 2, 6))
+        self.assertEqual(MeasurementFormatter().parts(full, cap, 10.0, "clk"),
+                         ["↑clk A…B: 6", "T≈ 2 отсч.", "f≈ 50 MHz"])
+        bus = self.capture("bus[3:0]\nRadix - HEX\n0\n1\n")
+        self.assertIsNone(service.measure(bus.signals[0], 0, 2))
+
+    def test_vcd_edge_period_uses_simulator_time(self):
+        lines = ["$timescale 1 ns $end", "$var wire 1 ! clk $end", '$var wire 1 " en $end',
+                 "$enddefinitions $end", "#0", "0!", '0"']
+        for step in range(1, 9):
+            lines += [f"#{step * 5}", f"{step % 2}!"]
+            if step == 3:
+                lines.append('1"')
+        path = Path(self.temp.name) / "clock.vcd"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        cap = VcdCaptureReader().load(path)
+        self.addCleanup(cap.close)
+        clk = next(s for s in cap.signals if s.short_name == "clk")
+        measurement = EdgeMeasurementService().measure(clk, 0, cap.count)
+        self.assertEqual(measurement.rising, 4)
+        self.assertEqual(MeasurementFormatter().parts(measurement, cap, 0, "clk"),
+                         ["↑clk A…B: 4", "T≈ 10 ns", "f≈ 100 MHz"])
 
 
 class InteractionTests(unittest.TestCase):
@@ -1166,6 +1232,98 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual(w.copy_period, 3)
         self.assertFalse(v.period_mode)
         self.assertEqual((v.cursor_a, v.cursor_b), original_markers)
+
+    def test_named_bookmarks_menu_navigation_rename_delete_and_capture_lifetime(self):
+        w = self.window
+        v = w.view
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "capture.csv"
+            path.write_text("clk\nRadix - HEX\n" + "".join(f"{i % 2}\n" for i in range(20)), encoding="utf-8")
+            w.open_file(path)
+            self.wait()
+            controller = w.bookmark_controller
+            self.assertIn("Навигация", [a.text() for a in w.menuBar().actions()])
+            self.assertEqual(controller.add_action.shortcut().toString(), "Ctrl+M")
+            v.set_cursor(15)
+            controller.add_action.trigger()
+            v.set_cursor(4)
+            controller.add_action.trigger()
+            controller.add_action.trigger()  # No duplicate marker on the same sample.
+            self.assertEqual([(b.name, b.sample) for b in v.bookmarks.items], [("M2", 4), ("M1", 15)])
+            v.set_cursor(0)
+            controller.next_action.trigger()
+            self.assertEqual(v.cursor_a, 4)
+            controller.next_action.trigger()
+            self.assertEqual(v.cursor_a, 15)
+            controller.next_action.trigger()
+            self.assertEqual(v.cursor_a, 15)
+            controller.previous_action.trigger()
+            self.assertEqual(v.cursor_a, 4)
+            v.grab()  # Bookmarks render as labelled lines without disturbing samples.
+            self.assertEqual(v.capture.signals[0].value_at(4), 0)
+
+            dialog = controller.show_manager(w)
+            self.assertFalse(dialog.isModal())
+            self.assertEqual(dialog.list.count(), 2)
+            dialog.list.item(1).setText("irq")
+            self.assertEqual(v.bookmarks.items[1].name, "irq")
+            dialog.list.item(0).setText("")
+            self.assertEqual(dialog.list.item(0).text(), "M2")
+            dialog.list.setCurrentRow(0)
+            dialog.delete_button.click()
+            self.assertEqual([b.name for b in v.bookmarks.items], ["irq"])
+
+            path.write_text("clk\nRadix - HEX\n" + "".join(f"{i % 2}\n" for i in range(10)), encoding="utf-8")
+            w.refresh_csv()
+            self.wait()
+            self.assertEqual([(b.name, b.sample) for b in v.bookmarks.items], [("irq", 9)])
+            w.open_file(path)
+            self.wait()
+            self.assertEqual(len(v.bookmarks), 0)
+            self.assertEqual(dialog.list.count(), 0)
+            self.assertNotIn("bookmark", json.dumps(w.preferences.__dict__, default=str).lower())
+
+    def test_bookmark_context_actions_and_edge_readout(self):
+        w = self.window
+        v = w.view
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "capture.csv"
+            rows = "".join(f"{i % 2},{i % 16:X}\n" for i in range(40))
+            path.write_text("clk,bus[3:0]\nRadix - HEX,HEX\n" + rows, encoding="utf-8")
+            w.open_file(path)
+            self.wait()
+            controller = v.menus
+            class Menu:
+                def build(inner, view):
+                    from PySide6.QtWidgets import QMenu
+                    inner.last = QMenu(view)
+                    QTimer.singleShot(0, inner.last.close)
+                    return inner.last
+            v.menus = Menu()
+            point = self.point(0, round(v.sample_x(10)))
+            QApplication.sendEvent(v.viewport(), QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse, point, v.viewport().mapToGlobal(point)))
+            v.menus = controller
+            self.assertEqual(v.context_sample, 10)
+            menu = v.menus.build(v)
+            next(a for a in menu.actions() if a.text().startswith("Поставить маркер здесь")).trigger()
+            self.assertEqual([b.sample for b in v.bookmarks.items], [10])
+            menu = v.menus.build(v)
+            self.assertFalse(any(a.text().startswith("Поставить маркер здесь") for a in menu.actions()))
+            with patch("ila_viewer.actions.QInputDialog.getText", return_value=("start", True)):
+                next(a for a in menu.actions() if a.text().startswith("Переименовать маркер")).trigger()
+            self.assertEqual(v.bookmarks.items[0].name, "start")
+            next(a for a in v.menus.build(v).actions() if a.text().startswith("Удалить маркер")).trigger()
+            self.assertEqual(len(v.bookmarks), 0)
+
+            v.selected = 0
+            v.set_cursor(2)
+            v.set_cursor(12, secondary=True)
+            self.assertIn("↑clk A…B: 5", w.readout.text())
+            self.assertIn("T≈ 2 отсч.", w.readout.text())
+            v.selected = 1
+            v.selectionChanged.emit()
+            self.assertNotIn("↑", w.readout.text())
 
 
 if __name__ == "__main__":

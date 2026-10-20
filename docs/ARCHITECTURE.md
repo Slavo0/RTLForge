@@ -32,6 +32,9 @@
 | `ila_viewer/period_dialog.py` | `CopyPeriodBanner`: немодальная панель настройки периода по двум точкам диаграммы |
 | `ila_viewer/refresh.py` | Снимок оформления сигналов и правил подсветки для сверки после повторной загрузки CSV |
 | `ila_viewer/highlights.py` | `HighlightService`, `HighlightIntervals`, `HighlightModel`: фоновый поиск, дисковые интервалы и состояние групп текущего захвата |
+| `ila_viewer/bookmarks.py` | `Bookmark`, `BookmarkModel`: именованные маркеры текущего захвата, порядок, переход, ограничение длиной захвата |
+| `ila_viewer/bookmarks_ui.py` | `BookmarkController`: команды меню «Навигация»; `BookmarkManagerDialog`: немодальный список маркеров |
+| `ila_viewer/measurements.py` | `EdgeMeasurementService`, `EdgeMeasurement`, `MeasurementFormatter`: фронты однобитного сигнала между A и B, период и частота |
 | `ila_viewer/highlights_ui.py` | `HighlightConditionDialog`, `HighlightPanel`: редактор условия и список групп над полосой прокрутки |
 | `tests/` | Поведенческие тесты и искусственный CSV |
 | `scripts/benchmark_waveform.py` | Воспроизводимая проверка большого искусственного захвата |
@@ -167,6 +170,25 @@ Shift в колонках расширяет выделение, Shift на wave
 порядка. Переход к краям при отсутствии
 фронтов реализован в навигации `WaveformView`, не добавляет фиктивных изменений
 в исходный `SignalData` и не меняет результаты поиска.
+
+## Именованные маркеры и измерения
+
+`BookmarkModel` — состояние представления, внедряемое в `WaveformView(bookmarks=...)`
+(по умолчанию создаётся собственное). Оно не входит в `ViewerPreferences` и не меняет
+`SignalData`. `MainWindow.loaded` очищает модель при открытии другого файла и вызывает
+`clamp(count)` при обновлении, так что маркеры за концом нового захвата переносятся на
+последний отсчёт. `WaveformRenderer.draw_bookmarks` рисует только маркеры видимого
+окна. Команды меню и окно списка собраны в `BookmarkController`; окно лишь вызывает
+`install(menu, window)`. Контекстные команды добавляет `BookmarkActions`, используя
+`WaveformView.context_sample` — ближайший отсчёт правого щелчка.
+
+`EdgeMeasurementService.measure(signal, a, b)` считает переходы с отсчётом в
+`(min, max]` только по индексу серий. У сигнала со значениями лишь 0/1 серии
+чередуются, поэтому число фронтов, первый и последний фронт получаются двумя
+бинарными поисками за O(log n) независимо от длины диапазона; при X/Z выполняется
+векторный проход по переходам диапазона. `MeasurementFormatter` переводит результат
+в текст: для `Capture.times` — через `time_at` и `$timescale`, для CSV — в отсчётах
+и через период ILA clock.
 
 ## Zoom и копирование
 

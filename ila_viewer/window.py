@@ -30,6 +30,8 @@ from .highlights import HighlightGroup, HighlightModel, HighlightService
 from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
 from .refresh import CaptureRefreshState
+from .bookmarks_ui import BookmarkController
+from .measurements import EdgeMeasurementService, MeasurementFormatter
 
 APP_NAME = "Waveform Reader"
 
@@ -56,6 +58,8 @@ class MainWindow(QMainWindow):
         self.copy_service = CopyValuesService()
         self.highlight_service = HighlightService()
         self.advanced_highlight_service = AdvancedHighlightService()
+        self.edge_measurements = EdgeMeasurementService()
+        self.measurement_formatter = MeasurementFormatter()
         self.highlights = HighlightModel(self)
         self.copy_period = None
         self.copy_phase = 0
@@ -67,6 +71,8 @@ class MainWindow(QMainWindow):
         self.refresh_bit_styles = None
         self.clipboard = clipboard if clipboard is not None else SystemClipboard()
         self.view = WaveformView(themes=self.themes, menus=menus, source_navigator=source_navigator, preferences=self.preferences)
+        self.bookmark_controller = BookmarkController(self.view, parent=self)
+        self.bookmark_controller.message.connect(lambda s: self.statusBar().showMessage(s, 5000))
         self.highlight_panel = HighlightPanel(self.highlights, self.view)
         self.view.attach_highlight_panel(self.highlights, self.highlight_panel)
         self.highlight_panel.createRequested.connect(self.create_highlight)
@@ -220,6 +226,9 @@ class MainWindow(QMainWindow):
         self.add_action(navigation, "Предыдущее совпадение", lambda: self.find_value(-1), "Shift+F3")
         navigation.addSeparator()
         self.add_action(navigation, "Убрать курсор B", self.clear_b)
+        navigation.addSeparator()
+        self.bookmark_controller.install(navigation, self)
+
 
         analysis = bar.addMenu("Анализ")
         self.add_action(analysis, "Копировать значения…", lambda: self.copy_values("DEFAULT"))
@@ -671,6 +680,10 @@ class MainWindow(QMainWindow):
         self.pending_copy_expression = ""
         old = self.capture
         self.highlights.reset()
+        if state is None:
+            self.view.bookmarks.clear()
+        else:
+            self.view.bookmarks.clamp(capture.count)
         self.capture = capture
         self.preferences.last_csv_directory = str(capture.path.resolve().parent)
         self.save_timer.start()
@@ -731,6 +744,10 @@ class MainWindow(QMainWindow):
                 parts.append(f"Δt: {self.capture.format_ticks(delta)}")
             elif v.period_ns:
                 parts.append(f"Δt: {abs(v.cursor_b - v.cursor_a) * v.period_ns:g} ns")
+            sig = v.current_signal
+            measurement = self.edge_measurements.measure(sig, v.cursor_a, v.cursor_b)
+            parts.extend(self.measurement_formatter.parts(measurement, self.capture, v.period_ns,
+                                                          sig.short_name if sig else ""))
         for name, data in self.capture.metadata.items():
             parts.append(f"{name}: {int(data[v.cursor_a])}")
         parts.append(f"Вид: {v.left:.0f}…{min(self.capture.count - 1, v.left + v.span):.0f}")
@@ -853,6 +870,10 @@ F — весь захват; Home / End — начало / конец.
 «Файл → Недавние файлы» открывает один из последних захватов.
 Ctrl+F — поиск; Enter / F3 — вперёд; Shift+F3 — назад.
 Ctrl+G — перейти к индексу отсчёта; Ctrl+O — открыть CSV, VCD или WLF.
+Ctrl+M — именованный маркер в позиции A; Alt + ← / → — предыдущий / следующий маркер.
+«Навигация → Маркеры…» — список маркеров: переход, переименование, удаление.
+Для однобитного сигнала при установленном B строка состояния показывает число
+фронтов ↑ между A и B и оценку периода/частоты (для VCD — в реальном времени).
 Ctrl+A после Name/Value — все видимые сигналы; после waveform — A=начало, B=конец.
 «Обновить файл» (F5) перечитывает захват, сохраняя оформление совпавших сигналов и действительные подсветки.
 Перетаскивание границы столбцов — ширина области имён.
