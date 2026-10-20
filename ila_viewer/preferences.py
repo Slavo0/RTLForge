@@ -24,6 +24,7 @@ class ViewerPreferences:
     maximized: bool = False
     copy_separator: str = "space"
     last_csv_directory: str = ""
+    recent_files: list = field(default_factory=list)
     wlf2vcd_path: str = ""
     separate_signal_styles: bool = False
     fill_bus: bool = False
@@ -35,6 +36,8 @@ class ViewerPreferences:
 
 
 class PreferencesStore:
+    RECENT_LIMIT = 10
+
     def __init__(self, path=None):
         """None creates an isolated in-memory store (tests / embedded viewers)."""
         self.path = Path(path) if path is not None else None
@@ -85,6 +88,8 @@ class PreferencesStore:
             result.copy_separator = "space"
         if result.last_csv_directory and not Path(result.last_csv_directory).is_dir():
             result.last_csv_directory = ""
+        result.recent_files = list(dict.fromkeys(
+            path for path in result.recent_files if isinstance(path, str) and path))[:self.RECENT_LIMIT]
         for key, low, high in (("name_width", 100, 10000), ("value_width", 60, 10000),
                                ("window_width", 400, 16000), ("window_height", 300, 16000)):
             setattr(result, key, max(low, min(high, getattr(result, key))))

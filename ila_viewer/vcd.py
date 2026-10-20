@@ -35,9 +35,12 @@ class SplitBusAssembler:
         for base, entries in groups.items():
             numbers = [number for number, _ in entries]
             if (len(entries) < 2 or len(set(numbers)) != len(numbers)
-                    or abs(numbers[0] - numbers[-1]) + 1 != len(numbers)
-                    or not all(abs(a - b) == 1 for a, b in zip(numbers, numbers[1:]))):
+                    or max(numbers) - min(numbers) + 1 != len(numbers)):
                 continue
+            if not all(abs(a - b) == 1 for a, b in zip(numbers, numbers[1:])):
+                # Some writers declare bits in arbitrary order; present them MSB first.
+                entries = sorted(entries, reverse=True)
+                numbers = [number for number, _ in entries]
             name = f"{base}[{numbers[0]}:{numbers[-1]}]"
             parent_index = len(signals)
             signals.append(SignalData(name, "BINARY", len(entries), True))
@@ -114,11 +117,19 @@ class VcdCaptureReader:
                             progress(min(99, int(stream.buffer.tell() / size * 100)), count)
 
                     started = False
+                    in_comment = False
+                    widths = [signal.width for signal in signals]
                     lines = (line for line in ([first_change] if first_change else []) if line)
                     for line_number, line in enumerate(chain(lines, stream), 1):
                         if line_number % 16384 == 0 and cancel():
                             raise LoadCancelled()
                         line = line.strip()
+                        if in_comment:
+                            in_comment = not re.search(r"\$end(?=\s|$)", line)
+                            continue
+                        if line.startswith("$comment"):
+                            in_comment = not re.search(r"\$end(?=\s|$)", line)
+                            continue
                         if not line or line.startswith("$"):
                             continue
                         if line.startswith("#"):
@@ -137,7 +148,11 @@ class VcdCaptureReader:
                             continue
                         symbol, value = parsed
                         for index in by_id.get(symbol, ()):
-                            changes[index] = value
+                            # VCD left-extends short vectors with 0, or with a leading x/z.
+                            if len(value) < widths[index] and value[0] in "xz":
+                                changes[index] = value.rjust(widths[index], value[0])
+                            else:
+                                changes[index] = value
                     if started:
                         commit()
                     time_buffer.tofile(time_file)

@@ -99,7 +99,7 @@ class WaveformRenderer:
         if not v.capture:
             painter.setPen(muted)
             painter.drawText(v.viewport().rect(), Qt.AlignmentFlag.AlignCenter,
-                             "Откройте CSV из Vivado ILA\nCtrl+O или перетащите файл в окно")
+                             "Откройте Vivado ILA CSV, VCD или WLF\nCtrl+O или перетащите файл в окно")
             return
         w, h, split = v.viewport().width(), v.viewport().height(), v.plot_left
         scroll = v.verticalScrollBar().value()

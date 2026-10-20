@@ -1,4 +1,4 @@
-# Архитектура ILA Waveform Reader
+# Архитектура Waveform Reader
 
 Цель — добавлять поведение через небольшие классы и композицию объектов,
 сохраняя точку запуска стабильной. Данные захвата отделены от настроек просмотра.
@@ -10,10 +10,10 @@
 |---|---|
 | `ila_viewer/__main__.py` | Тонкая точка запуска пакета |
 | `ila_viewer/application.py` | `WaveformApplication`: создание приложения и внедрение фабрики окна |
-| `ila_viewer/window.py` | `MainWindow`: сборка интерфейса, связывание событий, жизненный цикл захвата |
+| `ila_viewer/window.py` | `MainWindow`: сборка интерфейса и меню (Файл, Вид, Навигация, Анализ, Настройки, Справка), связывание событий, жизненный цикл захвата. Редакторы копирования и подсветки получают сигналы из дерева представления (`condition_nodes`), поэтому разрезанные биты VCD видны только внутри своей шины |
 | `ila_viewer/sources.py` | `CaptureSource`, выбор CSV/VCD/WLF и адаптер штатного `wlf2vcd`; `SourceNavigator`: переход к HDL |
 | `ila_viewer/data.py` | `Capture`, `SignalData`, потоковый CSV-парсер и дисковые индексы |
-| `ila_viewer/vcd.py` | `VcdCaptureReader`: потоковый разбор VCD; `SplitBusAssembler`: объединение последовательных скалярных битов без потери их исходных индексов |
+| `ila_viewer/vcd.py` | `VcdCaptureReader`: потоковый разбор VCD; `SplitBusAssembler`: объединение скалярных битов с непрерывным диапазоном индексов (в любом порядке объявления, показываются от старшего бита) без потери их исходных индексов |
 | `ila_viewer/bits.py` | `BitCodec`, `BitExpansionService`: извлечение битов и их точных переходов |
 | `ila_viewer/tree.py` | `SignalTree`, `WaveNode` и подклассы: дерево, порядок, группы, разделители; `DisplaySignal`: адаптер представления |
 | `ila_viewer/formats.py` | `ValueFormat`, `FormatRegistry`: стратегии отображения и разбора поисковых значений |
@@ -24,7 +24,7 @@
 | `ila_viewer/rendering.py` | `WaveformRenderer`: рисование видимого участка; не меняет данные и структуру дерева |
 | `ila_viewer/workers.py` | `BackgroundTask`: выполнение отменяемых операций вне GUI-потока |
 | `ila_viewer/preferences.py` | `ViewerPreferences`, `PreferencesStore`: только общие настройки, проверка типов и атомарная запись JSON |
-| `ila_viewer/settings_dialog.py` | `AppearanceDialog`: вкладка общих настроек вида |
+| `ila_viewer/settings_dialog.py` | `AppearanceDialog`: вкладки «Общие», «Сигналы», «Подсветка», «Источники» с поштучным сбросом к значениям по умолчанию |
 | `ila_viewer/selection.py` | `RowSelection`: диапазонное выделение по стабильным идентификаторам узлов и отдельный якорь |
 | `ila_viewer/copying.py` | `CopyValuesService`, `CopyRequest`, `CopyChannel`: сборка выбранных битов, снимок настроек, отменяемый экспорт; `SystemClipboard`: запись в Qt clipboard |
 | `ila_viewer/conditions.py` | Безопасный разбор условий Copy Values и разрешение коротких/полных имён сигналов |

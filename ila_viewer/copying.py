@@ -119,7 +119,7 @@ class CopyValuesService:
     def snapshot(self, view, radix="DEFAULT", condition=None, period=1, phase=0,
                  channel_options=None, separator=None, samples="all", sort="original", targets=None):
         if not view.capture:
-            raise ValueError("Откройте CSV для копирования")
+            raise ValueError("Откройте захват для копирования")
         channels = []
         for key, selected_offsets in (targets if targets is not None else self.selected_targets(view)):
             trace = key.signal

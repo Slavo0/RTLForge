@@ -1,13 +1,13 @@
 # Copyright 2026 Вячеслав Рудаков
 # SPDX-License-Identifier: Apache-2.0
 
-"""Standalone offline viewer for Vivado ILA CSV exports."""
+"""Standalone offline viewer for ILA CSV exports and simulator dumps (VCD, WLF)."""
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QDialog, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QToolBar,
@@ -31,11 +31,13 @@ from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
 from .refresh import CaptureRefreshState
 
+APP_NAME = "Waveform Reader"
+
 
 class MainWindow(QMainWindow):
     def __init__(self, source=None, themes=None, source_navigator=None, menus=None, preferences_store=None, clipboard=None):
         super().__init__()
-        self.setWindowTitle("ILA Waveform Reader")
+        self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.capture = None
         self.worker = None
@@ -88,33 +90,25 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         self.open_action = self.add_action(toolbar, "Открыть захват", self.choose_file, "Ctrl+O")
         toolbar.addSeparator()
-        self.add_action(toolbar, "+", lambda: self.view.zoom_toolbar(0.5), tooltip="Приблизить относительно середины A↔B")
-        self.add_action(toolbar, "−", lambda: self.view.zoom_toolbar(2), tooltip="Отдалить относительно середины A↔B")
-        self.add_action(toolbar, "Весь захват", self.view.fit, tooltip="F — уместить весь захват")
-        self.add_action(toolbar, "A ↔ B", self.view.zoom_cursors, tooltip="Уместить диапазон между курсорами")
+        self.zoom_in_action = self.add_action(toolbar, "+", lambda: self.view.zoom_toolbar(0.5), tooltip="Приблизить относительно середины A↔B")
+        self.zoom_out_action = self.add_action(toolbar, "−", lambda: self.view.zoom_toolbar(2), tooltip="Отдалить относительно середины A↔B")
+        self.fit_action = self.add_action(toolbar, "Весь захват", self.view.fit, tooltip="F — уместить весь захват")
+        self.zoom_cursors_action = self.add_action(toolbar, "A ↔ B", self.view.zoom_cursors, tooltip="Уместить диапазон между курсорами")
         toolbar.addSeparator()
-        self.add_action(toolbar, "← Изменение", lambda: self.view.next_transition(-1), tooltip="← — предыдущее изменение выбранного сигнала")
-        self.add_action(toolbar, "Изменение →", lambda: self.view.next_transition(1), tooltip="→ — следующее изменение выбранного сигнала")
-        self.add_action(toolbar, "К отсчёту…", self.goto_sample, "Ctrl+G")
-        self.add_action(toolbar, "Триггер", self.goto_trigger)
+        self.previous_change_action = self.add_action(toolbar, "← Изменение", lambda: self.view.next_transition(-1), tooltip="← — предыдущее изменение выбранного сигнала")
+        self.next_change_action = self.add_action(toolbar, "Изменение →", lambda: self.view.next_transition(1), tooltip="→ — следующее изменение выбранного сигнала")
+        self.goto_action = self.add_action(toolbar, "К отсчёту…", self.goto_sample, "Ctrl+G")
+        # Only Vivado ILA captures carry a TRIGGER column; simulator dumps do not.
+        self.trigger_action = self.add_action(toolbar, "Триггер", self.goto_trigger,
+                                              tooltip="Перейти к первому TRIGGER = 1")
+        self.trigger_action.setVisible(False)
         toolbar_spacer = QWidget()
         toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(toolbar_spacer)
-        self.refresh_action = self.add_action(toolbar, "Обновить файл", self.refresh_csv,
-                                              tooltip="Повторно открыть текущий захват с диска")
+        self.refresh_action = self.add_action(toolbar, "Обновить файл", self.refresh_csv, "F5",
+                                              tooltip="F5 — повторно открыть текущий захват с диска")
         self.refresh_action.setEnabled(False)
-
-        tools_menu = self.menuBar().addMenu("Файл")
-        tools_menu.addAction(self.open_action)
-        self.add_action(tools_menu, "Сохранить WLF как VCD…", self.export_wlf)
-        self.add_action(tools_menu, "Сохранить вид как PNG…", self.save_image)
-        self.add_action(tools_menu, "Выход", self.close, "Ctrl+Q")
-        settings = self.menuBar().addMenu("Настройки")
-        self.add_action(settings, "Настройки…", self.show_appearance)
-        self.add_action(settings, "Период отсчёта…", self.set_period)
-        self.add_action(settings, "Убрать курсор B", self.clear_b)
-        help_menu = self.menuBar().addMenu("Справка")
-        self.add_action(help_menu, "Управление", self.show_help, "F1")
+        self.build_menus()
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -132,23 +126,26 @@ class MainWindow(QMainWindow):
         self.search_edit.setToolTip("Точное значение целой шины. Без префикса — в выбранном формате. Enter: следующее совпадение.")
         self.search_edit.returnPressed.connect(lambda: self.find_value(1))
         search_row.addWidget(self.search_edit)
+        # The find buttons sit right next to the value they search for.
+        self.previous_button = QPushButton("Найти ←")
+        self.next_button = QPushButton("Найти →")
+        self.previous_button.setToolTip("Shift+F3 — предыдущее совпадение")
+        self.next_button.setToolTip("Enter / F3 — следующее совпадение")
+        self.previous_button.clicked.connect(lambda: self.find_value(-1))
+        self.next_button.clicked.connect(lambda: self.find_value(1))
+        search_row.addWidget(self.previous_button)
+        search_row.addWidget(self.next_button)
         self.loop_search = QCheckBox("↻")
         self.loop_search.setToolTip("Кольцевой поиск: после конца продолжать с начала сигнала")
         self.loop_search.setChecked(True)
         search_row.addWidget(self.loop_search)
         search_row.addStretch(1)
-        self.previous_button = QPushButton("Найти ←")
-        self.next_button = QPushButton("Найти →")
-        self.previous_button.clicked.connect(lambda: self.find_value(-1))
-        self.next_button.clicked.connect(lambda: self.find_value(1))
-        search_row.addWidget(self.previous_button)
-        search_row.addWidget(self.next_button)
         layout.addLayout(search_row)
         self.period_container = QVBoxLayout()
         self.period_container.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(self.period_container)
         layout.addWidget(self.view, 1)
-        self.readout = QLabel("Откройте waveform.csv")
+        self.readout = QLabel("Откройте захват: Vivado ILA CSV, VCD или WLF")
         self.readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.readout.setWordWrap(True)
         layout.addWidget(self.readout)
@@ -164,9 +161,6 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_button)
         self.statusBar().showMessage("Ctrl+колесо: масштаб · Shift+колесо: время · ←/→: изменения · Shift+клик: курсор B")
-        self.add_action(self, "Поиск", self.focus_search, "Ctrl+F")
-        self.add_action(self, "Следующее совпадение", lambda: self.find_value(1), "F3")
-        self.add_action(self, "Предыдущее совпадение", lambda: self.find_value(-1), "Shift+F3")
         available = QApplication.primaryScreen().availableGeometry()
         self.resize(min(self.preferences.window_width, int(available.width() * 0.95)),
                     min(self.preferences.window_height, int(available.height() * 0.95)))
@@ -185,6 +179,116 @@ class MainWindow(QMainWindow):
             action.setToolTip(tooltip)
         container.addAction(action)
         return action
+
+    def build_menus(self):
+        """Menus group commands by task; toolbar actions are shared, not duplicated."""
+        bar = self.menuBar()
+        file_menu = bar.addMenu("Файл")
+        file_menu.addAction(self.open_action)
+        self.recent_menu = file_menu.addMenu("Недавние файлы")
+        self.recent_menu.aboutToShow.connect(self.populate_recent_menu)
+        file_menu.addAction(self.refresh_action)
+        file_menu.addSeparator()
+        self.add_action(file_menu, "Сохранить WLF как VCD…", self.export_wlf)
+        self.add_action(file_menu, "Сохранить вид как PNG…", self.save_image)
+        file_menu.addSeparator()
+        self.add_action(file_menu, "Выход", self.close, "Ctrl+Q")
+
+        view_menu = bar.addMenu("Вид")
+        for action in (self.zoom_in_action, self.zoom_out_action, self.fit_action, self.zoom_cursors_action):
+            view_menu.addAction(action)
+        view_menu.addSeparator()
+        self.full_names_action = self.add_action(view_menu, "Полные имена сигналов", self.toggle_names)
+        self.full_names_action.setCheckable(True)
+        self.full_names_action.setChecked(self.preferences.full_names)
+        self.add_action(view_menu, "Ширина Name по содержимому", lambda: self.view.auto_fit_column("name"))
+        theme_menu = view_menu.addMenu("Тема")
+        self.theme_actions = QActionGroup(self)
+        for theme in self.themes.themes.values():
+            action = self.add_action(theme_menu, theme.label, lambda _checked=False, key=theme.key: self.themes.select(key))
+            action.setCheckable(True)
+            action.setData(theme.key)
+            self.theme_actions.addAction(action)
+        self.sync_theme_actions()
+
+        navigation = bar.addMenu("Навигация")
+        for action in (self.previous_change_action, self.next_change_action, self.goto_action, self.trigger_action):
+            navigation.addAction(action)
+        navigation.addSeparator()
+        self.add_action(navigation, "Поиск значения", self.focus_search, "Ctrl+F")
+        self.add_action(navigation, "Следующее совпадение", lambda: self.find_value(1), "F3")
+        self.add_action(navigation, "Предыдущее совпадение", lambda: self.find_value(-1), "Shift+F3")
+        navigation.addSeparator()
+        self.add_action(navigation, "Убрать курсор B", self.clear_b)
+
+        analysis = bar.addMenu("Анализ")
+        self.add_action(analysis, "Копировать значения…", lambda: self.copy_values("DEFAULT"))
+        self.add_action(analysis, "Подсветить участки по условию…", lambda: self.create_highlight())
+        self.add_action(analysis, "Advanced Highlight…", lambda: self.create_highlight(mode="advanced"))
+        analysis.addSeparator()
+        self.add_action(analysis, "Выбрать период выборки заново…", self.recalibrate_period,
+                        tooltip="Маркеры 1/2 задают шаг, с которым проверяются условия копирования и подсветки")
+        self.clock_period_action = self.add_action(analysis, "Период такта ILA (ns)…", self.set_period)
+
+        settings = bar.addMenu("Настройки")
+        self.add_action(settings, "Параметры…", self.show_appearance, "Ctrl+,")
+
+        help_menu = bar.addMenu("Справка")
+        self.add_action(help_menu, "Управление", self.show_help, "F1")
+        self.add_action(help_menu, "О программе", self.show_about)
+
+    def sync_theme_actions(self):
+        if not hasattr(self, "theme_actions"):
+            return
+        for action in self.theme_actions.actions():
+            action.setChecked(action.data() == self.themes.current.key)
+
+    def populate_recent_menu(self):
+        self.recent_menu.clear()
+        recent = self.preferences.recent_files
+        for index, path in enumerate(recent, 1):
+            action = self.recent_menu.addAction(f"&{index % 10}  {Path(path).name}")
+            action.setToolTip(path)
+            action.setStatusTip(path)
+            action.triggered.connect(lambda _checked=False, p=path: self.open_recent(p))
+        if recent:
+            self.recent_menu.addSeparator()
+            self.recent_menu.addAction("Очистить список", self.clear_recent_files)
+        else:
+            self.recent_menu.addAction("Нет недавних файлов").setEnabled(False)
+
+    def open_recent(self, path):
+        if not Path(path).is_file():
+            self.preferences.recent_files = [p for p in self.preferences.recent_files if p != path]
+            self.save_timer.start()
+            self.statusBar().showMessage(f"Файл не найден: {path}", 6000)
+            return
+        self.open_file(path)
+
+    def remember_recent(self, path):
+        path = str(Path(path).resolve())
+        recent = [path] + [p for p in self.preferences.recent_files if p != path]
+        self.preferences.recent_files = recent[:PreferencesStore.RECENT_LIMIT]
+        self.save_timer.start()
+
+    def clear_recent_files(self):
+        self.preferences.recent_files = []
+        self.save_timer.start()
+
+    def recalibrate_period(self):
+        if not self.capture:
+            self.statusBar().showMessage("Сначала откройте захват.", 5000)
+            return
+        if self.worker or self.copy_period_banner is not None or self.active_editor is not None:
+            self.statusBar().showMessage("Дождитесь окончания текущей операции.", 5000)
+            return
+        self.start_period_setup(continuation=lambda: None)
+
+    def show_about(self):
+        QMessageBox.about(self, f"О программе {APP_NAME}",
+                          f"<b>{APP_NAME}</b><br>Офлайн-просмотр временных диаграмм: "
+                          "Vivado ILA CSV, VCD и Questa/ModelSim WLF (через wlf2vcd).<br><br>"
+                          "Apache License 2.0")
 
     def focus_search(self):
         self.search_edit.setFocus()
@@ -214,17 +318,8 @@ class MainWindow(QMainWindow):
         compiler = self.condition_compiler()
         selected = self.copy_service.selected_targets(self.view)
         selected_ids = {node.id for node, _ in selected}
-        available = []
-        picker_signals = []
-        def visit(node):
-            if node.signal and node.kind != "bit":
-                picker_signals.append(node.signal.source)
-                if node.id not in selected_ids:
-                    available.append((node, None))
-            for child in node.children:
-                visit(child)
-        visit(self.view.tree.root)
-        dialog = CopyOptionsDialog(picker_signals, compiler,
+        available = [(node, None) for node in self.condition_nodes() if node.id not in selected_ids]
+        dialog = CopyOptionsDialog(self.condition_signals(), compiler,
                                    selected, self.copy_service,
                                    self, full_names=self.view.full_names,
                                    expression_text=self.pending_copy_expression,
@@ -276,6 +371,20 @@ class MainWindow(QMainWindow):
         self.clipboard.write(text)
         self.statusBar().showMessage("Скопировано в буфер обмена.", 3000)
 
+    def condition_nodes(self):
+        """Signal rows offered by editors: whole buses, never their split VCD bits."""
+        nodes = []
+        def visit(node):
+            if node.signal and node.kind != "bit":
+                nodes.append(node)
+            for child in node.children:
+                visit(child)
+        visit(self.view.tree.root)
+        return nodes
+
+    def condition_signals(self):
+        return [node.signal.source for node in self.condition_nodes()]
+
     def condition_compiler(self):
         radix_by_name = {}
         stack = list(self.view.tree.root.children)
@@ -297,7 +406,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Дождитесь окончания текущей операции.", 5000)
             return
         if not self.capture:
-            self.statusBar().showMessage("Откройте CSV для подсветки.", 6000)
+            self.statusBar().showMessage("Откройте захват для подсветки.", 6000)
             return
         if self.copy_period is None:
             self.start_period_setup(continuation=lambda: self.create_highlight(group, draft, mode))
@@ -307,7 +416,7 @@ class MainWindow(QMainWindow):
             index = len(self.highlights.groups)
             draft = {"name": f"Подсветка {index + 1}",
                      "style": index % len(self.preferences.highlight_palette), "mode": mode}
-        dialog = HighlightConditionDialog(self.capture.signals, compiler,
+        dialog = HighlightConditionDialog(self.condition_signals(), compiler,
                                           self.preferences.highlight_palette,
                                           self.preferences.highlight_opacities,
                                           self, group, draft,
@@ -388,10 +497,12 @@ class MainWindow(QMainWindow):
     def apply_theme(self):
         self.setStyleSheet(self.themes.current.stylesheet())
         self.preferences.theme = self.themes.current.key
+        self.sync_theme_actions()
         self.save_timer.start()
 
     def sync_filter_width(self):
-        self.filter_edit.setFixedWidth(min(self.view.name_width + 1, max(100, self.width() - 350)))
+        # Leave room for the value search, both find buttons and the loop toggle.
+        self.filter_edit.setFixedWidth(min(self.view.name_width + 1, max(100, self.width() - 420)))
 
     def columns_changed(self):
         self.sync_filter_width()
@@ -412,6 +523,7 @@ class MainWindow(QMainWindow):
                 converter.executable = preferences.wlf2vcd_path or None
         self.view.preferences = preferences
         self.view.full_names = preferences.full_names
+        self.full_names_action.setChecked(preferences.full_names)
         self.themes.select(preferences.theme)
         self.view.layout_highlight_panel()
         self.view.viewport().update()
@@ -571,9 +683,16 @@ class MainWindow(QMainWindow):
             self.highlights.changed.emit()
         if old:
             old.close()
-        self.setWindowTitle(f"{capture.path.name} — ILA Waveform Reader")
-        changes = sum(len(sig.starts) - 1 for sig in capture.signals)
-        self.statusBar().showMessage(f"{capture.count:,} отсчётов · {len(capture.signals)} сигналов · {changes:,} изменений")
+        self.setWindowTitle(f"{capture.path.name} — {APP_NAME}")
+        self.remember_recent(capture.path)
+        self.trigger_action.setVisible(self.trigger_signal() is not None)
+        # Simulator dumps carry real timestamps; the ILA clock period only applies to CSV rows.
+        self.clock_period_action.setEnabled(capture.times is None)
+        # Bits of a split VCD bus are already counted by the rebuilt bus.
+        split_bits = {id(bit) for bits in capture.split_buses.values() for bit in bits}
+        shown = [sig for sig in capture.signals if id(sig) not in split_bits]
+        changes = sum(len(sig.starts) - 1 for sig in shown)
+        self.statusBar().showMessage(f"{capture.count:,} отсчётов · {len(shown)} сигналов · {changes:,} изменений")
         self.view.setFocus()
         if state and state.highlights:
             compiler = self.condition_compiler()
@@ -584,7 +703,7 @@ class MainWindow(QMainWindow):
             self.start_work(lambda task: state.rebuild_highlights(
                 capture, compiler, self.highlight_service, self.advanced_highlight_service,
                 task.progress.emit, task.isInterruptionRequested),
-                restored, "Восстановление подсветок после обновления CSV…", "подсветок")
+                restored, "Восстановление подсветок после обновления файла…", "подсветок")
 
     def update_selection(self):
         sig = self.view.current_signal
@@ -656,10 +775,15 @@ class MainWindow(QMainWindow):
             except ValueError:
                 self.statusBar().showMessage("Введите целый индекс внутри захвата.", 5000)
 
+    def trigger_signal(self):
+        if not self.capture:
+            return None
+        return next((s for s in self.capture.signals if s.name.upper() == "TRIGGER"), None)
+
     def goto_trigger(self):
         if not self.capture or self.worker:
             return
-        sig = next((s for s in self.capture.signals if s.name.upper() == "TRIGGER"), None)
+        sig = self.trigger_signal()
         if not sig:
             self.statusBar().showMessage("В файле нет столбца TRIGGER.", 5000)
             return
@@ -711,7 +835,7 @@ Copy Values… — для каждого сигнала свой Radix и диа
 Подсветить участки по условию — группы под диаграммой с отдельной прозрачностью.
 В окне копирования доступны разделитель и уникальные значения с сортировкой.
 Name и Value имеют независимые границы; Value расширяется при длинных значениях.
-Общий Radix, тема, заливка и стили подсветки находятся в «Настройки → Настройки…».
+Общий Radix, тема, заливка и стили подсветки находятся в «Настройки → Параметры…» (Ctrl+,).
 Стрелка слева от шины — раскрыть / свернуть биты.
 Перетаскивание имени — изменить порядок строк.
 Верх / низ строки: вставить до / после; центр группы: перенести внутрь.
@@ -725,10 +849,12 @@ Shift + колесо, Shift + ← / → — прокрутка времени.
 Ctrl + колесо — масштаб относительно мыши; + / − — относительно A.
 Средняя кнопка мыши + движение — прокрутка времени.
 F — весь захват; Home / End — начало / конец.
+«Триггер» появляется, только если в захвате есть столбец TRIGGER.
+«Файл → Недавние файлы» открывает один из последних захватов.
 Ctrl+F — поиск; Enter / F3 — вперёд; Shift+F3 — назад.
 Ctrl+G — перейти к индексу отсчёта; Ctrl+O — открыть CSV, VCD или WLF.
 Ctrl+A после Name/Value — все видимые сигналы; после waveform — A=начало, B=конец.
-«Обновить файл» справа вверху перечитывает захват, сохраняя оформление совпавших сигналов и действительные подсветки.
+«Обновить файл» (F5) перечитывает захват, сохраняя оформление совпавших сигналов и действительные подсветки.
 Перетаскивание границы столбцов — ширина области имён.
 Правый щелчок — формат значения выбранного сигнала.
 
@@ -738,7 +864,7 @@ Ctrl+A после Name/Value — все видимые сигналы; посл�
 Плотные изменения на общем виде показаны заполненной полосой.
 Приблизьте участок, чтобы увидеть отдельные переходы.
 
-Ось X — порядок строк CSV, начиная с 0. Sample in Buffer/Window
+Для CSV ось X — порядок строк, начиная с 0. Sample in Buffer/Window
 показываются отдельно. Время вычисляется только из введённого
 периода: при захвате с пропусками это не реальное время.
 Для VCD/WLF ось пропорциональна времени симуляции; индекс отсчёта означает

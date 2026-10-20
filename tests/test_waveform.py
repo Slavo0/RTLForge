@@ -91,6 +91,34 @@ class ReaderTests(unittest.TestCase):
         node.expanded = True
         self.assertEqual(len(tree.rows()), 13)
 
+    def test_vcd_unordered_split_bits_comments_and_short_vectors(self):
+        lines = ["$timescale 1 ns $end"]
+        lines += [f"$var wire 1 {symbol} data [{bit}] $end" for symbol, bit in zip("!\"#$", (1, 3, 0, 2))]
+        lines += ["$var wire 4 % wide [3:0] $end", "$enddefinitions $end",
+                  "$comment", "1! this line is not a value change", "$end",
+                  "#0", "0!", "1\"", "0#", "0$", "bx %", "#10", "1#", "b1 %"]
+        path = Path(self.directory.name) / "unordered.vcd"
+        path.write_text("\n".join(lines) + "\n", encoding="ascii")
+        capture = VcdCaptureReader().load(path)
+        self.addCleanup(capture.close)
+        self.assertEqual(list(capture.split_buses), ["data[3:0]"])
+        bus = next(sig for sig in capture.signals if sig.name == "data[3:0]")
+        self.assertEqual([bus.value_at(i) for i in range(2)], [0b1000, 0b1001])
+        tree = SignalTree(capture.signals, split_buses=capture.split_buses)
+        self.assertEqual([child.label for child in tree.root.children[0].children],
+                         ["[3]", "[2]", "[1]", "[0]"])
+        wide = next(sig for sig in capture.signals if sig.name == "wide[3:0]")
+        self.assertEqual([wide.value_at(i) for i in range(2)], ["XXXX", 1])
+
+    def test_recent_files_are_unique_strings_and_bounded(self):
+        path = Path(self.directory.name) / "settings.json"
+        path.write_text('{"recent_files": ["a.csv", 3, "a.csv", ""' +
+                        "".join(f', "{i}.vcd"' for i in range(20)) + "]}", encoding="utf-8")
+        recent = PreferencesStore(path).load().recent_files
+        self.assertEqual(recent[0], "a.csv")
+        self.assertEqual(len(recent), PreferencesStore.RECENT_LIMIT)
+        self.assertEqual(len(set(recent)), len(recent))
+
     def test_wlf_source_uses_converter_and_keeps_original_path(self):
         source = Path(self.directory.name) / "vsim.wlf"
         source.write_bytes(b"WLF placeholder")
@@ -358,6 +386,37 @@ class GuiTests(unittest.TestCase):
                                   dialog.channels.minimumSizeHint(), dialog.picker_panel.minimumSizeHint()))
             self.assertTrue(dialog.findChild(QDialogButtonBox).isVisible())
             dialog.close()
+
+    def test_highlight_dialog_lists_rebuilt_bus_and_trigger_follows_capture(self):
+        self.assertTrue(self.window.trigger_action.isVisible())
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "split.vcd"
+            lines = ["$timescale 1 ns $end"]
+            lines += [f"$var wire 1 {chr(33 + i)} rx_data [{8 - i}] $end" for i in range(9)]
+            lines += ["$var wire 1 A rx_we $end", "$enddefinitions $end", "#0"]
+            lines += [f"0{chr(33 + i)}" for i in range(9)] + ["1A", "#10", "1!"]
+            path.write_text("\n".join(lines) + "\n", encoding="ascii")
+            self.window.loaded(VcdCaptureReader().load(path))
+            self.assertFalse(self.window.trigger_action.isVisible())
+            self.assertFalse(self.window.clock_period_action.isEnabled())
+            self.assertIn(str(path.resolve()), self.window.preferences.recent_files)
+            self.window.copy_period, self.window.copy_phase = 1, 0
+            self.window.create_highlight()
+            dialog = self.window.active_editor
+            self.assertIsNotNone(dialog)
+            names = [dialog.signal_list.item(i).text() for i in range(dialog.signal_list.count())]
+            self.assertEqual(names, ["rx_data[8:0]", "rx_we"])
+            dialog.close()
+            self.app.processEvents()
+        self.window.loaded(load_csv(FIXTURE_CSV))
+        self.assertTrue(self.window.trigger_action.isVisible())
+
+    def test_find_buttons_follow_value_search_field(self):
+        w = self.window
+        self.assertLess(w.search_edit.geometry().right(), w.previous_button.geometry().left())
+        self.assertLess(w.next_button.geometry().right(), w.width() / 2 + w.view.name_width)
+        menus = [action.text() for action in w.menuBar().actions()]
+        self.assertEqual(menus, ["Файл", "Вид", "Навигация", "Анализ", "Настройки", "Справка"])
 
     def test_scrollbar_large_sample_counts(self):
         # Scrollbars use Qt's signed 32-bit range even when capture indices do not.

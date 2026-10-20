@@ -14,7 +14,7 @@ class WaveformApplication:
     def __init__(self, argv=None, window_factory=MainWindow):
         self.argv = list(sys.argv if argv is None else argv)
         self.qt = QApplication.instance() or QApplication(self.argv)
-        self.qt.setApplicationName("ILA Waveform Reader")
+        self.qt.setApplicationName("Waveform Reader")
         self.qt.setFont(QFont("Segoe UI", 10))
         self.qt.setStyle("Fusion")
         self.window = window_factory()
