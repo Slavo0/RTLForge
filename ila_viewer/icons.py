@@ -23,6 +23,12 @@ class RowIconPainter:
             painter.drawPolygon(QPolygonF([QPointF(x, y + 2), QPointF(x + 6, y + 2),
                                           QPointF(x + 8, y + 5), QPointF(x + 15, y + 5),
                                           QPointF(x + 15, y + 14), QPointF(x, y + 14)]))
+        elif kind == "decoded":
+            # A protocol row: two field boxes in sequence.
+            for left in (x, x + 8):
+                painter.drawPolygon(QPolygonF([QPointF(left, y + 7.5), QPointF(left + 2, y + 3),
+                                              QPointF(left + 5, y + 3), QPointF(left + 7, y + 7.5),
+                                              QPointF(left + 5, y + 12), QPointF(left + 2, y + 12)]))
         elif kind == "divider":
             for offset in (5, 10):
                 painter.drawLine(QPointF(x, y + offset), QPointF(x + 15, y + offset))

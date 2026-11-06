@@ -68,7 +68,9 @@ class CopyConditionDialog(QDialog):
         layout.addWidget(self.period_button)
         self.error = QLabel("Операторы: &&, ||, !, ~, = / ==, !=, <, >, <=, >=. "
                             "Число без префикса — в Radix сравниваемого сигнала; "
-                            "h334 — HEX, b010100 — Binary, d34953 — Decimal.")
+                            "h334 — HEX, b010100 — Binary, d34953 — Decimal. "
+                            "Часть шины: data[3], data[7:4], data[7,5,4,2-0] == b001001 "
+                            "(физические номера битов, старший — первый в списке).")
         self.error.setWordWrap(True)
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)

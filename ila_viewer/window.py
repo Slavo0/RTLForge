@@ -34,6 +34,7 @@ from .sampling import PeriodicSampling
 from .timebase import parse_clock
 from .bookmarks_ui import BookmarkController
 from .measurements import EdgeMeasurementService, MeasurementFormatter
+from .spi_ui import SpiController
 
 APP_NAME = "Waveform Reader"
 
@@ -76,11 +77,16 @@ class MainWindow(QMainWindow):
         self.view = WaveformView(themes=self.themes, menus=menus, source_navigator=source_navigator, preferences=self.preferences)
         self.bookmark_controller = BookmarkController(self.view, parent=self)
         self.bookmark_controller.message.connect(lambda s: self.statusBar().showMessage(s, 5000))
+        self.idle_actions = []
+        self.spi = SpiController(self.view, self, parent=self)
+        self.spi.message.connect(lambda s: self.statusBar().showMessage(s, 7000))
         self.highlight_panel = HighlightPanel(self.highlights, self.view)
         self.view.attach_highlight_panel(self.highlights, self.highlight_panel)
         self.highlight_panel.createRequested.connect(self.create_highlight)
         self.highlight_panel.advancedRequested.connect(lambda: self.create_highlight(mode="advanced"))
         self.highlight_panel.editRequested.connect(self.create_highlight)
+        self.highlight_panel.navigateRequested.connect(self.navigate_highlight)
+        self.highlights.changed.connect(self.update_status)
         self.themes.changed.connect(self.apply_theme)
         self.apply_theme()
         self.view.findRequested.connect(self.focus_search)
@@ -241,6 +247,8 @@ class MainWindow(QMainWindow):
         self.add_action(analysis, "Такт выборки: сигнал clk или маркеры…", self.recalibrate_period,
                         tooltip="Маркеры 1/2 задают шаг, с которым проверяются условия копирования и подсветки")
         self.clock_period_action = self.add_action(analysis, "Шкала времени CSV: такт ILA…", self.set_period)
+        analysis.addSeparator()
+        self.spi.install(analysis, self)
 
         settings = bar.addMenu("Настройки")
         self.add_action(settings, "Параметры…", self.show_appearance, "Ctrl+,")
@@ -471,6 +479,18 @@ class MainWindow(QMainWindow):
             task.progress.emit, task.isInterruptionRequested), complete,
             "Поиск участков для подсветки…", "проверенных периодов")
 
+    def navigate_highlight(self, group, direction):
+        if not self.capture or group not in self.highlights.groups:
+            return
+        index = group.intervals.step(self.view.cursor_a, direction)
+        if index is None:
+            self.statusBar().showMessage(f"В подсветке «{group.name}» нет участков.", 4000)
+            return
+        start, _ = group.intervals.interval(index)
+        self.highlights.active_id = group.id
+        self.view.set_cursor(start)
+        self.update_status()
+
     def start_period_setup(self, radix="DEFAULT", continuation=None):
         if not self.view.begin_period_setup():
             self.statusBar().showMessage("Для задания периода нужны хотя бы два отсчёта.", 6000)
@@ -699,6 +719,18 @@ class MainWindow(QMainWindow):
         else:
             complete(task.result)
         task.deleteLater()
+        self.drain_idle_actions()
+
+    def run_when_idle(self, callback):
+        """Run now, or after the current background operation finishes."""
+        if self.worker:
+            self.idle_actions.append(callback)
+        else:
+            callback()
+
+    def drain_idle_actions(self):
+        while self.idle_actions and not self.worker and not self.closing:
+            self.idle_actions.pop(0)()
 
     def cancel_work(self):
         if self.worker:
@@ -737,6 +769,8 @@ class MainWindow(QMainWindow):
             state.apply_styles(self.view)
             self.highlights.master_enabled = state.master_enabled
             self.highlights.changed.emit()
+        # Decoder files live in the old capture storage; release them before it is removed.
+        self.spi.capture_changed(capture, refresh=state is not None)
         if old:
             old.close()
         self.setWindowTitle(f"{capture.path.name} — {APP_NAME}")
@@ -789,7 +823,12 @@ class MainWindow(QMainWindow):
                                                           sig.short_name if sig else ""))
         for name, data in self.capture.metadata.items():
             parts.append(f"{name}: {int(data[v.cursor_a])}")
-        parts.append(f"Вид: {v.left:.0f}…{min(self.capture.count - 1, v.left + v.span):.0f}")
+        group = self.highlights.active_group
+        if group is not None and group.intervals.count:
+            # Like Find in an editor: position of A among the group's spans, "–" outside them.
+            index = group.intervals.index_at(v.cursor_a)
+            position = f"{index + 1:,}" if index is not None else "–"
+            parts.append(f"«{group.name}»: {position}/{group.intervals.count:,}")
         self.readout.setText("   |   ".join(parts))
 
     def find_value(self, direction):
@@ -919,7 +958,10 @@ New Divider, New Group. Цвета с пометкой «подходит» ко
 Ctrl + ← / → — перемещение A на один отсчёт.
 ↑ / ↓ — выбрать соседний сигнал.
 Колесо — вертикальная прокрутка сигналов.
-Shift + колесо, Shift + ← / → — прокрутка времени.
+Shift + ← / → — выделение: маркер, поставленный последним, остаётся, второй
+переходит к изменению выбранного сигнала (Ctrl+Shift — на один отсчёт,
+Shift+Home / End — до края захвата); Δ и Δt видны внизу.
+Shift + колесо, Shift + PageUp / PageDown — прокрутка времени.
 Ctrl + колесо — масштаб относительно мыши; + / − — относительно A.
 Средняя кнопка мыши + движение — прокрутка времени.
 F — весь захват; Home / End — начало / конец.
@@ -947,7 +989,13 @@ Ctrl+A после Name/Value — все видимые сигналы; посл�
 периода: при захвате с пропусками это не реальное время.
 Для VCD/WLF ось пропорциональна времени симуляции; индекс отсчёта означает
 порядковый номер временной отметки с событиями. WLF требует wlf2vcd из Questa/ModelSim.
-«Файл → Сохранить WLF как VCD…» создаёт VCD для просмотра без Questa.""")
+«Файл → Сохранить WLF как VCD…» создаёт VCD для просмотра без Questa.
+
+SPI / QSPI («Анализ → SPI / QSPI: декодер…»): выберите CS, SCK и IO0…IO3, фронт и
+формат — по таблице команд, фиксированный (1-1-1, 1-4-4, 4-4-4, 0-4-4…) или простые байты.
+Строка SPI на диаграмме: ← / → — к границе следующего поля, Shift + ← / → — выделить байты.
+Ctrl+Shift+C — копировать байты между A и B (без B — весь захват).
+Список транзакций: двойной щелчок выделяет транзакцию, копирование и сохранение .bin.""")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and any(u.isLocalFile() for u in event.mimeData().urls()):
@@ -970,6 +1018,7 @@ Ctrl+A после Name/Value — все видимые сигналы; посл�
             self.active_editor.reject()
         self.save_preferences()
         self.highlights.reset()
+        self.spi.dispose()
         if self.capture:
             self.view.capture = None
             self.view.auto_scroll.stop()

@@ -20,6 +20,7 @@ from .rendering import WaveformRenderer
 from .preferences import ViewerPreferences
 from .selection import RowSelection
 from .timebase import capture_axis
+from .annotations import SignalAnnotations
 from .bookmarks import BookmarkModel
 
 
@@ -58,6 +59,8 @@ class WaveformView(QAbstractScrollArea):
         # Named bookmarks are capture state owned by the presentation layer.
         self.bookmarks = bookmarks if bookmarks is not None else BookmarkModel(self)
         self.bookmarks.changed.connect(self.viewport().update)
+        # Decoder annotations drawn on signal rows (presentation only, owned by decoders).
+        self.annotations = SignalAnnotations(self.viewport().update)
         self.themes.changed.connect(self.viewport().update)
         self.visible_signals = []
         self.selected = 0
@@ -69,6 +72,7 @@ class WaveformView(QAbstractScrollArea):
         self.value_width = self.preferences.value_width
         self.cursor_a = 0
         self.cursor_b = None
+        self.anchor_marker = "A"  # the marker Shift+arrows keep fixed
         self.period_markers = [None, None]
         self.period_marker_target = None
         self.period_mode = False
@@ -150,6 +154,7 @@ class WaveformView(QAbstractScrollArea):
         self.selected = 0
         self.selection = RowSelection()
         self.cursor_a, self.cursor_b = 0, None
+        self.anchor_marker = "A"
         self.refresh_rows()
         self.verticalScrollBar().setValue(0)
         self.fit()
@@ -187,7 +192,17 @@ class WaveformView(QAbstractScrollArea):
         sig = node.signal
         if sig:
             return sig.format_value(sig.value_at(self.cursor_a), self.display_radix(sig))
+        if node.kind == "decoded":
+            return node.track.label_at(self.cursor_a)
         return str(int(node.values[self.cursor_a])) if node.kind == "parameter" else ""
+
+    @property
+    def current_navigable(self):
+        """What ←/→ and Shift+←/→ step through: a signal's changes or a decoded row's fields."""
+        node = self.current_node
+        if node is None:
+            return None
+        return node.signal or getattr(node, "track", None)
 
     def column_at(self, x):
         if abs(x - self.name_width) <= 5:
@@ -392,7 +407,8 @@ class WaveformView(QAbstractScrollArea):
             start, end = sorted((self.cursor_a, self.cursor_b))
             self.set_range(max(0, start - 1), max(2, end - start + 2))
 
-    def set_cursor(self, sample, secondary=False, reveal=True):
+    def set_cursor(self, sample, secondary=False, reveal=True, anchor=True):
+        """Move A (or B). ``anchor`` records it as the marker Shift+arrows extend from."""
         if not self.capture:
             return
         sample = max(0, min(self.capture.count - 1, int(sample)))
@@ -400,14 +416,40 @@ class WaveformView(QAbstractScrollArea):
             self.cursor_b = sample
         else:
             self.cursor_a = sample
+        if anchor:
+            self.anchor_marker = "B" if secondary else "A"
         if reveal and not self.left <= sample < self.left + self.span:
             self.set_range(sample - self.span / 2, self.span)
         self.ensure_value_width()
         self.cursorChanged.emit()
         self.viewport().update()
 
+    def extend_selection(self, direction, unit="change"):
+        """Shift+arrows, like selecting text: the anchor marker stays, the other one moves.
+
+        ``unit`` is ``change`` (next change of the selected signal), ``sample`` or ``end``.
+        """
+        if not self.capture or self.period_mode:
+            return
+        move_b = self.anchor_marker != "B" or self.cursor_b is None
+        if move_b:
+            origin = self.cursor_b if self.cursor_b is not None else self.cursor_a
+        else:
+            origin = self.cursor_a
+        last = self.capture.count - 1
+        if unit == "sample":
+            target = origin + direction
+        elif unit == "end":
+            target = 0 if direction < 0 else last
+        else:
+            sig = self.current_navigable
+            target = sig.transition(min(origin, last), direction) if sig else None
+            if target is None:
+                target = 0 if direction < 0 else last
+        self.set_cursor(target, secondary=move_b, anchor=False)
+
     def next_transition(self, direction):
-        sig = self.current_signal
+        sig = self.current_navigable
         if sig:
             sample = sig.transition(self.cursor_a, direction)
             if sample is None:
@@ -619,6 +661,7 @@ class WaveformView(QAbstractScrollArea):
                     self.cursor_a = 0
                     # B marks the exclusive boundary just after the final sample.
                     self.cursor_b = self.capture.count
+                    self.anchor_marker = "A"
                     self.cursorChanged.emit()
                     self.viewport().update()
             elif self.rows:
@@ -629,12 +672,20 @@ class WaveformView(QAbstractScrollArea):
             event.accept()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             direction = -1 if key == Qt.Key.Key_Left else 1
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if shift:
+                self.extend_selection(direction, "sample" if control else "change")
+            elif control:
                 self.set_cursor(self.cursor_a + direction)
-            elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self.set_range(self.left + direction * self.span * 0.1, self.span)
             else:
                 self.next_transition(direction)
+        elif key in (Qt.Key.Key_Home, Qt.Key.Key_End) and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.extend_selection(-1 if key == Qt.Key.Key_Home else 1, "end")
+        elif key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown) and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            # Keyboard time scroll (Shift+arrows now extend the A…B selection).
+            direction = -1 if key == Qt.Key.Key_PageUp else 1
+            self.set_range(self.left + direction * self.span * 0.5, self.span)
         elif key in (Qt.Key.Key_Up, Qt.Key.Key_Down) and self.visible_signals:
             self._selected = max(0, min(len(self.visible_signals) - 1, self.selected + (-1 if key == Qt.Key.Key_Up else 1)))
             self.selection.select(self.rows, self.selected, bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
@@ -663,6 +714,7 @@ class WaveformView(QAbstractScrollArea):
             self.zoom_band = None
             if not self.period_mode:
                 self.cursor_b = None
+                self.anchor_marker = "A"
             self.cursorChanged.emit()
             self.viewport().update()
         else:

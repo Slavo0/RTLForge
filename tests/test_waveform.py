@@ -458,6 +458,29 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(w.preferences.sample_period_ns, 10.0)
         self.assertIn("tA: 10 ns", w.readout.text())
 
+    def test_shift_arrows_extend_from_the_last_placed_marker(self):
+        v = self.window.view
+        v.selected = 3  # rx_re toggles every sample in the fixture
+        signal = v.current_signal
+        v.set_cursor(100)
+        QTest.keyClick(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        first = signal.transition(100, 1)
+        self.assertEqual((v.cursor_a, v.cursor_b), (100, first))
+        QTest.keyClick(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual((v.cursor_a, v.cursor_b), (100, signal.transition(first, 1)))
+        QTest.keyClick(v, Qt.Key.Key_Left, Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(v.cursor_b, signal.transition(first, 1) - 1)
+        self.assertIn("Δ:", self.window.readout.text())
+        # After placing B, B is the anchor and A moves.
+        v.set_cursor(300, secondary=True)
+        QTest.keyClick(v, Qt.Key.Key_Left, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual((v.cursor_a, v.cursor_b), (signal.transition(100, -1), 300))
+        QTest.keyClick(v, Qt.Key.Key_End, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual((v.cursor_a, v.cursor_b), (self.window.capture.count - 1, 300))
+        v.set_range(200, 100)
+        QTest.keyClick(v, Qt.Key.Key_PageDown, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(v.left, 250)
+
     def test_find_buttons_follow_value_search_field(self):
         w = self.window
         self.assertLess(w.search_edit.geometry().right(), w.previous_button.geometry().left())

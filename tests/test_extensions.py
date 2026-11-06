@@ -14,6 +14,7 @@ from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QFont, QFontDatabase, QContextMenuEvent
 from PySide6.QtTest import QTest
@@ -37,6 +38,11 @@ from ila_viewer.measurements import EdgeMeasurementService, MeasurementFormatter
 from ila_viewer.vcd import VcdCaptureReader
 from ila_viewer.sampling import EdgeSampling, clock_candidates
 from ila_viewer.timebase import capture_axis, format_ruler, format_seconds, parse_clock
+from ila_viewer.spi import (PARTIAL, UNKNOWN, UNKNOWN_COMMAND, BusWidths, DecodedTrack,
+                            FixedFormat, LineRef, SpiDecoder, SpiDecoderConfig, SpiExportRequest,
+                            SpiExportService, SpiPins, SpiSettings, bubble_label, field_label,
+                            guess_pins, line_options, overlays)
+from ila_viewer.annotations import SignalAnnotations
 
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "waveform.csv"
@@ -294,16 +300,22 @@ class ModelTests(unittest.TestCase):
     def test_clock_edge_highlights_do_not_paint_idle_gaps(self):
         cap, _ = self.spi_view()
         sck = cap.signals[0]
+        # Values sampled before an edge belong to the cycle that ends at that edge,
+        # so that cycle is painted, not the one after the edge.
         grid = EdgeSampling(sck, "rising")
         everything = HighlightService().build(cap, None, 0, cap.count, grid)
-        self.assertEqual(list(everything.visible(0, cap.count)), [(2.0, 8.0), (11.0, 13.0)])
+        self.assertEqual(list(everything.visible(0, cap.count)), [(0.0, 6.0), (9.0, 11.0)])
         compiler = ConditionCompiler(cap.signals)
         late = HighlightService().build(cap, compiler.compile("data == 55"), 0, cap.count, grid)
-        self.assertEqual(list(late.visible(0, cap.count)), [(11.0, 13.0)])
+        self.assertEqual(list(late.visible(0, cap.count)), [(9.0, 11.0)])  # where data is 55
         pattern = compiler.compile_pattern("data == 11 -> data == 22")
         sequence = AdvancedHighlightService().build(cap, pattern, 0, cap.count, grid)
-        self.assertEqual(list(sequence.visible(0, cap.count)), [(2.0, 6.0)])
-        for intervals in (everything, late, sequence):
+        self.assertEqual(list(sequence.visible(0, cap.count)), [(0.0, 4.0)])
+        # Sampling at the edge reads the new values, which hold until the next edge.
+        at_edge = EdgeSampling(sck, "rising", before_edge=False)
+        new_values = HighlightService().build(cap, compiler.compile("data == 66"), 0, cap.count, at_edge)
+        self.assertEqual(list(new_values.visible(0, cap.count)), [(11.0, 13.0)])
+        for intervals in (everything, late, sequence, new_values):
             intervals.close()
 
     def test_clock_candidates_prefer_clock_names(self):
@@ -375,6 +387,36 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(LoadCancelled):
             service.build(cap, condition, 0, 7, 1, 0, cancel=lambda: True)
         self.assertFalse(list(Path(cap.storage.name).glob("highlight_*.bin")))
+
+    def test_highlight_navigation_steps_and_wraps_like_editor_find(self):
+        cap = self.capture("ready\nRadix - HEX\n0\n1\n0\n0\n1\n1\n0\n1\n")
+        intervals = HighlightService().build(cap, ConditionCompiler(cap.signals).compile("ready"), 0, cap.count, 1, 0)
+        self.addCleanup(intervals.close)
+        self.assertEqual([intervals.interval(i) for i in range(intervals.count)], [(1, 2), (4, 6), (7, 8)])
+        self.assertEqual(intervals.step(0, 1), 0)
+        self.assertEqual(intervals.step(1, 1), 1)
+        self.assertEqual(intervals.step(7, 1), 0)            # wraps to the first span
+        self.assertIsNone(intervals.step(7, 1, wrap=False))
+        self.assertEqual(intervals.step(5, -1), 1)           # inside a span: back to its start
+        self.assertEqual(intervals.step(1, -1), 2)           # wraps to the last span
+        self.assertEqual((intervals.index_at(5), intervals.index_at(6)), (1, None))
+
+    def test_condition_bit_selections_and_signed_patterns(self):
+        cap = self.capture("we,data[7:0],s[7:0]\nRadix - HEX,HEX,SIGNED\n1,B5,-1\n0,25,5\n")
+        compiler = ConditionCompiler(cap.signals, {"s[7:0]": "SIGNED"})
+        rows = lambda text: [compiler.compile(text).matches(i, i - 1 if i else None) for i in range(cap.count)]
+        # B5 = 1011_0101, 25 = 0010_0101; selections keep the written bit order.
+        self.assertEqual(rows("data[7,5,4,2-0] == b111101"), [True, False])
+        self.assertEqual(rows("data[7,5,4,2-0] == b010101"), [False, True])
+        self.assertEqual(rows("data[0-1] == b10"), [True, True])
+        self.assertEqual(rows("data[7:4] > 2"), [True, False])
+        self.assertEqual(rows("data[7] && we"), [True, False])
+        self.assertEqual(rows("`data[7:0]`[6:5] == b01"), [True, True])
+        self.assertEqual(rows("prev(data[1:0]) == 1"), [False, True])
+        self.assertEqual(rows("s == hFF"), [True, False])  # bit pattern on a signed signal
+        for bad in ("we[1:0] == b01", "data[8]", "data[3,3]", "data[2:0] == b1111", "s == d200"):
+            with self.assertRaises(ValueError, msg=bad):
+                compiler.compile(bad)
 
     def test_condition_ordering_radix_prefixes_and_previous_sample(self):
         cap = self.capture("tx_data[7:0],tx_valid\nRadix - HEX,HEX\n09,1\n0A,1\n10,0\n")
@@ -537,6 +579,270 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(measurement.rising, 4)
         self.assertEqual(MeasurementFormatter().parts(measurement, cap, 0, "clk"),
                          ["↑clk A…B: 4", "T≈ 10 ns", "f≈ 100 MHz"])
+
+
+QUAD = (3, 2, 1, 0)
+
+
+def spi_transfers(lines, data):
+    """DQ values per transfer; ``lines`` lists the DQ index of each bit, most significant first."""
+    width = len(lines)
+    values = []
+    for byte in data:
+        for step in range(8 // width):
+            chunk = (byte >> (8 - width * (step + 1))) & ((1 << width) - 1)
+            values.append(sum(1 << line for i, line in enumerate(lines) if chunk >> (width - 1 - i) & 1))
+    return values
+
+
+def spi_csv(frames, idle=3, unknown_dq=False):
+    """Mode-0 SPI frames as Vivado CSV: 2 samples per clock half, data stable around each rising edge.
+
+    Frame items: ``(lines, bytes)`` single rate, ``("dtr", lines, bytes)`` on both edges,
+    ``("dummy", clocks)`` with DQ low (``"X"`` when ``unknown_dq``).
+    """
+    rows = []
+    for frame in frames:
+        rows += [(1, 0, 0)] * idle
+        for item in frame:
+            if item[0] == "dummy":
+                rows += ([(0, 0, "X")] * 2 + [(0, 1, "X")] * 2 if unknown_dq else
+                         [(0, 0, 0)] * 2 + [(0, 1, 0)] * 2) * item[1]
+            elif item[0] == "dtr":
+                values = spi_transfers(item[1], item[2])
+                for even, odd in zip(values[::2], values[1::2]):
+                    rows += [(0, 0, even)] * 2 + [(0, 1, odd)] * 2
+            else:
+                for value in spi_transfers(item[0], item[1]):
+                    rows += [(0, 0, value)] * 2 + [(0, 1, value)] * 2
+        rows += [(0, 0, 0)] * 2
+    rows += [(1, 0, 0)] * idle
+    body = "".join(f"{cs},{sck},{dq if isinstance(dq, str) else format(dq, 'X')}\n" for cs, sck, dq in rows)
+    return "cs_n,sck,dq[3:0]\nRadix - BINARY,BINARY,HEX\n" + body
+
+
+def spi_pins():
+    return SpiPins(LineRef("sck"), LineRef("cs_n"), True,
+                   tuple(LineRef("dq[3:0]", index, f"dq[{index}]") for index in range(4)))
+
+
+FLASH_FRAMES = [
+    [((0,), [0x06])],
+    [((0,), [0xEB]), (QUAD, [0x12, 0x34, 0x56]), ("dummy", 10), (QUAD, [0xDE, 0xAD, 0xBE, 0xEF])],
+    [((0,), [0x03, 0x00, 0x10, 0x00]), ((1,), [0x11, 0x22])],
+    [((0,), [0x02, 0x00, 0x00, 0x08, 0xA5, 0x5A])],
+]
+
+
+class SpiDecoderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def capture(self, frames, **options):
+        path = Path(self.temp.name) / f"spi{len(list(Path(self.temp.name).iterdir()))}.csv"
+        path.write_text(spi_csv(frames, **options), encoding="utf-8")
+        cap = load_csv(path)
+        self.addCleanup(cap.close)
+        return cap
+
+    def decode(self, cap, settings=None, pins=None):
+        result = SpiDecoder().decode(cap, SpiDecoderConfig(pins or spi_pins(), settings or SpiSettings()))
+        self.addCleanup(result.close)
+        return result
+
+    @staticmethod
+    def labels(result, frame, lane=0):
+        return [field_label(result, record) for record in result.frame_fields(frame, lane)]
+
+    def test_command_table_decodes_mixed_formats_per_frame(self):
+        cap = self.capture(FLASH_FRAMES)
+        before = [(np.array(sig.starts), np.array(sig.codes)) for sig in cap.signals]
+        result = self.decode(cap)
+        self.assertEqual(result.frame_count, 4)
+        self.assertEqual(self.labels(result, 0), ["CMD 06 WRITE ENABLE"])
+        self.assertEqual(self.labels(result, 1), ["CMD EB QUAD I/O FAST READ", "ADDR 123456", "dummy 10",
+                                                  "RD DE", "RD AD", "RD BE", "RD EF"])
+        self.assertEqual(result.frame_format(1), "1-4-4")
+        self.assertEqual(self.labels(result, 2)[1:], ["ADDR 001000", "RD 11", "RD 22"])
+        self.assertEqual(result.frame_format(2), "1-1-1")
+        self.assertEqual(self.labels(result, 3)[2:], ["WR A5", "WR 5A"])
+        self.assertEqual(int(result.frames[1]["address"]), 0x123456)
+        self.assertEqual(list(result.frames["data_bytes"]), [0, 4, 2, 2])
+        self.assertFalse(any(int(flags) for flags in result.frames["flags"]))
+        # Decoding reads the indices only; acquired samples stay untouched.
+        for (starts, codes), sig in zip(before, cap.signals):
+            self.assertTrue(np.array_equal(starts, sig.starts))
+            self.assertTrue(np.array_equal(codes, sig.codes))
+        lane = result.lanes[0]
+        self.assertTrue(np.all(lane["start"][1:] >= lane["end"][:-1]))  # ordered, not overlapping
+
+    def test_manual_dummy_and_fixed_formats_are_used_exactly(self):
+        cap = self.capture([[((0,), [0xEB]), (QUAD, [0x00, 0x01, 0x00]), ("dummy", 6), (QUAD, [0x42, 0x43])]])
+        wrong = self.decode(cap)  # the table default is 10 dummy clocks: the data shifts and ends short
+        self.assertNotEqual(self.labels(wrong, 0)[3:], ["RD 42", "RD 43"])
+        right = self.decode(cap, SpiSettings(dummy_cycles=6))
+        self.assertEqual(self.labels(right, 0)[2:], ["dummy 6", "RD 42", "RD 43"])
+        fixed = self.decode(cap, SpiSettings(mode="fixed", fixed=FixedFormat(BusWidths.parse("1-4-4"), 3, 6)))
+        self.assertEqual(self.labels(fixed, 0), ["CMD EB QUAD I/O FAST READ", "ADDR 000100", "dummy 6",
+                                                 "RD 42", "RD 43"])
+        # Continuous read without an opcode: 0-4-4.
+        xip = self.capture([[(QUAD, [0x00, 0x20, 0x00]), ("dummy", 4), (QUAD, [0x99])]])
+        result = self.decode(xip, SpiSettings(mode="fixed", fixed=FixedFormat(BusWidths.parse("0-4-4"), 3, 4)))
+        self.assertEqual(self.labels(result, 0), ["ADDR 002000", "dummy 4", "RD 99"])
+        self.assertEqual(int(result.frames[0]["opcode"]), -1)
+        with self.assertRaises(ValueError):
+            BusWidths.parse("1-3-4")
+
+    def test_quad_protocol_dtr_raw_lsb_unknown_and_partial(self):
+        cap = self.capture([[(QUAD, [0x0B, 0x00, 0x00, 0x40]), ("dummy", 10), (QUAD, [0x5A])]])
+        result = self.decode(cap, SpiSettings(protocol="quad"))
+        self.assertEqual(self.labels(result, 0), ["CMD 0B FAST READ", "ADDR 000040", "dummy 10", "RD 5A"])
+        self.assertEqual(result.frame_format(0), "4-4-4")
+        dtr = self.capture([[((0,), [0xED]), ("dtr", QUAD, [0xAB, 0xCD, 0xEF]), ("dummy", 8),
+                             ("dtr", QUAD, [0x01, 0x02])]])
+        result = self.decode(dtr)
+        self.assertEqual(self.labels(result, 0)[1:], ["ADDR ABCDEF", "dummy 8", "RD 01", "RD 02"])
+        self.assertIn("DTR", result.frame_format(0))
+        raw = self.capture([[((0,), [0x01, 0x80])]])
+        result = self.decode(raw, SpiSettings(mode="raw", msb_first=False))
+        self.assertEqual(self.labels(result, 0), ["MOSI 80", "MOSI 01"])
+        self.assertEqual(self.labels(result, 0, lane=1), ["MISO 00", "MISO 00"])
+        self.assertEqual(result.lane_count, 2)
+        odd = self.capture([[((0,), [0x9F]), ("dummy", 2)]], unknown_dq=True)
+        result = self.decode(odd)
+        fields = result.frame_fields(0)
+        self.assertEqual(int(fields[1]["flags"]), UNKNOWN | PARTIAL)  # 2 X bits of a byte
+        self.assertTrue(field_label(result, fields[1]).startswith("RD X"))
+        unknown = self.decode(self.capture([[((0,), [0x77, 0x01])]]))
+        self.assertTrue(int(unknown.frames[0]["flags"]) & UNKNOWN_COMMAND)
+        self.assertEqual(self.labels(unknown, 0), ["CMD 77", "MOSI 01"])
+
+    def test_export_stream_frames_range_binary_and_cancel_cleanup(self):
+        cap = self.capture(FLASH_FRAMES)
+        result = self.decode(cap)
+        service = SpiExportService()
+        self.assertEqual(service.build(SpiExportRequest(result)).text, "DE AD BE EF 11 22 A5 5A")
+        frames = service.build(SpiExportRequest(result, frames=(1, 3), layout="frames", separator=",", prefix=True))
+        self.assertEqual(frames.text, "#2 EB @123456: 0xDE,0xAD,0xBE,0xEF\n#4 02 @000008: 0xA5,0x5A")
+        read = service.build(SpiExportRequest(result, content="read", radix="DEC", separator=" "))
+        self.assertEqual(read.text, "222 173 190 239 17 34")
+        fields = result.frame_fields(1)
+        # A…B: the earlier boundary is included, the later one excluded.
+        between = service.build(SpiExportRequest(result, start=int(fields[3]["start"]) + 1,
+                                                 end=int(fields[6]["start"]) + 1))
+        self.assertEqual(between.text, "AD BE EF")
+        everything = service.build(SpiExportRequest(result, frames=(1,), content="all"))
+        self.assertEqual(everything.text, "EB 123456 DE AD BE EF")
+        target = Path(self.temp.name) / "data.bin"
+        self.assertEqual(service.write_binary(SpiExportRequest(result, frames=(1, 2)), target), 6)
+        self.assertEqual(target.read_bytes(), bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22]))
+        with self.assertRaises(LoadCancelled):
+            service.write_binary(SpiExportRequest(result), Path(self.temp.name) / "x.bin", cancel=lambda: True)
+        self.assertFalse((Path(self.temp.name) / "x.bin.part").exists())
+        storage = Path(cap.storage.name)
+        existing = set(storage.iterdir())
+        with self.assertRaises(LoadCancelled):
+            SpiDecoder().decode(cap, SpiDecoderConfig(spi_pins()), cancel=lambda: True)
+        self.assertEqual(set(storage.iterdir()), existing)
+        paths = list(result.paths)
+        result.close()
+        result.close()
+        self.assertFalse(any(path.exists() for path in paths))
+
+    def test_track_navigation_labels_and_line_choices(self):
+        cap = self.capture(FLASH_FRAMES)
+        result = self.decode(cap)
+        track = DecodedTrack(result, 0, "SPI")
+        fields = result.lanes[0]
+        first = int(fields[0]["start"])
+        self.assertEqual(track.transition(0, 1), first)
+        self.assertEqual(track.transition(first, 1), int(fields[0]["end"]))
+        self.assertEqual(track.transition(int(fields[2]["start"]), -1), int(fields[1]["start"]))
+        self.assertEqual(track.label_at(first), "CMD 06 WRITE ENABLE")
+        self.assertEqual(track.label_at(0), "")
+        self.assertEqual(result.frame_at(int(fields[2]["start"])), 1)
+        self.assertEqual(track.window(int(fields[2]["start"]), int(fields[4]["start"])), (2, 4))
+        self.assertTrue(list(track.busy(np.linspace(0, cap.count, 50))))
+        labels = [option.text for option in line_options(cap.signals)]
+        self.assertEqual(labels, ["cs_n", "sck", "dq[3]", "dq[2]", "dq[1]", "dq[0]"])
+        self.assertEqual(guess_pins(cap.signals), spi_pins())
+        with self.assertRaises(ValueError):
+            SpiDecoder().decode(cap, SpiDecoderConfig(SpiPins(LineRef("missing_sck"))))
+
+
+def wire_spi_csv(frames, idle=3):
+    """Mode-0 single-line SPI on separate 1-bit wires; ``frames`` holds (mosi, miso) byte pairs."""
+    rows = []
+    for frame in frames:
+        rows += [(1, 0, 0, 1)] * idle
+        for mosi, miso in frame:
+            for bit in range(7, -1, -1):
+                o, i = mosi >> bit & 1, miso >> bit & 1
+                rows += [(0, 0, o, i)] * 2 + [(0, 1, o, i)] * 2
+            rows += [(0, 0, 0, 0)] * 3  # inter-byte gap, as many controllers leave
+        rows += [(0, 0, 0, 0)] * 2
+    rows += [(1, 0, 0, 1)] * idle
+    body = "".join(",".join(map(str, row)) + ",0\n" for row in rows)
+    return "spi_cs,spi_clk,spi_mosi,spi_miso,reset_crc\nRadix - HEX,HEX,HEX,HEX,HEX\n" + body
+
+
+class SpiOverlayTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        path = Path(self.temp.name) / "wires.csv"
+        path.write_text(wire_spi_csv([[(0x05, 0xFF), (0xFF, 0x02)], [(0x03, 0x00), (0x00, 0x45), (0x00, 0x46)]]),
+                        encoding="utf-8")
+        self.cap = load_csv(path)
+        self.addCleanup(self.cap.close)
+
+    def decode(self, mode):
+        pins = guess_pins(self.cap.signals)
+        result = SpiDecoder().decode(self.cap, SpiDecoderConfig(pins, SpiSettings(mode=mode)))
+        self.addCleanup(result.close)
+        return result
+
+    def test_reset_named_signal_is_not_guessed_as_hold(self):
+        pins = guess_pins(self.cap.signals)
+        self.assertEqual([line.text if line else None for line in pins.io], ["spi_mosi", "spi_miso", None, None])
+
+    def test_fields_end_after_their_last_bit_and_navigation_steps_by_byte(self):
+        result = self.decode("raw")
+        lane = result.lanes[0]
+        self.assertTrue(np.all(lane["end"][:-1] < lane["start"][1:]))  # visible gaps between bytes
+        self.assertEqual(int(lane["end"][0] - lane["start"][0]), 7 * 4 + 2)  # 8 bits, half a clock after the last
+        track = DecodedTrack(result, 0, "MOSI")
+        self.assertEqual(track.transition(int(lane["start"][0]), 1), int(lane["start"][1]))
+        self.assertEqual(track.transition(int(lane["start"][1]), 1), int(lane["end"][1]))  # frame end
+        self.assertEqual(track.transition(int(lane["start"][2]), -1), int(lane["end"][1]))
+        self.assertEqual([bubble_label(result, f) for f in lane], ["0x05", "0xFF", "0x03", "0x00", "0x00"])
+
+    def test_overlays_put_bytes_on_their_wires_and_arrows_on_sck(self):
+        result = self.decode("commands")
+        tracks = [DecodedTrack(result, lane, "SPI") for lane in range(result.lane_count)]
+        items = overlays(result, self.cap, tracks)
+        names = [(name.rsplit("/", 1)[-1], annotation.kind) for name, annotation in items]
+        self.assertEqual(names, [("spi_clk", "edges"), ("spi_mosi", "fields"), ("spi_miso", "fields")])
+        mosi, miso = items[1][1], items[2][1]
+        first, stop = mosi.window(0, self.cap.count)
+        labels = [bubble_label(result, f) for f in mosi.visible(first, stop)]
+        self.assertEqual(labels[:2], ["READ STATUS REGISTER (0x05)", "READ (0x03)"])
+        self.assertTrue(labels[2].startswith("адрес 0x"))
+        self.assertEqual([bubble_label(result, f) for f in miso.visible(*miso.window(0, self.cap.count))], ["0x02"])
+        edges = items[0][1].visible(0, self.cap.count, 1000)
+        self.assertEqual(len(edges), 5 * 8)  # rising sample edges inside CS only
+        self.assertIsNone(items[0][1].visible(0, self.cap.count, 10))  # too dense: draw nothing
+        self.assertTrue(list(mosi.busy(np.linspace(0, self.cap.count, 20))))
+        registry = SignalAnnotations()
+        registry.set("spi", items)
+        mosi_signal = next(s for s in self.cap.signals if s.short_name == "spi_mosi")
+        self.assertEqual(registry.for_signal(mosi_signal), [mosi])
+        registry.set_enabled(False)
+        self.assertEqual(registry.for_signal(mosi_signal), [])
+        registry.set_enabled(True)
+        registry.clear("spi")
+        self.assertEqual(registry.for_signal(mosi_signal), [])
 
 
 class InteractionTests(unittest.TestCase):
@@ -1421,6 +1727,95 @@ class InteractionTests(unittest.TestCase):
             v.selected = 1
             v.selectionChanged.emit()
             self.assertNotIn("↑", w.readout.text())
+
+
+    def spi_window(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "spi.csv"
+        path.write_text(spi_csv(FLASH_FRAMES), encoding="utf-8")
+        w = self.window
+        clipboard = SimpleNamespace(text="")
+        clipboard.write = lambda value: setattr(clipboard, "text", value)
+        w.clipboard = clipboard
+        w.open_file(path)
+        self.wait()
+        return w, clipboard, path
+
+    def test_spi_decoder_row_navigation_selection_and_copy(self):
+        w, clipboard, _ = self.spi_window()
+        v = w.view
+        dialog = w.spi.open_dialog()
+        self.assertIsNotNone(dialog)
+        self.assertFalse(dialog.isModal())
+        self.assertEqual(dialog.sck_box.currentData(), LineRef("sck", 0, "sck"))
+        dialog.dummy_box.setValue(10)
+        dialog.submit()
+        self.wait()
+        result = w.spi.result
+        self.assertIsNotNone(result)
+        self.assertEqual(result.frame_count, 4)
+        self.assertEqual(v.rows[0].node.kind, "decoded")
+        panel = w.spi.panel
+        self.assertTrue(panel.isVisible())
+        self.assertEqual(panel.model.rowCount(), 4)
+        self.assertIn("DE AD BE EF", panel.model.data(panel.model.index(1, 8)))
+        # ←/→ on the decoder row step through fields; Shift+→ extends B byte by byte.
+        v.selected = 0
+        v.interaction_region = "waveform"
+        v.setFocus()
+        data = result.frame_data(1)
+        v.set_cursor(int(data[0]["start"]))
+        QTest.keyClick(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        QTest.keyClick(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(v.cursor_b, int(data[2]["start"]))
+        self.assertEqual(v.row_value(v.rows[0].node), "RD DE")
+        w.spi.copy_action.trigger()
+        self.wait()
+        self.assertEqual(clipboard.text, "DE AD")
+        # Panel: one line per selected transaction, then select its data with A/B.
+        panel.layout_box.setCurrentIndex(panel.layout_box.findData("frames"))
+        model = panel.table.selectionModel()
+        model.select(panel.model.index(2, 0), model.SelectionFlag.ClearAndSelect | model.SelectionFlag.Rows)
+        panel.buttons["Копировать выбранные"].click()
+        self.wait()
+        self.assertEqual(clipboard.text, "#3 03 @001000: 11 22")
+        panel.buttons["Выделить данные"].click()
+        fields = result.frame_data(2)
+        self.assertEqual((v.cursor_a, v.cursor_b), (int(fields[0]["start"]), int(fields[-1]["end"])))
+        panel.filter_box.setCurrentIndex(panel.filter_box.findData(0x02))
+        self.assertEqual(panel.model.rowCount(), 1)
+        # The context menu offers the transaction under the mouse.
+        v.selected = 0
+        v.context_sample = int(fields[0]["start"])
+        menu = v.menus.build(v)
+        spi_menu = next(a.menu() for a in menu.actions() if a.text() == "SPI / QSPI")
+        self.assertIn("Выделить транзакцию #3", [a.text() for a in spi_menu.actions()])
+        v.viewport().grab()  # labelled fields
+        v.fit()
+        v.viewport().grab()  # zoomed-out band
+        next(a for a in spi_menu.actions() if a.text() == "Убрать строку декодера").trigger()
+        self.assertNotEqual(v.rows[0].node.kind, "decoded")
+
+    def test_spi_refresh_redecodes_and_other_file_drops_decoder(self):
+        w, clipboard, path = self.spi_window()
+        w.spi.open_dialog().submit()
+        self.wait()
+        paths = list(w.spi.result.paths)
+        w.refresh_csv()
+        self.wait()
+        QTest.qWait(30)
+        self.wait()
+        self.assertIsNotNone(w.spi.result)
+        self.assertEqual(w.spi.result.frame_count, 4)
+        self.assertFalse(any(p.exists() for p in paths))  # old decoder files released
+        self.assertEqual(sum(1 for row in w.view.rows if row.node.kind == "decoded"), 1)
+        w.open_file(FIXTURE_CSV)
+        self.wait()
+        QTest.qWait(30)
+        self.assertIsNone(w.spi.result)
+        self.assertIsNone(w.spi.config)
+        self.assertFalse(any(row.node.kind == "decoded" for row in w.view.rows))
 
 
 if __name__ == "__main__":

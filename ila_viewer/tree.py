@@ -109,6 +109,16 @@ class DividerNode(WaveNode):
     kind = "divider"
 
 
+class DecodedNode(WaveNode):
+    """A protocol-decoder row: draws a ``track`` (fields with labels), never a capture signal."""
+
+    kind = "decoded"
+
+    def __init__(self, label, track):
+        super().__init__(label)
+        self.track = track
+
+
 @dataclass
 class VisibleRow:
     node: WaveNode
@@ -263,7 +273,7 @@ class SignalTree:
         return divider
 
     def remove_container(self, node):
-        if node.kind not in ("group", "divider") or node is self.root:
+        if node.kind not in ("group", "divider", "decoded") or node is self.root:
             return
         parent = node.parent
         parent.children.remove(node)
