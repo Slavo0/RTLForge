@@ -3,17 +3,20 @@
 
 """Cancellable event-sequence matching on calibrated samples."""
 
-from pathlib import Path
-import struct
-import tempfile
+import numpy as np
 
 from .data import LoadCancelled
-from .highlights import HighlightIntervals
+from .highlights import IntervalWriter
 from .sampling import as_sampling
 
 
 class AdvancedHighlightService:
-    """Keep active FSM paths so overlapping stage sequences remain detectable."""
+    """A sequence of k stages matches at point i when stage j holds at point i + j.
+
+    Every start point is tried, so overlapping sequences are all found. Stage results
+    are numpy arrays per chunk of grid points; the last k - 1 points of a chunk are
+    carried into the next one, so sequences that cross a chunk border are kept.
+    """
 
     def build(self, capture, pattern, marker_a, marker_b, period, phase=0,
               progress=lambda percent, rows: None, cancel=lambda: False):
@@ -22,50 +25,41 @@ class AdvancedHighlightService:
         lower, upper = sorted((marker_a, marker_b))
         start_boundary = lower + (marker_b == lower)
         end_boundary = min(capture.count, upper + (marker_b != upper))
-        active = []  # (next stage index, first matching sample)
-        pending = None
-        count = 0
-        path = None
+        stages = pattern.stages
+        k = len(stages)
+        writer = IntervalWriter(capture.storage.name, "advanced_")
+        carry = None  # (stage masks, starts, ends) of points that cannot finish a sequence yet
+        points = 0
         try:
-            with tempfile.NamedTemporaryFile(dir=capture.storage.name, prefix="advanced_",
-                                             suffix=".bin", delete=False) as stream:
-                path = Path(stream.name)
-                points = sampling.points(start_boundary, end_boundary, capture.count, cancel)
-                for index, point in enumerate(points):
-                    sample, at, previous = point.sample, point.at, point.previous_at
-                    if index % 4096 == 0:
-                        if cancel():
-                            raise LoadCancelled()
-                        progress(round(100 * (sample - start_boundary) /
-                                       max(1, end_boundary - start_boundary)), index)
-                    next_active = []
-                    for stage_index, start in active:
-                        if not pattern.stages[stage_index].matches(at, previous):
-                            continue
-                        if stage_index + 1 < len(pattern.stages):
-                            next_active.append((stage_index + 1, start))
-                            continue
-                        end = min(point.end, end_boundary)
-                        if pending and start <= pending[1]:
-                            pending = pending[0], max(pending[1], end)
-                        else:
-                            if pending:
-                                stream.write(struct.pack("<qq", *pending))
-                                count += 1
-                            pending = start, end
-                    if pattern.stages[0].matches(at, previous):
-                        # The sequence is painted from the span of its first matching point.
-                        next_active.append((1, max(point.start, start_boundary)))
-                    active = next_active
-                if pending:
-                    stream.write(struct.pack("<qq", *pending))
-                    count += 1
-            progress(100, count)
-            if not count:
-                path.unlink(missing_ok=True)
-                return HighlightIntervals()
-            return HighlightIntervals(path, count)
+            for chunk in sampling.point_chunks(start_boundary, end_boundary, capture.count, cancel):
+                if cancel():
+                    raise LoadCancelled()
+                masks = np.stack([stage.evaluate(chunk.at, chunk.previous_at) for stage in stages])
+                starts, ends = chunk.start, chunk.end
+                if carry is not None:
+                    masks = np.concatenate((carry[0], masks), axis=1)
+                    starts = np.concatenate((carry[1], starts))
+                    ends = np.concatenate((carry[2], ends))
+                n = masks.shape[1]
+                complete = n - k + 1
+                if complete > 0:
+                    found = masks[0, :complete].copy()
+                    for j in range(1, k):
+                        found &= masks[j, j:j + complete]
+                    hits = np.flatnonzero(found)
+                    # Painted from the span of the first point to the end of the last one.
+                    writer.add(np.maximum(starts[hits], start_boundary),
+                               np.minimum(ends[hits + k - 1], end_boundary))
+                    tail = slice(complete, n)
+                else:
+                    tail = slice(0, n)
+                carry = masks[:, tail], starts[tail], ends[tail]
+                points += len(chunk.sample)
+                progress(round(100 * (int(chunk.sample[-1]) - start_boundary) /
+                               max(1, end_boundary - start_boundary)), points)
+            result = writer.finish()
+            progress(100, result.count)
+            return result
         except BaseException:
-            if path:
-                path.unlink(missing_ok=True)
+            writer.discard()
             raise

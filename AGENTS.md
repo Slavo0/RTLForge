@@ -74,6 +74,10 @@ The user requires object-oriented, extensible design for this application.
   Every line and frame format is user-chosen (command table, fixed format such as 1-4-4
   or 0-4-4, raw bytes); never infer the mode from traffic. Decoder rows are DecodedNode
   tracks; decoder config is capture state, not a preference. Docs say SPI/QSPI only.
+- Heavy work is vectorized with numpy first, then split over the shared WorkerPool
+  (cpu.py, spawn). Worker modules (csv_chunks, data, cpu) stay Qt-free; worker count is
+  the general preference worker_count (0 = physical cores - 1). Vectorized paths must
+  equal the scalar references in tests/reference.py. Tests inject CpuTopology.
 - Run `python -m unittest -v tests.test_waveform tests.test_extensions` for relevant
   behavioral changes. Use `python -m scripts.benchmark_waveform` for changes affecting large captures.
 - Keep README.md, docs/USER_GUIDE.md and docs/ARCHITECTURE.md aligned with actual capabilities.
