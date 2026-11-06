@@ -8,16 +8,129 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 
 from .timebase import sample_axis_ruler
+from .spi import ADDR, CMD, DATA, DUMMY, MISO, MOSI, READ, UNKNOWN, WRITE, bubble_label
+
+# Theme roles for decoded protocol fields.
+FIELD_ROLES = {CMD: "marker_a", ADDR: "marker_b", DUMMY: "muted", READ: "bit", WRITE: "bus",
+               MOSI: "bus", MISO: "bit", DATA: "bus"}
 
 
 class WaveformRenderer:
     def __init__(self, view):
         self.view = view
 
+    def pixel_edges(self):
+        """Sample positions of the plot's pixel boundaries, following the real time axis."""
+        v = self.view
+        if v.capture.times is not None:
+            time_edges = np.linspace(v.capture.time_at(v.left), v.capture.time_at(v.left + v.span), v.plot_width + 1)
+            return v.capture.samples_at_times(time_edges)
+        return np.linspace(v.left, v.left + v.span, v.plot_width + 1)
+
+    def draw_track(self, painter, track, y):
+        """A decoder row: one filled, labelled box per field, a shaded band when zoomed out."""
+        v = self.view
+        first, stop = track.window(v.left, v.left + v.span)
+        if stop - first > max(8, v.plot_width // 3):
+            self.draw_busy(painter, track.busy(self.pixel_edges()), y + 12, y + v.ROW - 12)
+            return
+        self.draw_boxes(painter, track.result, track.fields[first:stop], y + 10, y + v.ROW - 10)
+
+    def draw_busy(self, painter, spans, top, bottom):
+        v = self.view
+        color = QColor(v.themes.current.bus)
+        color.setAlpha(100)
+        for a, b in spans:
+            x1, x2 = v.sample_x(a), v.sample_x(b)
+            painter.fillRect(QRectF(x1, top, max(1.0, x2 - x1), bottom - top), color)
+
+    @staticmethod
+    def ink(fill):
+        """Dark or light text, whichever reads better on ``fill``."""
+        return QColor("#14161a") if fill.lightnessF() > 0.5 else QColor("#ffffff")
+
+    def draw_boxes(self, painter, result, fields, top, bottom):
+        """Logic-2-style decoded fields: rounded filled boxes with ``0x45`` centered."""
+        v = self.view
+        theme = v.themes.current
+        left, right = v.left, v.left + v.span
+        metrics = painter.fontMetrics()
+        height = bottom - top
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for record in fields:
+            kind, flags = int(record["kind"]), int(record["flags"])
+            fill = QColor(theme.unknown if flags & UNKNOWN else getattr(theme, FIELD_ROLES.get(kind, "bus")))
+            x1 = v.sample_x(max(left, float(record["start"])))
+            x2 = v.sample_x(min(right, float(record["end"])))
+            if x2 - x1 < 1:
+                x2 = x1 + 1
+            # A one-pixel gap keeps neighbouring bytes apart, like separate packets.
+            rect = QRectF(x1 + 0.5, top, max(1.0, x2 - x1 - 1.5), height)
+            outline = QColor(fill)
+            body = QColor(fill)
+            body.setAlpha(70 if kind == DUMMY else 215)
+            painter.setPen(QPen(outline, 1))
+            painter.setBrush(body)
+            radius = min(3.0, rect.width() / 2, height / 2)
+            painter.drawRoundedRect(rect, radius, radius)
+            room = int(rect.width() - 6)
+            if room > 8:
+                label = bubble_label(result, record)
+                if metrics.horizontalAdvance(label) > room:
+                    label = bubble_label(result, record, short=True)
+                if metrics.horizontalAdvance(label) > room and label.startswith("0x"):
+                    label = label[2:]
+                label = metrics.elidedText(label, Qt.TextElideMode.ElideRight, room)
+                painter.setPen(QColor(theme.text) if kind == DUMMY else self.ink(fill))
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+        painter.restore()
+
+    def draw_overlays(self, painter, annotations, sig, y):
+        """Decoded bytes above the waveform and sampling arrows on the clock."""
+        v = self.view
+        left, right = v.left, v.left + v.span
+        for annotation in annotations:
+            if annotation.kind == "fields":
+                top, bottom = y + 3, y + 20
+                first, stop = annotation.window(left, right)
+                if stop - first > max(8, v.plot_width // 3):
+                    self.draw_busy(painter, annotation.busy(self.pixel_edges()), top, bottom)
+                else:
+                    self.draw_boxes(painter, annotation.result, annotation.visible(first, stop), top, bottom)
+            elif annotation.kind == "edges":
+                positions = annotation.visible(left, right, max(1, v.plot_width // 6))
+                if positions is None or not len(positions):
+                    continue
+                xs = [v.sample_x(float(sample)) for sample in positions]
+                if len(xs) > 1 and min(b - a for a, b in zip(xs, xs[1:])) < 10:
+                    continue  # arrows would merge into a strip; zoom in to see them
+                hi, lo = self.band(sig, y)
+                middle = (hi + lo) / 2
+                color = QColor(v.themes.current.text)
+                color.setAlpha(200)
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                direction = -1 if annotation.rising else 1
+                for x in xs:
+                    tip = middle + direction * 4
+                    base = middle - direction * 4
+                    painter.drawPolygon(QPolygonF([QPointF(x, tip), QPointF(x - 4, base), QPointF(x + 4, base)]))
+                painter.restore()
+
+    def band(self, sig, y):
+        """Waveform top/bottom of a row; rows with decoded bytes leave room above for them."""
+        v = self.view
+        if any(a.kind == "fields" for a in v.annotations.for_signal(sig)):
+            return y + 23, y + v.ROW - 5
+        return y + 12, y + v.ROW - 12
+
     def line(self, painter, x1, y1, x2, y2):
         painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
-    def draw_segment(self, painter, sig, code, x1, x2, y, transition=False):
+    def draw_segment(self, painter, sig, code, x1, x2, y, transition=False, band=None):
         v = self.view
         if x2 <= x1:
             return
@@ -25,7 +138,7 @@ class WaveformRenderer:
         unknown = isinstance(value, str)
         color = QColor(v.themes.current.unknown) if unknown else v.signal_color(sig)
         painter.setPen(QPen(color, 1.2))
-        hi, lo = y + 12, y + v.ROW - 12
+        hi, lo = band or self.band(sig, y)
         if not sig.is_bus and not unknown:
             level = hi if value else lo
             if value and v.preferences.fill_high:
@@ -46,10 +159,11 @@ class WaveformRenderer:
         if x2 - x1 > 20:
             label = sig.format_value(value, v.display_radix(sig))
             label = painter.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, int(x2 - x1 - 10))
-            painter.drawText(QRectF(x1 + 5, y, x2 - x1 - 10, v.ROW), Qt.AlignmentFlag.AlignCenter, label)
+            painter.drawText(QRectF(x1 + 5, hi - 12, x2 - x1 - 10, lo - hi + 24), Qt.AlignmentFlag.AlignCenter, label)
 
     def draw_signal(self, painter, sig, y):
         v = self.view
+        hi, lo = self.band(sig, y)
         first = sig.run_index(v.left)
         last = min(len(sig.starts), int(np.searchsorted(sig.starts, v.left + v.span, side="left")) + 1)
         if last - first <= v.plot_width * 2:
@@ -58,7 +172,7 @@ class WaveformRenderer:
                 end = min(v.left + v.span,
                           int(sig.starts[index + 1]) if index + 1 < len(sig.starts) else v.capture.count)
                 self.draw_segment(painter, sig, sig.codes[index], v.sample_x(start), v.sample_x(end), y,
-                                   index > 0 and sig.starts[index] >= v.left)
+                                   index > 0 and sig.starts[index] >= v.left, (hi, lo))
         else:
             # Preserve subpixel activity: shade any pixel containing transitions.
             # Work is bounded by viewport width, regardless of capture length.
@@ -82,13 +196,13 @@ class WaveformRenderer:
                 x1, x2 = v.plot_left + run_start, v.plot_left + run_end
                 if busy:
                     color = v.signal_color(sig)
-                    painter.fillRect(QRectF(x1, y + 12, x2 - x1, v.ROW - 24),
+                    painter.fillRect(QRectF(x1, hi, x2 - x1, lo - hi),
                                      QColor(color.red(), color.green(), color.blue(), 100))
                     painter.setPen(color)
-                    self.line(painter, x1, y + 12, x2, y + 12)
-                    self.line(painter, x1, y + v.ROW - 12, x2, y + v.ROW - 12)
+                    self.line(painter, x1, hi, x2, hi)
+                    self.line(painter, x1, lo, x2, lo)
                 else:
-                    self.draw_segment(painter, sig, code, x1, x2, y)
+                    self.draw_segment(painter, sig, code, x1, x2, y, band=(hi, lo))
                 run_start = run_end
 
     def draw_bookmarks(self, painter, w, h, color, background):
@@ -159,6 +273,11 @@ class WaveformRenderer:
             painter.setClipRect(QRectF(split, v.HEADER, v.plot_width, max(0, h - v.HEADER)))
             if sig:
                 self.draw_signal(painter, sig, y)
+                annotations = v.annotations.for_signal(sig)
+                if annotations:
+                    self.draw_overlays(painter, annotations, sig, y)
+            elif node.kind == "decoded":
+                self.draw_track(painter, node.track, y)
             elif node.kind == "divider":
                 painter.setPen(QPen(QColor(v.tree.inherited_color(node) or theme.muted), 1, Qt.PenStyle.DashLine))
                 self.line(painter, split, y + v.ROW / 2, w, y + v.ROW / 2)

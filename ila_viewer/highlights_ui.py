@@ -138,21 +138,35 @@ class HighlightConditionDialog(CopyConditionDialog):
 
 class HighlightChip(QFrame):
     editRequested = Signal(object)
+    navigateRequested = Signal(object, int)  # group, -1 / +1
 
     def __init__(self, model, group, parent=None):
         super().__init__(parent)
         self.model = model
         self.group = group
+        self.setObjectName("highlightChip")
         row = QHBoxLayout(self)
         row.setContentsMargins(3, 0, 3, 0)
         row.setSpacing(3)
+        # A rounded badge in the group colour holds the visibility tick and name.
+        self.badge = QFrame()
+        self.badge.setObjectName("highlightBadge")
+        badge_layout = QHBoxLayout(self.badge)
+        badge_layout.setContentsMargins(7, 5, 9, 5)
         self.enabled_box = QCheckBox()
         self.enabled_box.toggled.connect(self.set_visible)
-        row.addWidget(self.enabled_box)
-        self.color_button = QPushButton("Цвет")
-        self.color_button.clicked.connect(self.choose_color)
-        row.addWidget(self.color_button)
+        badge_layout.addWidget(self.enabled_box)
+        row.addWidget(self.badge)
+        self.previous_button = QPushButton("←")
+        self.previous_button.setToolTip("Предыдущий подсвеченный участок")
+        self.previous_button.clicked.connect(lambda: self.navigateRequested.emit(self.group, -1))
+        row.addWidget(self.previous_button)
+        self.next_button = QPushButton("→")
+        self.next_button.setToolTip("Следующий подсвеченный участок")
+        self.next_button.clicked.connect(lambda: self.navigateRequested.emit(self.group, 1))
+        row.addWidget(self.next_button)
         edit = QPushButton("Изменить")
+        edit.setToolTip("Условие, название, цвет и прозрачность группы")
         edit.clicked.connect(lambda: self.editRequested.emit(self.group))
         row.addWidget(edit)
         remove = QPushButton("×")
@@ -168,25 +182,29 @@ class HighlightChip(QFrame):
         self.enabled_box.setChecked(group.visible)
         self.enabled_box.blockSignals(False)
         foreground = "#111111" if QColor(group.color).lightness() > 140 else "#ffffff"
-        self.color_button.setStyleSheet(f"background: {group.color}; color: {foreground}")
+        self.badge.setStyleSheet(
+            f"QFrame#highlightBadge {{ background: {group.color}; border-radius: 4px; }}"
+            f"QFrame#highlightBadge QCheckBox {{ background: transparent; color: {foreground}; }}"
+            # The default indicator vanishes on a coloured fill: outline = hidden, filled = shown.
+            f"QFrame#highlightBadge QCheckBox::indicator {{ width: 11px; height: 11px; border-radius: 3px;"
+            f" border: 2px solid {foreground}; background: transparent; }}"
+            f"QFrame#highlightBadge QCheckBox::indicator:checked {{ background: {foreground}; }}")
+        has_matches = group.intervals.count > 0
+        self.previous_button.setEnabled(has_matches)
+        self.next_button.setEnabled(has_matches)
         title = "Advanced Highlight · " if group.mode == "advanced" else ""
-        self.setToolTip(f"{title}{group.expression or '(без условия)'} · {group.intervals.count} участков · {group.opacity} %")
+        self.setToolTip(f"{title}{group.expression or '(без условия)'} · {group.intervals.count:,} участков · {group.opacity} %")
 
     def set_visible(self, checked):
         self.group.visible = checked
         self.model.changed.emit()
-
-    def choose_color(self):
-        color = QColorDialog.getColor(QColor(self.group.color), self, "Цвет подсветки")
-        if color.isValid():
-            self.group.color = color.name()
-            self.model.changed.emit()
 
 
 class HighlightPanel(QWidget):
     createRequested = Signal()
     advancedRequested = Signal()
     editRequested = Signal(object)
+    navigateRequested = Signal(object, int)
 
     def __init__(self, model, parent=None):
         super().__init__(parent)
@@ -236,6 +254,7 @@ class HighlightPanel(QWidget):
             if chip is None:
                 chip = HighlightChip(self.model, group, self.content)
                 chip.editRequested.connect(self.editRequested.emit)
+                chip.navigateRequested.connect(self.navigateRequested.emit)
                 self._chips[group.id] = chip
                 self.chips.insertWidget(index, chip)
             else:

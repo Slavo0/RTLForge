@@ -31,7 +31,8 @@ class AdvancedHighlightService:
                                              suffix=".bin", delete=False) as stream:
                 path = Path(stream.name)
                 points = sampling.points(start_boundary, end_boundary, capture.count, cancel)
-                for index, (sample, next_start, at, previous) in enumerate(points):
+                for index, point in enumerate(points):
+                    sample, at, previous = point.sample, point.at, point.previous_at
                     if index % 4096 == 0:
                         if cancel():
                             raise LoadCancelled()
@@ -44,7 +45,7 @@ class AdvancedHighlightService:
                         if stage_index + 1 < len(pattern.stages):
                             next_active.append((stage_index + 1, start))
                             continue
-                        end = min(next_start, end_boundary)
+                        end = min(point.end, end_boundary)
                         if pending and start <= pending[1]:
                             pending = pending[0], max(pending[1], end)
                         else:
@@ -53,7 +54,8 @@ class AdvancedHighlightService:
                                 count += 1
                             pending = start, end
                     if pattern.stages[0].matches(at, previous):
-                        next_active.append((1, sample))
+                        # The sequence is painted from the span of its first matching point.
+                        next_active.append((1, max(point.start, start_boundary)))
                     active = next_active
                 if pending:
                     stream.write(struct.pack("<qq", *pending))

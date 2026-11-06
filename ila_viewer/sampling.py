@@ -3,12 +3,15 @@
 
 """Sampling grids for copy and highlight: a fixed period or the edges of a clock signal.
 
-A grid yields points ``(start, end, at, previous_at)``:
+A grid yields ``GridPoint(sample, start, end, at, previous_at)``:
 
-* ``start`` - the sample where the point begins (used for ranges and highlighting);
-* ``end`` - where the highlighted interval of this point ends;
+* ``sample`` - the grid position (period sample or clock edge), used for A…B ranges;
+* ``start``/``end`` - the span the sampled values describe, painted by highlights;
 * ``at`` - the sample whose values are evaluated and copied;
 * ``previous_at`` - ``at`` of the preceding grid point, for ``prev(signal)``.
+
+Keeping ``sample`` and the painted span apart matters for "before the edge"
+sampling: those values belong to the cycle that *ends* at the edge.
 
 Edge sampling never assumes a free-running clock: gated or bursty clocks such as
 SPI SCK only produce points where real edges exist.
@@ -17,12 +20,21 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import re
+from typing import NamedTuple
 
 import numpy as np
 
 from .data import LoadCancelled
 
 CLOCK_NAME = re.compile(r"clk|clock|sck", re.IGNORECASE)
+
+
+class GridPoint(NamedTuple):
+    sample: int
+    start: int
+    end: int
+    at: int
+    previous_at: int | None
 
 
 def clock_score(signal):
@@ -67,7 +79,8 @@ class PeriodicSampling(SamplingGrid):
         for index, sample in enumerate(range(first, upper, period)):
             if index % 4096 == 0 and cancel():
                 raise LoadCancelled()
-            yield sample, sample + period, sample, sample - period if sample >= period else None
+            yield GridPoint(sample, sample, sample + period, sample,
+                            sample - period if sample >= period else None)
 
     def describe(self):
         return f"период {self.period:,} отсч."
@@ -174,26 +187,36 @@ class EdgeSampling(SamplingGrid):
         typical = self.typical_interval()
         span = max(1, int(round(typical))) if typical else None
         previous = self._edge_before(lower, cancel)
-        previous_at = self._at(previous) if previous is not None else None
         current = None
         for chunk in self.edges(lower, count, cancel):
             for edge in map(int, chunk):
                 if current is not None:
-                    yield self._point(current, edge, span, previous_at)
-                    previous_at = self._at(current)
+                    yield self._point(current, previous, edge, span)
+                    previous = current
                 if edge >= upper:
                     return
                 current = edge
         if current is not None:
-            yield self._point(current, count, span, previous_at)
+            yield self._point(current, previous, count, span)
 
     def _at(self, edge):
         return edge - 1 if self.before_edge and edge > 0 else edge
 
-    def _point(self, start, next_start, span, previous_at):
-        # A gated clock must not paint its idle gap: cap the interval at one typical period.
-        end = min(next_start, start + span) if span else next_start
-        return start, max(start + 1, end), self._at(start), previous_at
+    def _point(self, edge, previous_edge, next_edge, span):
+        """The span shown for an edge is the one its sampled values describe.
+
+        Before the edge, values belong to the cycle that ends at the edge; at the
+        edge, to the cycle that starts there. A gated clock must not paint its idle
+        gap, so either span is capped at one typical clock period.
+        """
+        previous_at = self._at(previous_edge) if previous_edge is not None else None
+        if self.before_edge:
+            start = previous_edge if previous_edge is not None else 0
+            if span:
+                start = max(start, edge - span)
+            return GridPoint(edge, max(0, min(start, edge - 1)), edge, self._at(edge), previous_at)
+        end = min(next_edge, edge + span) if span else next_edge
+        return GridPoint(edge, edge, max(edge + 1, end), self._at(edge), previous_at)
 
     def __eq__(self, other):
         return (isinstance(other, EdgeSampling) and other.signal is self.signal

@@ -43,6 +43,28 @@ class HighlightIntervals:
             left, right = self.data[index]
             yield max(float(left), start), min(float(right), end)
 
+    def interval(self, index):
+        start, end = self.data[index]
+        return int(start), int(end)
+
+    def index_at(self, sample):
+        """Index of the interval containing ``sample``, or None."""
+        if not self.count:
+            return None
+        index = int(np.searchsorted(self.data[:, 0], sample, side="right")) - 1
+        return index if index >= 0 and sample < self.data[index, 1] else None
+
+    def step(self, sample, direction, wrap=True):
+        """Next (direction > 0) or previous interval start relative to ``sample``, like Find in an editor."""
+        if not self.count:
+            return None
+        starts = self.data[:, 0]
+        if direction > 0:
+            index = int(np.searchsorted(starts, sample, side="right"))
+            return index if index < self.count else (0 if wrap else None)
+        index = int(np.searchsorted(starts, sample, side="left")) - 1
+        return index if index >= 0 else (self.count - 1 if wrap else None)
+
     def close(self):
         if isinstance(self.data, np.memmap):
             self.data._mmap.close()
@@ -85,6 +107,11 @@ class HighlightModel(QObject):
         super().__init__(parent)
         self.groups = []
         self.master_enabled = True
+        self.active_id = None  # group last navigated with ← / →, shown as n/total
+
+    @property
+    def active_group(self):
+        return next((group for group in self.groups if group.id == self.active_id), None)
 
     def set_master_enabled(self, enabled, restore_visibility=True):
         if self.master_enabled == enabled:
@@ -117,6 +144,7 @@ class HighlightModel(QObject):
             group.intervals.close()
         self.groups.clear()
         self.master_enabled = True
+        self.active_id = None
         self.changed.emit()
 
 
@@ -135,15 +163,17 @@ class HighlightService:
             with tempfile.NamedTemporaryFile(dir=capture.storage.name, prefix="highlight_", suffix=".bin", delete=False) as stream:
                 path = Path(stream.name)
                 points = sampling.points(lower, upper + 1, capture.count, cancel)
-                for index, (sample, next_start, at, previous) in enumerate(points):
+                for index, point in enumerate(points):
+                    sample = point.sample
                     if index % 4096 == 0:
                         if cancel():
                             raise LoadCancelled()
                         progress(round(100 * (sample - lower) / max(1, upper - lower)), index)
-                    if sample == marker_b or (condition is not None and not condition.matches(at, previous)):
+                    if sample == marker_b or (condition is not None and not condition.matches(point.at, point.previous_at)):
                         continue
-                    start = max(sample, lower + (marker_b == lower))
-                    end = min(next_start, capture.count, upper + (marker_b != upper))
+                    # Paint the span the sampled values describe, clipped to A…B.
+                    start = max(point.start, lower + (marker_b == lower))
+                    end = min(point.end, capture.count, upper + (marker_b != upper))
                     if end <= start:
                         continue
                     if pending and start <= pending[1]:

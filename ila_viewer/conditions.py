@@ -5,10 +5,43 @@
 from dataclasses import dataclass, replace
 import re
 
+from .bits import BitCodec
 from .formats import FORMATS
 
-_TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|<=|>=|[()!~<>=])|(?P<quoted>`[^`]+`)|(?P<word>d-\d+|[A-Za-z_][\w$]*(?:\[\d+(?::\d+)?\])?|0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|[\da-fA-F]+|-?\d+))", re.IGNORECASE)
+# A bit selection after a name: data[3], data[1:0], data[7,5,4,2-0].
+_SELECT = r"(?:\[[\d\s,:\-]+\])?"
+_TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|<=|>=|[()!~<>=])|(?P<quoted>`[^`]+`" + _SELECT +
+                    r")|(?P<word>d-\d+|[A-Za-z_][\w$]*" + _SELECT +
+                    r"|0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|[\da-fA-F]+|-?\d+))", re.IGNORECASE)
 _EXPLICIT = re.compile(r"(?i)(h[0-9a-f][0-9a-f_]*|b[01][01_]*|d-?[0-9][0-9_]*|0x[0-9a-f_]+|0b[01_]+|0o[0-7_]+)")
+_SELECTED_NAME = re.compile(r"(?P<base>.+?)\[(?P<selection>[\d\s,:\-]+)\]")
+_SIGNED = {"SIGNED", "SIGNED_MAGNITUDE"}
+
+
+def bit_selection(signal, text):
+    """Physical bit labels in written order -> offsets, MSB of the result first.
+
+    ``7,5,4,2-0`` and ``7:4`` follow Verilog concatenation order; ``0-2`` puts bit 0 first.
+    """
+    labels = BitCodec.labels(signal)
+    offsets = {label: signal.width - 1 - index for index, label in enumerate(labels)}
+    chosen = []
+    for part in text.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:[:\-]\s*(\d+))?\s*", part)
+        if not match:
+            raise ValueError(f"Неверный выбор битов [{text}]: используйте [3], [7:4] или [7,5,2-0]")
+        first = int(match[1])
+        last = int(match[2]) if match[2] is not None else first
+        step = 1 if last >= first else -1
+        for label in range(first, last + step, step):
+            if label not in offsets:
+                raise ValueError(f"Бит {label} вне сигнала {signal.short_name} "
+                                 f"(доступны {labels[0]}…{labels[-1]})")
+            if offsets[label] in chosen:
+                raise ValueError(f"Бит {label} указан в [{text}] дважды")
+            chosen.append(offsets[label])
+    whole = tuple(range(signal.width - 1, -1, -1))
+    return None if tuple(chosen) == whole else tuple(chosen)
 
 
 @dataclass(frozen=True)
@@ -16,41 +49,68 @@ class SignalValue:
     source: object
     radix: str
     lag: int = 0
+    bits: tuple | None = None  # selected physical offsets; None means the whole signal
+
+    @property
+    def width(self):
+        return len(self.bits) if self.bits is not None else self.source.width
+
+    @property
+    def effective(self):
+        effective = FORMATS.effective(self.radix, self.source.radix)
+        # A bit selection is a plain bit pattern: it has no sign bit of its own.
+        return "UNSIGNED" if self.bits is not None and effective in _SIGNED else effective
+
+    def _select(self, value):
+        if self.bits is None:
+            return value
+        if isinstance(value, int):
+            packed = 0
+            for offset in self.bits:
+                packed = (packed << 1) | ((value >> offset) & 1)
+            return packed
+        pattern = BitCodec.binary(value, self.source.width, self.source.radix)
+        picked = "".join(pattern[self.source.width - 1 - offset] for offset in self.bits)
+        return int(picked, 2) if all(c in "01" for c in picked) else picked
+
+    def _signed(self, bits):
+        width = self.width
+        if self.effective == "SIGNED" and bits & (1 << (width - 1)):
+            return bits - (1 << width)
+        if self.effective == "SIGNED_MAGNITUDE" and bits & (1 << (width - 1)):
+            return -(bits & ((1 << (width - 1)) - 1))
+        return bits
 
     def at(self, sample, previous_sample=None):
         target = previous_sample if self.lag else sample
         if target is None:
             return None
-        value = self.source.value_at(target)
+        value = self._select(self.source.value_at(target))
         if not isinstance(value, int):
             return value
-        width = self.source.width
-        bits = value & ((1 << width) - 1)
-        effective = FORMATS.effective(self.radix, self.source.radix)
-        if effective == "SIGNED" and bits & (1 << (width - 1)):
-            return bits - (1 << width)
-        if effective == "SIGNED_MAGNITUDE" and bits & (1 << (width - 1)):
-            return -(bits & ((1 << (width - 1)) - 1))
-        return bits
+        return self._signed(value & ((1 << self.width) - 1))
 
     def parse_literal(self, token):
+        width = self.width
         explicit = _explicit_number(token)
         if explicit is not None:
-            effective = FORMATS.effective(self.radix, self.source.radix)
-            minimum = -(1 << (self.source.width - 1)) if effective in {"SIGNED", "SIGNED_MAGNITUDE"} else 0
-            if not minimum <= explicit < (1 << self.source.width):
-                raise ValueError(f"Значение {token} не помещается в {self.source.width} бит")
+            pattern = not token.lower().startswith(("d", "-"))
+            if self.effective in _SIGNED and pattern:
+                # h/b/0x literals are bit patterns: hFF on a signed byte means -1.
+                if not 0 <= explicit < (1 << width):
+                    raise ValueError(f"Значение {token} не помещается в {width} бит")
+                return self._signed(explicit)
+            minimum = -(1 << (width - 1)) if self.effective in _SIGNED else 0
+            maximum = (1 << (width - 1)) if self.effective in _SIGNED else (1 << width)
+            if not minimum <= explicit < maximum:
+                raise ValueError(f"Значение {token} не помещается в {width} бит")
             return explicit
-        bits = FORMATS.parse(token, self.source.width, self.radix,
-                             source_radix=self.source.radix)
+        radix = self.radix if self.bits is None else self.effective
+        source_radix = self.source.radix if self.bits is None else "BINARY"
+        bits = FORMATS.parse(token, width, radix, source_radix=source_radix)
         if isinstance(bits, str):
             return bits
-        effective = FORMATS.effective(self.radix, self.source.radix)
-        if effective == "SIGNED" and bits & (1 << (self.source.width - 1)):
-            return bits - (1 << self.source.width)
-        if effective == "SIGNED_MAGNITUDE" and bits & (1 << (self.source.width - 1)):
-            return -(bits & ((1 << (self.source.width - 1)) - 1))
-        return bits
+        return self._signed(bits & ((1 << width) - 1))
 
 
 @dataclass(frozen=True)
@@ -309,7 +369,13 @@ class ConditionCompiler:
         if token in ("&&", "||", ")"):
             raise ValueError(f"Неожиданный элемент: {token}")
         quoted = token.startswith("`")
-        name = token[1:-1] if quoted else token
+        selection = None
+        if quoted:
+            closing = token.rindex("`")
+            name, suffix = token[1:closing], token[closing + 1:]
+            selection = suffix[1:-1] if suffix else None
+        else:
+            name = token
         if not quoted and _EXPLICIT.fullmatch(name):
             return ("literal", Literal(name))
         signal = self.by_full.get(name.casefold()) if quoted else None
@@ -326,9 +392,19 @@ class ConditionCompiler:
                     signal, lag = choices[0], 1
                 elif len(choices) > 1:
                     raise ValueError(f"Имя {name[:-5]} неоднозначно; используйте prev(`полное_имя`)")
+            # An exact name such as a split VCD bit rx_data[3] wins; otherwise
+            # data[3:0] selects bits of data.
+            selected = _SELECTED_NAME.fullmatch(name) if signal is None else None
+            if selected:
+                choices = self.choices_for(selected["base"])
+                if len(choices) > 1:
+                    raise ValueError(f"Имя {selected['base']} неоднозначно; используйте `полное_имя`[{selected['selection']}]")
+                if choices:
+                    signal, selection = choices[0], selected["selection"]
         if signal:
             radix = self.radix_by_name.get(signal.name, "HEX")
-            return ("signal", SignalValue(signal, radix, lag))
+            bits = bit_selection(signal, selection) if selection is not None else None
+            return ("signal", SignalValue(signal, radix, lag, bits))
         if quoted:
             raise ValueError(f"Сигнал {name} не найден")
         if name.lower() in ("true", "false"):

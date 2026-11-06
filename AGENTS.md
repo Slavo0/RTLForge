@@ -17,6 +17,10 @@ The user requires object-oriented, extensible design for this application.
 - A plain left click on the waveform removes B; Shift+left click creates/moves B.
 - A plain waveform click selects its row and moves A; Ctrl+click toggles that row;
   Shift+click moves B without changing row selection.
+- Shift+Left/Right extends like text selection: the last placed marker (A by click,
+  B by Shift+click) is the anchor; the other moves to the selected signal's
+  previous/next change (Ctrl+Shift: one sample, Shift+Home/End: capture edge).
+  Keyboard time scroll is Shift+PageUp/PageDown.
 - Mouse placement rounds to the nearest sample. During period calibration,
   plain click/drag controls marker 1 and Shift+click/drag controls marker 2.
 - Ctrl+A selects visible signals after Name/Value interaction; after waveform
@@ -57,12 +61,19 @@ The user requires object-oriented, extensible design for this application.
   dispose indices when a group or capture is removed.
 - Numeric condition literals inherit the compared signal's display radix unless
   prefixed with h/b/d. Preserve operand order for relational comparisons.
+  Conditions may select bits by physical label (data[3], data[1:0], data[7,5,2-0]);
+  a selection is an unsigned pattern in written order. On signed signals h/b/0x
+  literals are bit patterns; d literals must fit the signed range.
   Advanced Highlight stages match consecutive calibrated samples; prev(signal)
   refers to the preceding sample on that period grid or clock-edge grid. Keep overlapping matches
   and rebuild advanced groups after CSV refresh when their signals still exist.
 - CSV refresh reconciles signal styling by source name and recompiles highlight
   conditions against the new capture; opening another CSV starts fresh. Keep
   copy/highlight editors nonmodal so navigation and zoom remain available.
+- SPI/QSPI decoding lives in spi.py (Qt-free, disk-backed, cancellable) and spi_ui.py.
+  Every line and frame format is user-chosen (command table, fixed format such as 1-4-4
+  or 0-4-4, raw bytes); never infer the mode from traffic. Decoder rows are DecodedNode
+  tracks; decoder config is capture state, not a preference. Docs say SPI/QSPI only.
 - Run `python -m unittest -v tests.test_waveform tests.test_extensions` for relevant
   behavioral changes. Use `python -m scripts.benchmark_waveform` for changes affecting large captures.
 - Keep README.md, docs/USER_GUIDE.md and docs/ARCHITECTURE.md aligned with actual capabilities.

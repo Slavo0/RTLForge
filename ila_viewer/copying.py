@@ -207,7 +207,7 @@ class CopyValuesService:
                     previous_candidate = None
                     previous_value = None
                     points = grid.points(request.start, request.end + 1, request.capture_count, cancel)
-                    for offset, (sample, _, at, previous) in enumerate(points):
+                    for offset, (sample, _, _, at, previous) in enumerate(points):
                         if offset % 4096 == 0 and cancel():
                             raise LoadCancelled()
                         if sample == request.exclude_sample:
