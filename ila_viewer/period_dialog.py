@@ -1,7 +1,12 @@
 # Copyright 2026 Вячеслав Рудаков
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inline controls for choosing the sampling clock: markers 1/2 or a clock signal's edges."""
+"""Inline controls for choosing the sampling clock: markers 1/2 or a clock signal's edges.
+
+Layout: one row of choices (source, signal, edge, sampling moment, actions) and one
+readout row that shows what the choice gives. Gestures for markers are keycaps, not
+instructions; everything the user must decide is a visible control.
+"""
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -10,6 +15,7 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit
 from .measurements import format_frequency
 from .sampling import EdgeSampling, clock_candidates, clock_score
 from .timebase import format_seconds, group_digits, parse_clock
+from .widgets import SegmentedChoice, keycap, muted, plain_container
 
 
 class CopyPeriodBanner(QFrame):
@@ -18,6 +24,7 @@ class CopyPeriodBanner(QFrame):
     cancelled = Signal()
 
     MARKERS = "markers"
+    SIGNAL = "signal"
 
     def __init__(self, view, parent=None, signals=(), current=None, edge="rising",
                  before_edge=True, sample_period_ns=0.0):
@@ -26,82 +33,113 @@ class CopyPeriodBanner(QFrame):
         self.setObjectName("copyPeriodBanner")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
-        self.headline = QLabel("● ВЫБОР ТАКТА ВЫБОРКИ")
-        self.headline.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(self.headline)
+        layout.setSpacing(8)
 
-        source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("Такт:"))
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.headline = QLabel("Такт выборки")
+        self.headline.setObjectName("bannerTitle")
+        row.addWidget(self.headline)
+        row.addSpacing(8)
+
+        # The combo keeps every source (tests and callers use it); the markers entry is
+        # chosen with the segmented switch, so it is hidden from the drop-down list.
         self.source_box = QComboBox()
-        self.source_box.addItem("Маркеры 1 и 2 (период в отсчётах)", self.MARKERS)
+        self.source_box.addItem("Маркеры 1 и 2", self.MARKERS)
         for signal in clock_candidates(signals):
-            label = signal.short_name + ("  (похоже на такт)" if clock_score(signal) else "")
+            label = signal.short_name + ("  — похоже на такт" if clock_score(signal) else "")
             self.source_box.addItem(label, signal)
             self.source_box.setItemData(self.source_box.count() - 1, signal.name, 3)  # tooltip role
-        source_row.addWidget(self.source_box, 1)
-        source_row.addWidget(QLabel("Фронт:"))
-        self.edge_box = QComboBox()
-        for key, label in (("rising", "↑ передний"), ("falling", "↓ задний"), ("both", "↕ оба")):
-            self.edge_box.addItem(label, key)
-        self.edge_box.setCurrentIndex(max(0, self.edge_box.findData(edge)))
-        source_row.addWidget(self.edge_box)
-        source_row.addWidget(QLabel("Значения:"))
-        self.timing_box = QComboBox()
-        self.timing_box.addItem("до фронта (как регистр)", True)
-        self.timing_box.addItem("в момент фронта", False)
-        self.timing_box.setCurrentIndex(0 if before_edge else 1)
-        self.timing_box.setToolTip("До фронта — значения, которые видит триггер в момент фронта. "
-                                   "В симуляции регистры меняются в тот же момент времени, поэтому "
-                                   "значение «в момент фронта» уже новое.")
-        source_row.addWidget(self.timing_box)
-        layout.addLayout(source_row)
+        self.source_box.view().setRowHidden(0, True)
+        self.source_box.setMinimumContentsLength(18)
+        has_clock = self.source_box.count() > 1
+        self.mode_box = SegmentedChoice([
+            (self.SIGNAL, "По сигналу такта", "Выборка на фронтах выбранного однобитного сигнала"),
+            (self.MARKERS, "По маркерам 1–2", "Период — расстояние между точками 1 и 2 на диаграмме")])
+        self.mode_box.setItemEnabled(0, has_clock)
+        row.addWidget(self.mode_box)
+        row.addSpacing(12)
 
-        self.instruction = QLabel("На диаграмме: ЛКМ — точка 1 (начало), Shift+ЛКМ — точка 2 (конец полного периода). "
-                                  "Линии можно перетаскивать. Ctrl+колесо меняет масштаб.")
-        self.instruction.setWordWrap(True)
-        layout.addWidget(self.instruction)
+        # Clock-signal controls.
+        self.signal_controls = plain_container()
+        signal_row = QHBoxLayout(self.signal_controls)
+        signal_row.setContentsMargins(0, 0, 0, 0)
+        signal_row.setSpacing(8)
+        signal_row.addWidget(self.source_box)
+        signal_row.addSpacing(8)
+        signal_row.addWidget(muted("Фронт"))
+        self.edge_box = SegmentedChoice([
+            ("rising", "↑", "Передний фронт"), ("falling", "↓", "Задний фронт"), ("both", "↕", "Оба фронта")], edge)
+        signal_row.addWidget(self.edge_box)
+        signal_row.addSpacing(8)
+        signal_row.addWidget(muted("Значение"))
+        self.timing_box = SegmentedChoice([
+            (True, "до фронта", "Значения, которые видит регистр в момент фронта. В симуляции регистры "
+                                "меняются в тот же момент времени, поэтому «на фронте» значение уже новое."),
+            (False, "на фронте", "Значения в момент фронта")], before_edge)
+        signal_row.addWidget(self.timing_box)
+        row.addWidget(self.signal_controls)
 
-        self.time_row = QHBoxLayout()
-        self.time_label = QLabel("Частота такта:")
-        self.time_row.addWidget(self.time_label)
+        # Marker controls: the two gestures as keycaps.
+        self.marker_controls = plain_container()
+        marker_row = QHBoxLayout(self.marker_controls)
+        marker_row.setContentsMargins(0, 0, 0, 0)
+        marker_row.setSpacing(6)
+        marker_row.addWidget(keycap("ЛКМ"))
+        marker_row.addWidget(QLabel("точка 1"))
+        marker_row.addSpacing(12)
+        marker_row.addWidget(keycap("Shift + ЛКМ"))
+        marker_row.addWidget(QLabel("точка 2"))
+        marker_row.addSpacing(12)
+        marker_row.addWidget(muted("линии можно перетаскивать"))
+        self.marker_controls.setToolTip("Точка 2 — конец полного периода, начиная от точки 1. "
+                                        "Ctrl+колесо меняет масштаб.")
+        row.addWidget(self.marker_controls)
+
+        row.addStretch(1)
+        cancel_button = QPushButton("Отмена")
+        cancel_button.setAutoDefault(False)
+        cancel_button.clicked.connect(self.cancelled)
+        row.addWidget(cancel_button)
+        self.confirm_button = QPushButton("Применить")
+        self.confirm_button.setProperty("primary", True)
+        self.confirm_button.clicked.connect(self.confirm)
+        row.addWidget(self.confirm_button)
+        layout.addLayout(row)
+
+        # Readout: what the current choice gives, plus the optional clock frequency for CSV.
+        readout = QHBoxLayout()
+        readout.setSpacing(8)
+        self.status = QLabel()
+        self.status.setProperty("role", "readout")
+        self.status.setWordWrap(True)
+        readout.addWidget(self.status, 1)
+        self.time_label = muted("Частота такта")
+        readout.addWidget(self.time_label)
         self.clock_edit = QLineEdit()
-        self.clock_edit.setPlaceholderText("необязательно: 100 MHz или 10 ns — задаёт шкалу времени")
+        self.clock_edit.setPlaceholderText("100 MHz")
+        self.clock_edit.setToolTip("Необязательно. Частота или период такта (100 MHz, 10 ns) задаёт шкалу "
+                                   "времени CSV: длительность одного отсчёта ILA.")
+        self.clock_edit.setFixedWidth(self.clock_edit.fontMetrics().horizontalAdvance("0" * 14) + 16)
         self.clock_edit.textChanged.connect(self.update_status)
-        self.time_row.addWidget(self.clock_edit, 1)
-        layout.addLayout(self.time_row)
+        readout.addWidget(self.clock_edit)
+        layout.addLayout(readout)
         self.has_time = view.capture is not None and view.capture.times is not None
         self.previous_sample_period = sample_period_ns
         for widget in (self.time_label, self.clock_edit):
             widget.setVisible(not self.has_time)
-
-        self.status = QLabel()
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Масштаб диаграммы:"))
-        zoom_in = QPushButton("+")
-        zoom_in.clicked.connect(lambda: view.zoom_toolbar(0.5))
-        controls.addWidget(zoom_in)
-        zoom_out = QPushButton("−")
-        zoom_out.clicked.connect(lambda: view.zoom_toolbar(2))
-        controls.addWidget(zoom_out)
-        controls.addStretch(1)
-        self.confirm_button = QPushButton("Подтвердить период")
-        self.confirm_button.clicked.connect(self.confirm)
-        controls.addWidget(self.confirm_button)
-        cancel_button = QPushButton("Отмена")
-        cancel_button.clicked.connect(self.cancelled)
-        controls.addWidget(cancel_button)
-        layout.addLayout(controls)
 
         self._sampling = None
         if isinstance(current, EdgeSampling):
             index = next((i for i in range(1, self.source_box.count())
                           if self.source_box.itemData(i).name == current.signal.name), 0)
             self.source_box.setCurrentIndex(index)
-        elif current is None and self.source_box.count() > 1 and clock_score(self.source_box.itemData(1)):
+        elif current is None and has_clock and clock_score(self.source_box.itemData(1)):
             # Simulator dumps usually contain a clock: offer it instead of manual markers.
             self.source_box.setCurrentIndex(1)
+        self._last_signal = max(1, self.source_box.currentIndex()) if has_clock else 0
+        self.mode_box.setCurrentData(self.MARKERS if self.uses_markers else self.SIGNAL)
+        self.mode_box.currentIndexChanged.connect(self.mode_changed)
         self.source_box.currentIndexChanged.connect(self.source_changed)
         self.edge_box.currentIndexChanged.connect(self.source_changed)
         self.timing_box.currentIndexChanged.connect(self.update_status)
@@ -112,6 +150,13 @@ class CopyPeriodBanner(QFrame):
     def uses_markers(self):
         return self.source_box.currentData() == self.MARKERS
 
+    def mode_changed(self, *_):
+        """The segmented switch picks markers or the last chosen clock signal."""
+        if self.mode_box.currentData() == self.MARKERS:
+            self.source_box.setCurrentIndex(0)
+        elif self.source_box.count() > 1:
+            self.source_box.setCurrentIndex(self._last_signal)
+
     def sampling(self):
         if self.uses_markers:
             return None
@@ -120,11 +165,15 @@ class CopyPeriodBanner(QFrame):
 
     def source_changed(self, *_):
         markers = self.uses_markers
-        self.instruction.setVisible(markers)
-        self.edge_box.setEnabled(not markers)
-        self.timing_box.setEnabled(not markers)
-        self.confirm_button.setText("Подтвердить период" if markers else "Подтвердить такт")
-        self.time_label.setText("Длительность периода 1→2:" if markers else "Частота этого такта:")
+        if not markers:
+            self._last_signal = self.source_box.currentIndex()
+        if self.mode_box.currentData() != (self.MARKERS if markers else self.SIGNAL):
+            self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentData(self.MARKERS if markers else self.SIGNAL)
+            self.mode_box.blockSignals(False)
+        self.signal_controls.setVisible(not markers)
+        self.marker_controls.setVisible(markers)
+        self.time_label.setText("Длительность 1→2" if markers else "Частота такта")
         self._sampling = self.sampling()
         if self._sampling is not None:
             self._show_edges(self._sampling)
@@ -160,36 +209,42 @@ class CopyPeriodBanner(QFrame):
             return None
         return parse_clock(text) / interval
 
+    def _set_status(self, text, error=False):
+        self.status.setText(text)
+        self.status.setProperty("role", "error" if error else "readout")
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+
     def update_status(self, *_):
         valid_clock = True
         try:
             sample_period = self.sample_period_ns()
         except ValueError as exc:
             sample_period, valid_clock = None, False
-            clock_note = f" ⚠ {exc}"
+            clock_note = f"  ·  частота: {exc}"
         else:
-            clock_note = (f" · 1 отсчёт = {format_seconds(sample_period * 1e-9)}" if sample_period else "")
+            clock_note = f"  ·  1 отсчёт = {format_seconds(sample_period * 1e-9)}" if sample_period else ""
         if self.uses_markers:
             first, second = self.view.period_markers
             if first is None or second is None or first == second:
-                self.status.setText("Пока не выбраны две разные точки. Нажмите ЛКМ для точки 1 и Shift+ЛКМ для точки 2.")
+                self._set_status("Поставьте точки 1 и 2 на диаграмме")
                 self.confirm_button.setEnabled(False)
                 return
             period = abs(second - first)
-            self.status.setText(f"Точка 1: {first:,}  →  точка 2: {second:,}  ·  ПОЛНЫЙ ПЕРИОД: {period:,} отсчётов."
-                                f"{clock_note} После проверки нажмите «Подтвердить период».")
+            self._set_status(f"1: {first:,}  →  2: {second:,}  ·  период {period:,} отсч.{clock_note}",
+                             not valid_clock)
             self.confirm_button.setEnabled(valid_clock)
             return
         sampling = self._sampling
         edges = sampling.count_edges() if sampling else 0
         if not edges:
-            self.status.setText("У этого сигнала нет выбранных фронтов в захвате.")
+            self._set_status("У этого сигнала нет выбранных фронтов", True)
             self.confirm_button.setEnabled(False)
             return
         typical = sampling.typical_interval()
-        parts = [f"Фронтов: {edges:,}"]
+        parts = [f"фронтов {edges:,}"]
         if typical:
-            parts.append(f"типичный шаг: {group_digits(typical, 2)} отсч.")
+            parts.append(f"шаг {group_digits(typical, 2)} отсч.")
             axis = self.view.time_axis()
             if axis is not None and self.view.capture.times is not None:
                 rising = EdgeSampling(sampling.signal, "rising").typical_interval()
@@ -198,9 +253,8 @@ class CopyPeriodBanner(QFrame):
                     ticks = abs(axis.to_ticks(start + rising) - axis.to_ticks(start))
                     seconds = ticks * axis.tick_seconds
                     if seconds > 0:
-                        parts.append(f"T ≈ {format_seconds(seconds, axis.resolution)} · f ≈ {format_frequency(1 / seconds)}")
-        self.status.setText(" · ".join(parts) + clock_note +
-                            ". Неактивный такт (как SCK в SPI) учитывается: выборка только на реальных фронтах.")
+                        parts.append(f"T ≈ {format_seconds(seconds, axis.resolution)}  ·  f ≈ {format_frequency(1 / seconds)}")
+        self._set_status("  ·  ".join(parts) + clock_note, not valid_clock)
         self.confirm_button.setEnabled(valid_clock)
 
     def confirm(self):

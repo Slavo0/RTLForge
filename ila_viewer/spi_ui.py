@@ -17,7 +17,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDockWidget,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QPushButton, QSpinBox, QStackedWidget, QTableView,
+                               QLabel, QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTableView,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .actions import ContextActionProvider
@@ -26,6 +26,7 @@ from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, TRUNCATED, UN
                   SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins,
                   SpiSettings, default_commands, guess_pins, line_options, overlays, rebind)
 from .tree import DecodedNode
+from .widgets import SegmentedChoice, muted, plain_container
 
 FIXED_PRESETS = ("1-1-1", "1-1-2", "1-2-2", "1-1-4", "1-4-4", "2-2-2", "4-4-4", "0-4-4", "0-1-1", "1-0-1", "1-1-0", "1-0-0")
 DIRECTION_TEXT = {"read": "чтение", "write": "запись", "none": "нет"}
@@ -54,17 +55,21 @@ class SpiDecoderDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Декодер SPI / QSPI")
         self.setModal(False)
-        self.resize(980, 760)
         self.options = line_options(signals)
         pins = config.pins if config else guess_pins(signals)
         settings = config.settings if config else (settings or SpiSettings())
         layout = QVBoxLayout(self)
+        layout.setSpacing(12)
 
+        # 1. Wires. IO2/IO3 matter only for quad formats, so they open on demand.
         lines = QGroupBox("Линии")
         form = QFormLayout(lines)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
         self.cs_box = self._line_box(pins.cs if pins else None, "— нет: весь захват один кадр")
-        self.cs_level = _combo([(True, "активный низкий (CS#)"), (False, "активный высокий")],
-                               pins.cs_active_low if pins else True)
+        self.cs_level = SegmentedChoice([(True, "активен 0", "CS# — кадр, пока линия в нуле"),
+                                         (False, "активен 1", "Кадр, пока линия в единице")],
+                                        pins.cs_active_low if pins else True)
         row = QHBoxLayout()
         row.addWidget(self.cs_box, 1)
         row.addWidget(self.cs_level)
@@ -72,55 +77,97 @@ class SpiDecoderDialog(QDialog):
         self.sck_box = self._line_box(pins.sck if pins else None, None)
         form.addRow("SCK", self.sck_box)
         self.io_boxes = []
-        hints = ("IO0 / MOSI / DQ0", "IO1 / MISO / DQ1", "IO2 / WP# / DQ2", "IO3 / HOLD# / DQ3")
+        hints = ("MOSI · IO0", "MISO · IO1", "IO2 · WP#", "IO3 · HOLD#")
+        self.quad_rows = []
         for index, hint in enumerate(hints):
             box = self._line_box(pins.io[index] if pins else None, "— не подключена")
             self.io_boxes.append(box)
-            form.addRow(hint, box)
+            label = QLabel(hint)
+            form.addRow(label, box)
+            if index >= 2:
+                self.quad_rows.append((label, box))
+        self.quad_toggle = QPushButton("+ IO2, IO3 для Quad SPI")
+        self.quad_toggle.setCheckable(True)
+        self.quad_toggle.setAutoDefault(False)
+        self.quad_toggle.toggled.connect(self._show_quad)
+        form.addRow("", self.quad_toggle)
+
+        # 2. Sampling.
+        sampling = QGroupBox("Выборка")
+        sample_form = QFormLayout(sampling)
+        sample_form.setHorizontalSpacing(12)
+        sample_form.setVerticalSpacing(6)
+        self.edge_box = SegmentedChoice([("rising", "↑ передний", "SPI режимы 0 и 3"),
+                                         ("falling", "↓ задний", "SPI режимы 1 и 2")], settings.sample_edge)
+        self.timing_box = SegmentedChoice([(True, "до фронта", "Значение линии перед фронтом, как его видит регистр"),
+                                           (False, "на фронте", "Значение линии в момент фронта")],
+                                          settings.before_edge)
+        sample_form.addRow("Фронт SCK", self.edge_box)
+        sample_form.addRow("Чтение линий", self.timing_box)
+
         top = QHBoxLayout()
+        top.setSpacing(12)
         top.addWidget(lines, 3)
-        side = QVBoxLayout()
-        top.addLayout(side, 2)
+        top.addWidget(sampling, 2, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(top)
 
-        sampling = QGroupBox("Выборка")
-        form = QFormLayout(sampling)
-        self.edge_box = _combo([("rising", "↑ передний фронт SCK (режимы 0 и 3)"),
-                                ("falling", "↓ задний фронт SCK (режимы 1 и 2)")], settings.sample_edge)
-        self.timing_box = _combo([(True, "значение до фронта"), (False, "значение на фронте")], settings.before_edge)
-        form.addRow("Фронт", self.edge_box)
-        form.addRow("Линии читаются", self.timing_box)
-        side.addWidget(sampling)
-
-        self.mode_box = _combo([("commands", "По коду команды (таблица команд)"),
-                                ("fixed", "Фиксированный формат для всех кадров"),
-                                ("raw", "Простой SPI: только байты")], settings.mode)
-        mode = QGroupBox("Режим декодирования")
-        QVBoxLayout(mode).addWidget(self.mode_box)
-        side.addWidget(mode)
-        side.addStretch(1)
+        # 3. What a frame contains. Pages follow the segment order.
+        content = QGroupBox("Содержимое кадра")
+        content_layout = QVBoxLayout(content)
+        content_layout.setSpacing(8)
+        self.mode_box = SegmentedChoice([
+            ("raw", "Только байты", "Каждый кадр CS — поток байтов, без команды и адреса"),
+            ("commands", "Команды флеш-памяти", "Формат кадра по коду команды из таблицы"),
+            ("fixed", "Один формат для всех", "Команда, адрес, dummy и данные заданы вручную")], settings.mode)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mode_box)
+        mode_row.addStretch(1)
+        content_layout.addLayout(mode_row)
         self.pages = QStackedWidget()
+        self.pages.addWidget(self._raw_page(settings))
         self.pages.addWidget(self._commands_page(settings))
         self.pages.addWidget(self._fixed_page(settings.fixed))
-        self.pages.addWidget(self._raw_page(settings))
-        self.mode_box.currentIndexChanged.connect(self.pages.setCurrentIndex)
-        self.pages.setCurrentIndex(self.mode_box.currentIndex())
-        layout.addWidget(self.pages, 1)
+        self.mode_box.currentIndexChanged.connect(self._mode_changed)
+        content_layout.addWidget(self.pages, 1)
+        layout.addWidget(content, 1)
 
         self.error = QLabel()
         self.error.setWordWrap(True)
-        self.error.setStyleSheet("color: #e06c75;")
-        layout.addWidget(self.error)
+        self.error.setProperty("role", "error")
         buttons = QHBoxLayout()
-        buttons.addStretch(1)
+        buttons.addWidget(self.error, 1)
         self.decode_button = QPushButton("Декодировать")
+        self.decode_button.setProperty("primary", True)
         self.decode_button.setDefault(True)
         self.decode_button.clicked.connect(self.submit)
         close = QPushButton("Закрыть")
+        close.setAutoDefault(False)
         close.clicked.connect(self.reject)
-        buttons.addWidget(self.decode_button)
         buttons.addWidget(close)
+        buttons.addWidget(self.decode_button)
         layout.addLayout(buttons)
+
+        has_quad = any(box.currentData() is not None for _, box in self.quad_rows)
+        self.quad_toggle.setChecked(has_quad)
+        self._show_quad(has_quad)
+        self._mode_changed()
+        self.resize(760, 0)
+
+    def _show_quad(self, shown):
+        for label, box in self.quad_rows:
+            label.setVisible(shown)
+            box.setVisible(shown)
+        self.quad_toggle.setText("− скрыть IO2, IO3" if shown else "+ IO2, IO3 для Quad SPI")
+
+    def _mode_changed(self, *_):
+        self.pages.setCurrentIndex(self.mode_box.currentIndex())
+        # Only the current page takes space; the table page is tall.
+        for index in range(self.pages.count()):
+            policy = QSizePolicy.Policy.Preferred if index == self.pages.currentIndex() else QSizePolicy.Policy.Ignored
+            self.pages.widget(index).setSizePolicy(policy, policy)
+        self.pages.updateGeometry()
+        # Fit the height to the current page once the layout has settled; width stays.
+        QTimer.singleShot(0, lambda: self.resize(self.width(), self.sizeHint().height()))
 
     def _line_box(self, current, empty_text):
         box = QComboBox()
@@ -136,50 +183,77 @@ class SpiDecoderDialog(QDialog):
 
     def _commands_page(self, settings):
         page = QWidget()
+        page.setObjectName("plain")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         form = QFormLayout()
-        self.protocol_box = _combo([("extended", "Extended SPI: команда на 1 линии (1-x-x)"),
-                                    ("dual", "Dual SPI: всё на 2 линиях (2-2-2)"),
-                                    ("quad", "Quad SPI: всё на 4 линиях (4-4-4)")], settings.protocol)
-        self.address_box = _combo([(3, "3 байта"), (4, "4 байта (команды с 3-байтовым адресом тоже)")],
-                                  settings.address_bytes)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+        self.protocol_box = SegmentedChoice([
+            ("extended", "Extended 1-x-x", "Команда на 1 линии, адрес и данные — по формату команды"),
+            ("dual", "Dual 2-2-2", "Все фазы на 2 линиях"),
+            ("quad", "Quad 4-4-4", "Все фазы на 4 линиях")], settings.protocol)
+        self.address_box = SegmentedChoice([(3, "3 байта"), (4, "4 байта", "Команды с 3-байтовым адресом тоже читают 4 байта")],
+                                           settings.address_bytes)
         self.dummy_box = QSpinBox()
         self.dummy_box.setRange(-1, 255)
         self.dummy_box.setSpecialValueText("по таблице")
         self.dummy_box.setValue(-1 if settings.dummy_cycles is None else settings.dummy_cycles)
-        self.dummy_box.setToolTip("Число dummy-тактов команд FAST READ (отмечены в таблице). "
-                                  "Должно совпадать с настройкой микросхемы.")
-        self.dtr_box = QCheckBox("Протокол DTR: все фазы на обоих фронтах")
+        self.dummy_box.setToolTip("Dummy-такты команд FAST READ. Должно совпадать с настройкой микросхемы.")
+        self.dtr_box = QCheckBox("DTR: все фазы на обоих фронтах")
         self.dtr_box.setChecked(settings.dtr)
         form.addRow("Протокол", self.protocol_box)
         form.addRow("Адрес", self.address_box)
-        form.addRow("Dummy FAST READ", self.dummy_box)
-        form.addRow(self.dtr_box)
+        dummy_row = QHBoxLayout()
+        dummy_row.addWidget(self.dummy_box)
+        dummy_row.addSpacing(16)
+        dummy_row.addWidget(self.dtr_box)
+        dummy_row.addStretch(1)
+        form.addRow("Dummy FAST READ", dummy_row)
         layout.addLayout(form)
+
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setToolTip("Формат: команда-адрес-данные в линиях. Пусто в Dual/Quad — "
                               "те же фазы на 2/4 линиях. Данные: чтение, запись или нет.")
         self.fill_table(settings.commands)
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setMinimumHeight(220)
-        layout.addWidget(self.table, 1)
-        row = QHBoxLayout()
-        add = QPushButton("Добавить команду")
+        self.table.setMinimumHeight(260)
+        self.table_toggle = QPushButton()
+        self.table_toggle.setCheckable(True)
+        self.table_toggle.setAutoDefault(False)
+        self.table_toggle.toggled.connect(self._show_table)
+        self.table_tools = plain_container()
+        tools = QHBoxLayout(self.table_tools)
+        tools.setContentsMargins(0, 0, 0, 0)
+        add = QPushButton("Добавить")
         add.clicked.connect(self.add_row)
         remove = QPushButton("Удалить выбранные")
         remove.clicked.connect(self.remove_rows)
-        reset = QPushButton("Таблица по умолчанию")
+        reset = QPushButton("По умолчанию")
         reset.clicked.connect(lambda: self.fill_table(default_commands()))
         for button in (add, remove, reset):
-            row.addWidget(button)
-        row.addStretch(1)
-        layout.addLayout(row)
+            button.setAutoDefault(False)
+            tools.addWidget(button)
+        tools.addStretch(1)
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(self.table_toggle)
+        toggle_row.addWidget(self.table_tools, 1)
+        layout.addLayout(toggle_row)
+        layout.addWidget(self.table, 1)
+        self._show_table(False)
         return page
+
+    def _show_table(self, shown):
+        self.table.setVisible(shown)
+        self.table_tools.setVisible(shown)
+        self.table_toggle.setText(("▾ " if shown else "▸ ") + f"Таблица команд ({self.table.rowCount()})")
+        if self.isVisible():
+            self._mode_changed()
 
     def fill_table(self, commands):
         self.table.setRowCount(0)
@@ -242,7 +316,11 @@ class SpiDecoderDialog(QDialog):
 
     def _fixed_page(self, fixed):
         page = QWidget()
+        page.setObjectName("plain")
         form = QFormLayout(page)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
         self.fixed_format = QComboBox()
         self.fixed_format.setEditable(True)
         self.fixed_format.addItems(FIXED_PRESETS)
@@ -251,36 +329,44 @@ class SpiDecoderDialog(QDialog):
                                      "(например 0-4-4 для чтения без кода команды)")
         self.fixed_address = QSpinBox()
         self.fixed_address.setRange(0, 4)
+        self.fixed_address.setSuffix(" Б")
         self.fixed_address.setValue(fixed.address_bytes)
         self.fixed_dummy = QSpinBox()
         self.fixed_dummy.setRange(0, 255)
+        self.fixed_dummy.setSuffix(" такт.")
         self.fixed_dummy.setValue(fixed.dummy)
-        self.fixed_direction = _combo([("read", "чтение (от устройства)"), ("write", "запись (в устройство)")],
-                                      fixed.direction)
-        self.fixed_dtr = _combo([("off", "нет (SDR)"), ("address_data", "адрес и данные (команда SDR)"),
-                                 ("all", "все фазы")], fixed.dtr)
-        form.addRow("Формат", self.fixed_format)
-        form.addRow("Адрес, байт", self.fixed_address)
-        form.addRow("Dummy, тактов", self.fixed_dummy)
+        self.fixed_direction = SegmentedChoice([("read", "чтение", "Данные от устройства; одна линия — IO1"),
+                                                ("write", "запись", "Данные в устройство; одна линия — IO0")],
+                                               fixed.direction)
+        self.fixed_dtr = SegmentedChoice([("off", "нет"), ("address_data", "адрес и данные", "Команда SDR"),
+                                          ("all", "все фазы")], fixed.dtr)
+        phases = QHBoxLayout()
+        phases.setSpacing(6)
+        phases.addWidget(self.fixed_format)
+        phases.addSpacing(16)
+        phases.addWidget(muted("адрес"))
+        phases.addWidget(self.fixed_address)
+        phases.addSpacing(16)
+        phases.addWidget(muted("dummy"))
+        phases.addWidget(self.fixed_dummy)
+        phases.addStretch(1)
+        form.addRow("Линии фаз", phases)
         form.addRow("Данные", self.fixed_direction)
         form.addRow("DTR", self.fixed_dtr)
-        note = QLabel("Один формат для каждого кадра CS. Однолинейные данные: чтение — IO1, запись — IO0.")
-        note.setWordWrap(True)
-        form.addRow(note)
         return page
 
     def _raw_page(self, settings):
         page = QWidget()
+        page.setObjectName("plain")
         form = QFormLayout(page)
-        self.raw_lines = _combo([(1, "1 линия: MOSI (IO0) и MISO (IO1) одновременно"),
-                                 (2, "2 линии: IO1 IO0"), (4, "4 линии: IO3…IO0")], settings.raw_lines)
-        self.bit_order = _combo([(True, "старший бит первым (MSB first)"), (False, "младший бит первым (LSB first)")],
-                                settings.msb_first)
-        form.addRow("Линии данных", self.raw_lines)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+        self.raw_lines = SegmentedChoice([(1, "1 линия: MOSI и MISO", "Два потока байтов одновременно: IO0 и IO1"),
+                                          (2, "2 линии", "IO1 IO0"), (4, "4 линии", "IO3…IO0")], settings.raw_lines)
+        self.bit_order = SegmentedChoice([(True, "MSB first"), (False, "LSB first")], settings.msb_first)
+        form.addRow("Данные", self.raw_lines)
         form.addRow("Порядок битов", self.bit_order)
-        note = QLabel("Каждый кадр CS делится на байты с первого фронта, без команды и адреса.")
-        note.setWordWrap(True)
-        form.addRow(note)
         return page
 
     def config(self):

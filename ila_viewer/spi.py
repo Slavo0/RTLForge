@@ -273,7 +273,7 @@ class SpiSettings:
         if self.address_bytes not in (3, 4):
             raise ValueError("Адрес команд: 3 или 4 байта")
         if self.raw_lines not in (1, 2, 4):
-            raise ValueError("Простой SPI: 1, 2 или 4 линии данных")
+            raise ValueError("Только байты: 1, 2 или 4 линии данных")
         if self.fixed.address_bytes not in range(0, 5) or not 0 <= self.fixed.dummy <= 255:
             raise ValueError("Фиксированный формат: адрес 0…4 байта, dummy 0…255 тактов")
         if self.dummy_cycles is not None and not 0 <= self.dummy_cycles <= 255:
@@ -290,7 +290,7 @@ class SpiSettings:
     def describe(self):
         edge = "↑" if self.sample_edge == "rising" else "↓"
         if self.mode == "raw":
-            return f"простой SPI, {self.raw_lines} лин., SCK {edge}"
+            return f"только байты, {self.raw_lines} лин., SCK {edge}"
         if self.mode == "fixed":
             f = self.fixed
             return (f"фиксированный {f.widths.text}, адрес {f.address_bytes} Б, dummy {f.dummy}"

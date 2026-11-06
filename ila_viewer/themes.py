@@ -3,8 +3,11 @@
 
 """Replaceable theme objects and background-aware signal palettes."""
 from dataclasses import dataclass
+from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QColor
+
+ASSETS = Path(__file__).resolve().parent / "assets"
 
 
 @dataclass(frozen=True)
@@ -24,26 +27,111 @@ class Theme:
     marker_b: str
     unknown: str
 
+    # The waveform keeps its many meaningful colors; the chrome around it uses the
+    # neutral ramp of the theme plus one accent (the theme's bus color).
+    @property
+    def accent(self):
+        return self.bus
+
+    @property
+    def dark(self):
+        return QColor(self.background).lightnessF() < 0.5
+
+    @property
+    def on_accent(self):
+        """Text and tick color on an accent fill."""
+        return "#14161a" if QColor(self.accent).lightnessF() > 0.55 else "#ffffff"
+
+    def a_b_band(self):
+        """Fill between markers A and B: marker A's hue, faint enough to read waves through."""
+        color = QColor(self.marker_a)
+        color.setAlpha(16 if self.dark else 24)
+        return color
+
     def stylesheet(self):
+        tick = (ASSETS / ("check_dark.svg" if self.on_accent == "#14161a" else "check_light.svg")).as_posix()
         return f"""
 QMainWindow, QWidget {{ background: {self.panel}; color: {self.text}; }}
-QFrame#copyPeriodBanner {{ background: {self.selected}; border: 1px solid {self.marker_a}; border-radius: 5px; }}
-QToolBar {{ border: 0; spacing: 5px; padding: 6px; }}
-QToolButton, QPushButton {{ background: {self.alternate}; border: 1px solid {self.grid}; padding: 6px 10px; border-radius: 4px; }}
-QToolButton:hover, QPushButton:hover {{ background: {self.selected}; }}
-QToolButton:disabled, QPushButton:disabled {{ color: {self.muted}; }}
-QLineEdit, QComboBox, QSpinBox {{ background: {self.background}; border: 1px solid {self.grid}; border-radius: 4px; padding: 5px; }}
+QLabel, QCheckBox, QRadioButton {{ background: transparent; }}
+QWidget#plain {{ background: transparent; }}
+QLabel:disabled, QCheckBox:disabled {{ color: {self.muted}; }}
+
+QFrame#copyPeriodBanner {{ background: {self.alternate}; border: 1px solid {self.grid};
+    border-left: 3px solid {self.marker_a}; border-radius: 6px; }}
+QFrame#copyPeriodBanner QLabel#bannerTitle {{ font-weight: 600; }}
+QLabel[role="muted"] {{ color: {self.muted}; }}
+QLabel[role="readout"] {{ font-family: Consolas, "Cascadia Mono", monospace; }}
+QLabel[role="error"] {{ color: {self.unknown}; }}
+QLabel[keycap="true"] {{ background: {self.background}; border: 1px solid {self.grid};
+    border-bottom-width: 2px; border-radius: 4px; padding: 0px 6px; color: {self.text}; }}
+
+QToolBar {{ border: 0; spacing: 2px; padding: 4px 8px; }}
+QToolBar::separator {{ background: {self.grid}; width: 1px; margin: 6px 8px; }}
+QToolBar QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 4px;
+    padding: 4px 10px; }}
+QToolBar QToolButton:hover {{ background: {self.selected}; }}
+QToolBar QToolButton:pressed {{ background: {self.grid}; }}
+QToolBar QToolButton:disabled {{ color: {self.muted}; }}
+
+QPushButton, QToolButton {{ background: {self.alternate}; border: 1px solid {self.grid};
+    border-radius: 4px; padding: 4px 12px; min-height: 20px; }}
+QPushButton:hover, QToolButton:hover {{ background: {self.selected}; }}
+QPushButton:pressed, QToolButton:pressed {{ background: {self.grid}; }}
+QPushButton:disabled, QToolButton:disabled {{ color: {self.muted}; }}
+QPushButton:focus, QToolButton:focus {{ border-color: {self.accent}; }}
+QPushButton:default {{ border-color: {self.muted}; }}
+QPushButton[primary="true"] {{ background: {self.accent}; color: {self.on_accent}; border-color: {self.accent}; }}
+QPushButton[primary="true"]:hover {{ background: {self.accent}; border-color: {self.text}; }}
+QPushButton[primary="true"]:disabled {{ background: {self.alternate}; color: {self.muted}; border-color: {self.grid}; }}
+QPushButton[segment="true"] {{ border-radius: 0px; padding: 4px 10px; margin: 0px; }}
+QPushButton[segment="true"][first="true"] {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+QPushButton[segment="true"][last="true"] {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+QPushButton[segment="true"]:checked {{ background: {self.selected}; border-color: {self.accent}; }}
+
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {self.background};
+    border: 1px solid {self.grid}; border-radius: 4px; padding: 4px 6px; }}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {self.accent}; }}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {self.muted}; }}
+QComboBox QAbstractItemView {{ background: {self.background}; border: 1px solid {self.grid};
+    selection-background-color: {self.selected}; selection-color: {self.text}; }}
+
+QCheckBox {{ spacing: 6px; }}
+QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {self.muted};
+    border-radius: 3px; background: {self.background}; }}
+QCheckBox::indicator:hover {{ border-color: {self.accent}; }}
+QCheckBox::indicator:checked {{ background: {self.accent}; border-color: {self.accent}; image: url("{tick}"); }}
+QCheckBox::indicator:disabled {{ border-color: {self.grid}; }}
+
+QGroupBox {{ border: 1px solid {self.grid}; border-radius: 6px; margin-top: 10px; padding: 8px 8px 6px 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0px 4px; color: {self.muted}; }}
+QTabWidget::pane {{ border: 1px solid {self.grid}; border-radius: 4px; }}
+QHeaderView::section {{ background: {self.panel}; color: {self.muted}; border: 0;
+    border-right: 1px solid {self.grid}; border-bottom: 1px solid {self.grid}; padding: 3px 6px; }}
+QTableView, QTableWidget, QListView, QTreeView {{ background: {self.background}; gridline-color: {self.grid};
+    selection-background-color: {self.selected}; selection-color: {self.text}; border: 1px solid {self.grid}; }}
+
 QStatusBar {{ background: {self.background}; }}
-QProgressBar {{ border: 1px solid {self.grid}; text-align: center; }}
-QProgressBar::chunk {{ background: {self.selected}; }}
-QScrollBar:horizontal {{ background: {self.panel}; height: 16px; }}
-QScrollBar:vertical {{ background: {self.panel}; width: 16px; }}
-QScrollBar::handle {{ background: {self.muted}; min-width: 24px; min-height: 24px; border-radius: 4px; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
-QMenu {{ border: 1px solid {self.grid}; }}
+QProgressBar {{ background: {self.background}; border: 1px solid {self.grid}; border-radius: 4px;
+    text-align: center; }}
+QProgressBar::chunk {{ background: {self.accent}; border-radius: 3px; }}
+
+QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 0px; }}
+QScrollBar:vertical {{ background: transparent; width: 12px; margin: 0px; }}
+QScrollBar::handle {{ background: {self.grid}; border-radius: 4px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ min-width: 32px; }}
+QScrollBar::handle:vertical {{ min-height: 32px; }}
+QScrollBar::handle:hover, QScrollBar::handle:pressed {{ background: {self.muted}; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: 0; }}
+
+QMenu {{ background: {self.panel}; border: 1px solid {self.grid}; padding: 4px 0px; }}
+QMenu::item {{ padding: 4px 24px 4px 12px; }}
 QMenu::item:selected {{ background: {self.selected}; }}
-QMenu::separator {{ height: 1px; background: {self.muted}; margin: 5px 0px; }}
-QToolTip {{ color: {self.text}; background: {self.panel}; border: 1px solid {self.muted}; }}
+QMenu::item:disabled {{ color: {self.muted}; }}
+QMenu::separator {{ height: 1px; background: {self.grid}; margin: 4px 8px; }}
+QMenuBar::item {{ padding: 4px 8px; background: transparent; }}
+QMenuBar::item:selected {{ background: {self.selected}; border-radius: 4px; }}
+QToolTip {{ color: {self.text}; background: {self.panel}; border: 1px solid {self.grid}; padding: 4px; }}
 """
 
 
