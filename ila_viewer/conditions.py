@@ -166,6 +166,14 @@ class Condition:
     def __init__(self, expression, root):
         self.expression, self.root = expression, root
         self.uses_history = self._uses_history(root)
+        self._vector = None
+
+    def evaluate(self, at, previous):
+        """``matches`` for arrays of samples; ``previous`` holds -1 where there is no previous point."""
+        if self._vector is None:
+            from .condition_vectors import VectorEvaluator
+            self._vector = VectorEvaluator(self)
+        return self._vector.evaluate(at, previous)
 
     @classmethod
     def _uses_history(cls, node):

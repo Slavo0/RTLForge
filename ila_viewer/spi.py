@@ -425,20 +425,33 @@ class _EdgeStream:
 
 
 class _RecordWriter:
+    BATCH = 65536  # records per disk write; frames produce many tiny arrays
+
     def __init__(self, folder, prefix, dtype):
         stream = tempfile.NamedTemporaryFile(dir=folder, prefix=prefix, suffix=".bin", delete=False)
         self.path = Path(stream.name)
         self.stream = stream
         self.dtype = dtype
         self.count = 0
+        self.pending = []
+        self.pending_count = 0
 
     def write(self, records):
         if len(records):
-            records.tofile(self.stream)
+            self.pending.append(np.array(records, copy=True))
+            self.pending_count += len(records)
             self.count += len(records)
+            if self.pending_count >= self.BATCH:
+                self.flush()
+
+    def flush(self):
+        if self.pending:
+            np.concatenate(self.pending).tofile(self.stream)
+            self.pending, self.pending_count = [], 0
 
     def close(self):
         if not self.stream.closed:
+            self.flush()
             self.stream.close()
 
     def discard(self):
@@ -914,6 +927,25 @@ class DecodedTrack:
         fields = self.fields
         return index + 1 >= len(fields) or int(fields["frame"][index + 1]) != int(fields["frame"][index])
 
+    def search(self, query, sample, direction, cancel=lambda: False, wrap=True):
+        """Start of the next/previous field where ``query`` (a SpiQuery) matches, like SignalData.search."""
+        key = (query, len(self.fields))
+        if getattr(self, "_search_key", None) != key:
+            self._search_hits = np.asarray(self.fields["start"])[query.field_matches(self.fields, cancel)]
+            self._search_key = key
+        starts = self._search_hits
+        if not len(starts):
+            return None
+        if direction > 0:
+            index = int(np.searchsorted(starts, sample, side="right"))
+            if index < len(starts):
+                return int(starts[index]), False
+            return (int(starts[0]), True) if wrap else None
+        index = int(np.searchsorted(starts, sample, side="left")) - 1
+        if index >= 0:
+            return int(starts[index]), False
+        return (int(starts[-1]), True) if wrap else None
+
     def transition(self, sample, direction):
         """Next/previous field boundary, like a signal change.
 
@@ -941,6 +973,125 @@ class DecodedTrack:
         if j >= 0 and self._frame_last(j):
             candidates.append(int(ends[j]))
         return max(candidates) if candidates else None
+
+
+_HEX = re.compile(r"(?:0x)?([0-9a-f_]+)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class SpiQuery:
+    """What to find in decoded SPI fields.
+
+    * ``9F`` or ``9F EF 40`` - consecutive bytes of one transaction, in any field
+      (command, address bytes, data); ``001000`` is the same as ``00 10 00``;
+    * ``data 01 02`` - only data bytes;
+    * ``cmd 9F`` - command opcode; ``@1000`` or ``addr 1000`` - address,
+      ``@1000-1FFF`` a range of addresses.
+
+    Values are hexadecimal, like the decoded labels. X/Z and partial units never match.
+    """
+
+    kind: str                    # "bytes", "data", "cmd", "addr"
+    values: tuple = ()           # bytes, or (low, high) for cmd/addr
+
+    PREFIXES = (("cmd", "cmd"), ("addr", "addr"), ("@", "addr"), ("data", "data"))
+
+    @classmethod
+    def parse(cls, text):
+        text = text.strip()
+        kind, rest = "bytes", text
+        for prefix, name in cls.PREFIXES:
+            if text.casefold().startswith(prefix):
+                kind, rest = name, text[len(prefix):].strip(" :=")
+                break
+        if not rest:
+            raise ValueError("Введите значение в HEX: 9F, @1000, cmd 03 или 01 02 03")
+        if kind in ("cmd", "addr"):
+            parts = re.split(r"\s*(?:-|\.\.|…)\s*", rest)
+            if len(parts) > 2:
+                raise ValueError(f"Диапазон задаётся как @1000-1FFF, а не «{rest}»")
+            low, high = (cls._number(part) for part in (parts * 2)[:2])
+            return cls(kind, (min(low, high), max(low, high)))
+        data = []
+        for token in re.split(r"[\s,]+", rest):
+            digits = cls._digits(token)
+            digits = digits.rjust(len(digits) + len(digits) % 2, "0")
+            data.extend(int(digits[i:i + 2], 16) for i in range(0, len(digits), 2))
+        if len(data) > 256:
+            raise ValueError("Не больше 256 байт в поиске")
+        return cls(kind, tuple(data))
+
+    @staticmethod
+    def _digits(token):
+        match = _HEX.fullmatch(token)
+        if not match or not match[1].strip("_"):
+            raise ValueError(f"«{token}» — не HEX-значение")
+        return match[1].replace("_", "")
+
+    @classmethod
+    def _number(cls, token):
+        return int(cls._digits(token), 16)
+
+    def describe(self):
+        if self.kind in ("cmd", "addr"):
+            low, high = self.values
+            text = f"{low:X}" if low == high else f"{low:X}–{high:X}"
+            return ("команда " if self.kind == "cmd" else "адрес ") + text
+        return ("данные " if self.kind == "data" else "") + " ".join(f"{b:02X}" for b in self.values)
+
+    def lanes(self, result):
+        return (0,) if self.kind in ("cmd", "addr") else tuple(range(result.lane_count))
+
+    def field_matches(self, fields, cancel=lambda: False, chunk=1 << 20):
+        """Indices of fields where a match starts, ascending and unique."""
+        total = len(fields)
+        found = []
+        if self.kind in ("cmd", "addr"):
+            low, high = self.values
+            wanted = CMD if self.kind == "cmd" else ADDR
+            for a in range(0, total, chunk):
+                if cancel():
+                    raise LoadCancelled()
+                part = np.asarray(fields[a:a + chunk])
+                good = (part["kind"] == wanted) & ((part["flags"] & (UNKNOWN | PARTIAL)) == 0)
+                good &= (part["value"] >= low) & (part["value"] <= high)
+                found.append(np.flatnonzero(good) + a)
+            return np.concatenate(found) if found else np.empty(0, dtype=np.int64)
+        sequence = np.asarray(self.values, dtype=np.int64)
+        length = len(sequence)
+        for a in range(0, total, chunk):
+            if cancel():
+                raise LoadCancelled()
+            last = a + chunk >= total
+            part = np.asarray(fields[a:a + chunk + length])  # overlap: every field holds >= 1 byte
+            sizes = np.maximum(1, (part["bits"].astype(np.int64) + 7) // 8)
+            sizes[part["kind"] == DUMMY] = 0
+            if self.kind == "data":
+                sizes[~np.isin(part["kind"], list(DATA_KINDS))] = 0
+            owner = np.repeat(np.arange(len(part)), sizes)
+            if len(owner) < length:
+                continue
+            first_byte = np.cumsum(sizes) - sizes
+            position = np.arange(len(owner)) - first_byte[owner]
+            shift = 8 * (sizes[owner] - 1 - position)
+            values = (part["value"][owner].astype(np.int64) >> shift) & 0xFF
+            values[(part["flags"][owner] & (UNKNOWN | PARTIAL)) != 0] = -1
+            frames = part["frame"][owner]
+            starts = len(owner) - length + 1
+            hit = values[:starts] == sequence[0]
+            for j in range(1, length):
+                hit &= (values[j:j + starts] == sequence[j]) & (frames[j:j + starts] == frames[:starts])
+            owners = owner[np.flatnonzero(hit)]
+            if not last:
+                owners = owners[owners < chunk]  # matches starting in the overlap belong to the next chunk
+            found.append(np.unique(owners) + a)
+        return np.concatenate(found) if found else np.empty(0, dtype=np.int64)
+
+    def frames(self, result, cancel=lambda: False):
+        """Frame indices that contain at least one match."""
+        hits = [np.asarray(result.lanes[lane]["frame"])[self.field_matches(result.lanes[lane], cancel)]
+                for lane in self.lanes(result) if lane < len(result.lanes)]
+        return np.unique(np.concatenate(hits)).astype(np.int64) if hits else np.empty(0, dtype=np.int64)
 
 
 def bubble_label(result, record, short=False):

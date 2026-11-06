@@ -17,17 +17,22 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDockWidget,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTableView,
+                               QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTableView,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .actions import ContextActionProvider
 from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, TRUNCATED, UNKNOWN,
                   UNKNOWN_COMMAND, BusWidths, CommandSpec, DecodedTrack, FixedFormat,
-                  SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins,
+                  SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
                   SpiSettings, default_commands, guess_pins, line_options, overlays, rebind)
 from .tree import DecodedNode
 from .widgets import SegmentedChoice, muted, plain_container
 
+SEARCH_TOOLTIP = "\n".join((
+    "Оставить транзакции, где есть совпадение (HEX):",
+    "9F EF 40 — байты подряд: команда, байты адреса, данные",
+    "cmd 9F — команда · @1000 или @1000-1FFF — адрес · data 01 02 — только данные",
+    "Enter — применить; F3 на строке SPI — к следующему совпадению"))
 FIXED_PRESETS = ("1-1-1", "1-1-2", "1-2-2", "1-1-4", "1-4-4", "2-2-2", "4-4-4", "0-4-4", "0-1-1", "1-0-1", "1-1-0", "1-0-0")
 DIRECTION_TEXT = {"read": "чтение", "write": "запись", "none": "нет"}
 SEPARATORS = {"space": ("Пробел", " "), "none": ("Без разделителя", ""), "comma": ("Запятая", ","),
@@ -541,12 +546,20 @@ class SpiPanel(QDockWidget):
         self.filter_box.currentIndexChanged.connect(self.apply_filter)
         self.data_only = QCheckBox("Только с данными")
         self.data_only.toggled.connect(self.apply_filter)
+        self.search_edit = QLineEdit()
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setPlaceholderText("Найти: 9F, @1000, 01 02 03")
+        self.search_edit.setToolTip(SEARCH_TOOLTIP)
+        self.search_edit.setMinimumWidth(self.search_edit.fontMetrics().horizontalAdvance("0" * 26))
+        self.search_edit.returnPressed.connect(self.apply_filter)
+        self.search_edit.textChanged.connect(lambda text: self.apply_filter() if not text else None)
         self.summary = QLabel()
         self.settings_button = QPushButton("Настройки декодера…")
         self.settings_button.clicked.connect(controller.open_dialog)
         top.addWidget(QLabel("Показать:"))
         top.addWidget(self.filter_box)
         top.addWidget(self.data_only)
+        top.addWidget(self.search_edit)
         top.addWidget(self.summary, 1)
         top.addWidget(self.settings_button)
         layout.addLayout(top)
@@ -634,10 +647,22 @@ class SpiPanel(QDockWidget):
             mask &= np.asarray(frames["flags"]) != 0
         if self.data_only.isChecked():
             mask &= np.asarray(frames["data_bytes"]) > 0
+        found = ""
+        text = self.search_edit.text().strip()
+        if text:
+            try:
+                query = SpiQuery.parse(text)
+            except ValueError as exc:
+                self.summary.setText(f"Поиск: {exc}")
+                return
+            matching = np.zeros(result.frame_count, dtype=bool)
+            matching[query.frames(result)] = True
+            mask &= matching
+            found = f"«{query.describe()}» · "
         rows = np.flatnonzero(mask)
         self.model.set_result(result, rows)
         total = int(np.asarray(frames["data_bytes"]).sum()) if result.frame_count else 0
-        self.summary.setText(f"{len(rows):,} из {result.frame_count:,} · байт данных: {total:,} · "
+        self.summary.setText(f"{found}{len(rows):,} из {result.frame_count:,} · байт данных: {total:,} · "
                              f"{result.config.describe()}")
 
 

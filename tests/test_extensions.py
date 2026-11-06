@@ -26,6 +26,9 @@ from ila_viewer.formats import FORMATS, RealSettings
 from ila_viewer.tree import BusNode, GroupNode, SignalTree, ParameterNode
 from ila_viewer.themes import DARK, LIGHT, SignalPalette
 from ila_viewer.window import MainWindow
+from ila_viewer.cpu import CpuTopology
+
+TEST_CPU = CpuTopology(physical=16, logical=32, name="Test CPU")
 from ila_viewer.preferences import PreferencesStore, ViewerPreferences
 from ila_viewer.copying import CopyValuesService
 from ila_viewer.conditions import ConditionCompiler
@@ -634,6 +637,160 @@ FLASH_FRAMES = [
 ]
 
 
+class VectorizedPathTests(unittest.TestCase):
+    """The numpy paths must give exactly what the original per-row/per-point code gave."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def write(self, name, text, newline="\n"):
+        path = Path(self.temp.name) / name
+        with path.open("w", encoding="utf-8", newline=newline) as stream:
+            stream.write(text)
+        return path
+
+    def assertSameCapture(self, actual, expected):
+        self.assertEqual(actual.count, expected.count)
+        self.assertEqual([s.name for s in actual.signals], [s.name for s in expected.signals])
+        for got, want in zip(actual.signals, expected.signals):
+            self.assertEqual((got.width, got.values), (want.width, want.values), got.name)
+            np.testing.assert_array_equal(got.starts, want.starts, err_msg=got.name)
+            np.testing.assert_array_equal(got.codes, want.codes, err_msg=got.name)
+        for name, data in expected.metadata.items():
+            np.testing.assert_array_equal(actual.metadata[name], data)
+
+    def generated_csv(self, rows=3000, newline="\n"):
+        rng = np.random.default_rng(7)
+        lines = ["Sample in Buffer,Sample in Window,TRIGGER,data[7:0],wide,s[7:0],bit,x,m[15:0]",
+                 "Radix - UNSIGNED,UNSIGNED,UNSIGNED,HEX,HEX,SIGNED,BINARY,HEX,HEX"]
+        for i in range(rows):
+            data = "XX" if i % 97 < 3 else f"{int(rng.integers(0, 4)) * 0x41:02X}"
+            wide = f"{(1 << 100) + i // 50:X}" if i % 400 else "zzzz"
+            lines.append(f"{i},{i % 512},{int(i == rows // 2)},{data},{wide},{int(rng.integers(-3, 3))},"
+                         f"{(i // 3) % 2},{'0a' if i % 10 else '0A'},{'XXXX' if i % 701 == 5 else f'{(i // 3) * 7 & 0xFFFF:04X}'}")
+            if i == 100:
+                lines.append("")      # blank line inside the body
+            if i == 200:
+                lines.append(",,,,,,,,")  # a row of empty cells
+        return "\n".join(lines) + "\n"
+
+    def test_vectorized_csv_matches_row_by_row_reader(self):
+        from tests.reference import reference_load_csv
+        cases = [FIXTURE_CSV, self.write("gen.csv", self.generated_csv()),
+                 self.write("crlf.csv", self.generated_csv(500), newline="\r\n"),
+                 self.write("quoted.csv", 'Sample in Buffer,"q[3:0]"\nRadix - UNSIGNED,HEX\n0,"1"\n1,"2"\n2,2\n'),
+                 self.write("no_eol.csv", "a,b[1:0]\nRadix - HEX,HEX\n1,0\n0,3"),
+                 self.write("single.csv", "a\nRadix - HEX\n0\n1\n1\n\n0\n")]
+        for path in cases:
+            with self.subTest(path=path.name):
+                actual, expected = load_csv(path), reference_load_csv(path)
+                self.addCleanup(actual.close)
+                self.addCleanup(expected.close)
+                self.assertSameCapture(actual, expected)
+
+    def test_parallel_csv_merges_chunks_like_one_process(self):
+        from ila_viewer import data
+        from ila_viewer.cpu import WorkerPool
+        path = self.write("parallel.csv", self.generated_csv(20000))
+        pool = WorkerPool(3)
+        self.addCleanup(pool.shutdown)
+        with patch.object(data, "MIN_PARALLEL_CHUNK", 64 << 10):
+            self.assertEqual(pool.workers_for(path.stat().st_size, data.MIN_PARALLEL_CHUNK), 3)
+            actual = load_csv(path, pool=pool)
+        self.addCleanup(actual.close)
+        expected = load_csv(path)
+        self.addCleanup(expected.close)
+        self.assertSameCapture(actual, expected)
+        self.assertFalse(list(Path(actual.storage.name).glob("part*")))
+        bad = self.write("bad.csv", self.generated_csv(20000).replace("\n15000,", "\n15000,1,"))
+        with patch.object(data, "MIN_PARALLEL_CHUNK", 64 << 10):
+            with self.assertRaisesRegex(ValueError, r"Строка 15005: ожидалось 9 столбцов"):
+                load_csv(bad, pool=pool)
+        with self.assertRaisesRegex(ValueError, r"Строка 15005: ожидалось 9 столбцов"):
+            load_csv(bad)
+
+    def test_csv_errors_keep_physical_line_numbers(self):
+        path = self.write("bad.csv", "a[3:0],b\nRadix - HEX,HEX\n1,0\n\n12,1\n")
+        with self.assertRaisesRegex(ValueError, r"Строка 5, a\[3:0\]: значение 12 выходит за ширину 4 бит"):
+            load_csv(path)
+
+    def test_cpu_recommendation_uses_physical_cores(self):
+        from ila_viewer.cpu import CpuTopology, WorkerPool
+        topology = CpuTopology(physical=16, logical=32, name="AMD Ryzen 9 9950X3D")
+        self.assertEqual(topology.recommended_workers(), 15)
+        self.assertEqual(topology.recommended_workers(available=8), 7)
+        self.assertEqual(CpuTopology(2, 4).recommended_workers(), 1)
+        self.assertIn("16 ядер / 32 потоков", topology.describe())
+        pool = WorkerPool(15)
+        self.assertEqual(pool.workers_for(10 << 20, 16 << 20), 1)   # small files stay in-process
+        self.assertEqual(pool.workers_for(100 << 20, 16 << 20), 7)
+        self.assertEqual(pool.workers_for(1 << 30, 16 << 20), 15)
+
+    def condition_capture(self):
+        text = self.generated_csv(1500)
+        cap = load_csv(self.write("cond.csv", text))
+        self.addCleanup(cap.close)
+        return cap
+
+    EXPRESSIONS = ("data == 41", "data != 82", "data > 41", "41 < data", "data >= hC3",
+                   "data[7:4] == 4", "data[0] && bit", "!bit || data == 0", "wide > 1",
+                   "s < 0", "s == hFF", "s == d-2", "s[7] == 1", "bit != prev(bit)",
+                   "prev(data) == data", "data == prev(data) && !(s >= 1)", "x == 0A", "(data == 41) == 1",
+                   "data == wide", "data < s", "TRIGGER", "bit == true", "data != prev(wide)")
+
+    def test_vector_condition_matches_scalar_condition(self):
+        cap = self.condition_capture()
+        radix = {"s[7:0]": "SIGNED"}
+        compiler = ConditionCompiler(cap.signals, radix)
+        at = np.arange(cap.count, dtype=np.int64)
+        previous = at - 1
+        for expression in self.EXPRESSIONS:
+            with self.subTest(expression=expression):
+                condition = compiler.compile(expression)
+                expected = [condition.matches(i, i - 1 if i else None) for i in range(cap.count)]
+                self.assertEqual(condition.evaluate(at, previous).tolist(), expected)
+
+    def test_vector_highlights_match_per_point_builders(self):
+        from tests.reference import reference_advanced, reference_highlight
+        from ila_viewer.sampling import PeriodicSampling
+        cap = self.condition_capture()
+        compiler = ConditionCompiler(cap.signals)
+        bit = next(s for s in cap.signals if s.name == "bit")
+        grids = [PeriodicSampling(1), PeriodicSampling(3, 2), EdgeSampling(bit, "rising"),
+                 EdgeSampling(bit, "both", before_edge=False), EdgeSampling(bit, "falling")]
+        for grid in grids:
+            for a, b in ((0, cap.count - 1), (cap.count - 1, 5), (400, 401), (700, 700)):
+                for expression in ("data == 41", "bit != prev(bit)", "data > 41 && !bit"):
+                    with self.subTest(grid=grid.describe(), a=a, b=b, expression=expression):
+                        condition = compiler.compile(expression)
+                        result = HighlightService().build(cap, condition, a, b, grid)
+                        self.addCleanup(result.close)
+                        self.assertEqual([result.interval(i) for i in range(result.count)],
+                                         reference_highlight(cap, condition, a, b, grid))
+                pattern = compiler.compile_pattern("data == 41 -> data != 41 -> bit")
+                with self.subTest(grid=grid.describe(), a=a, b=b, pattern=True):
+                    result = AdvancedHighlightService().build(cap, pattern, 0, cap.count - 1, grid)
+                    self.addCleanup(result.close)
+                    self.assertEqual([result.interval(i) for i in range(result.count)],
+                                     reference_advanced(cap, pattern, 0, cap.count - 1, grid))
+
+    def test_point_chunks_match_points_across_chunk_borders(self):
+        from ila_viewer import sampling
+        from ila_viewer.sampling import PeriodicSampling
+        cap = self.condition_capture()
+        bit = next(s for s in cap.signals if s.name == "bit")
+        with patch.object(sampling, "CHUNK_POINTS", 7), patch.object(EdgeSampling, "CHUNK", 5):
+            for grid in (PeriodicSampling(2, 1), EdgeSampling(bit), EdgeSampling(bit, "both", False)):
+                for lower, upper in ((0, cap.count), (13, 600), (601, 602)):
+                    with self.subTest(grid=grid.describe(), lower=lower, upper=upper):
+                        expected = [tuple(-1 if v is None else v for v in point)
+                                    for point in grid.points(lower, upper, cap.count)]
+                        chunks = list(grid.point_chunks(lower, upper, cap.count))
+                        actual = [tuple(map(int, row)) for chunk in chunks for row in zip(*chunk)]
+                        self.assertEqual(actual, expected)
+
+
 class SpiDecoderTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -676,6 +833,40 @@ class SpiDecoderTests(unittest.TestCase):
             self.assertTrue(np.array_equal(codes, sig.codes))
         lane = result.lanes[0]
         self.assertTrue(np.all(lane["start"][1:] >= lane["end"][:-1]))  # ordered, not overlapping
+
+    def test_spi_query_finds_commands_addresses_and_byte_sequences(self):
+        from ila_viewer.spi import SpiQuery
+        cap = self.capture(FLASH_FRAMES)
+        result = self.decode(cap)
+        frames = lambda text: SpiQuery.parse(text).frames(result).tolist()
+        self.assertEqual(frames("cmd EB"), [1])
+        self.assertEqual(frames("cmd 0x03"), [2])
+        self.assertEqual(frames("@1000"), [2])
+        self.assertEqual(frames("@1000-123456"), [1, 2])
+        self.assertEqual(frames("DE AD BE"), [1])
+        self.assertEqual(frames("deadbeef"), [1])          # one token, split into bytes
+        self.assertEqual(frames("12 34 56 DE"), [1])       # address bytes, then data
+        self.assertEqual(frames("EB 12"), [1])             # command, then the first address byte
+        self.assertEqual(frames("data 12"), [])            # 12 is an address byte here
+        self.assertEqual(frames("EF 03"), [])              # never across two transactions
+        self.assertEqual(frames("AD DE"), [])
+        self.assertEqual(SpiQuery.parse("@1000-FFF").values, (0xFFF, 0x1000))
+        for bad in ("", "cmd", "zz", "@1-2-3"):
+            with self.assertRaises(ValueError, msg=bad):
+                SpiQuery.parse(bad)
+        track = DecodedTrack(result, 0, "SPI")
+        data = result.frame_data(1)
+        query = SpiQuery.parse("AD")
+        self.assertEqual(track.search(query, 0, 1), (int(data[1]["start"]), False))
+        self.assertEqual(track.search(query, int(data[1]["start"]), 1), (int(data[1]["start"]), True))
+        self.assertIsNone(track.search(query, int(data[1]["start"]), 1, wrap=False))
+        self.assertEqual(track.search(query, cap.count, -1), (int(data[1]["start"]), False))
+        # Chunk borders: a sequence that spans two chunks is still found once.
+        lane = result.lanes[0]
+        expected = SpiQuery.parse("DE AD BE EF").field_matches(lane).tolist()
+        self.assertEqual(SpiQuery.parse("DE AD BE EF").field_matches(lane, chunk=2).tolist(), expected)
+        self.assertEqual(SpiQuery.parse("AD").field_matches(lane, chunk=1).tolist(),
+                         SpiQuery.parse("AD").field_matches(lane).tolist())
 
     def test_manual_dummy_and_fixed_formats_are_used_exactly(self):
         cap = self.capture([[((0,), [0xEB]), (QUAD, [0x00, 0x01, 0x00]), ("dummy", 6), (QUAD, [0x42, 0x43])]])
@@ -855,7 +1046,7 @@ class InteractionTests(unittest.TestCase):
         cls.app.setFont(QFont("Segoe UI", 10))
 
     def setUp(self):
-        self.window = MainWindow(preferences_store=PreferencesStore())
+        self.window = MainWindow(preferences_store=PreferencesStore(), cpu=TEST_CPU)
         self.window.resize(1280, 900)
         self.window.show()
         self.window.loaded(load_csv(FIXTURE_CSV))
@@ -1122,7 +1313,7 @@ class InteractionTests(unittest.TestCase):
             w.close()
             content = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(set(content), set(ViewerPreferences.__dataclass_fields__))
-            other = MainWindow(preferences_store=PreferencesStore(path))
+            other = MainWindow(preferences_store=PreferencesStore(path), cpu=TEST_CPU)
             try:
                 self.assertIsNone(other.capture)
                 self.assertEqual(other.view.rows, [])
@@ -1136,6 +1327,32 @@ class InteractionTests(unittest.TestCase):
                 other.close()
             # setUp cleanup may close the window again after TemporaryDirectory exits.
             w.preferences_store = PreferencesStore()
+
+    def test_worker_processes_follow_cpu_and_preference(self):
+        from ila_viewer.settings_dialog import AppearanceDialog
+        from ila_viewer.cpu import available_cpus
+        w = self.window
+        self.assertEqual(w.worker_pool.workers, TEST_CPU.recommended_workers(available_cpus()))
+        self.assertEqual(w.preferences.cpu_signature, TEST_CPU.signature)
+        self.assertIsNotNone(w.worker_hint)
+        self.assertIn("16 ядер / 32 потоков", w.worker_hint[0].text())
+        dialog = AppearanceDialog(w.preferences, w.themes, w, cpu=TEST_CPU)
+        dialog.show_tab("performance")
+        self.assertEqual(dialog.workers_box.value(), 0)
+        self.assertTrue(dialog.workers_box.specialValueText().startswith("Авто"))
+        dialog.workers_box.setValue(4)
+        w.apply_preferences(dialog.result_preferences())
+        self.assertEqual((w.preferences.worker_count, w.worker_pool.workers), (4, 4))
+        dialog.restore_defaults()
+        self.assertEqual(dialog.workers_box.value(), 0)
+        dialog.deleteLater()
+        # The same CPU on the next start shows no hint.
+        again = MainWindow(preferences_store=PreferencesStore(), cpu=TEST_CPU)
+        again.preferences.cpu_signature = TEST_CPU.signature
+        again.worker_hint = None
+        again.suggest_workers()
+        self.assertIsNone(again.worker_hint)
+        again.close()
 
     def test_theme_specific_bus_bit_colors_and_fill_preferences(self):
         w, v = self.window, self.window.view
@@ -1785,6 +2002,33 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual((v.cursor_a, v.cursor_b), (int(fields[0]["start"]), int(fields[-1]["end"])))
         panel.filter_box.setCurrentIndex(panel.filter_box.findData(0x02))
         self.assertEqual(panel.model.rowCount(), 1)
+        panel.filter_box.setCurrentIndex(0)
+        # Search: the panel keeps matching transactions, F3 on the decoder row jumps to bytes.
+        panel.search_edit.setText("@1000")
+        QTest.keyClick(panel.search_edit, Qt.Key.Key_Return)
+        self.assertEqual(panel.model.rowCount(), 1)
+        self.assertEqual(panel.model.frame_index(0), 2)
+        self.assertIn("адрес 1000", panel.summary.text())
+        panel.search_edit.setText("BE EF")
+        QTest.keyClick(panel.search_edit, Qt.Key.Key_Return)
+        self.assertEqual([panel.model.frame_index(i) for i in range(panel.model.rowCount())], [1])
+        panel.search_edit.setText("q")
+        QTest.keyClick(panel.search_edit, Qt.Key.Key_Return)
+        self.assertIn("не HEX", panel.summary.text())
+        panel.search_edit.clear()
+        self.assertEqual(panel.model.rowCount(), 4)
+        v.selected = 0
+        v.selectionChanged.emit()
+        self.assertTrue(w.search_edit.placeholderText().startswith("SPI"))
+        v.set_cursor(0)
+        w.search_edit.setText("22")
+        w.find_value(1)
+        self.wait()
+        self.assertEqual(v.cursor_a, int(result.frame_data(2)[1]["start"]))
+        w.search_edit.setText("cmd 77")
+        w.find_value(1)
+        self.wait()
+        self.assertIn("не найдено", w.statusBar().currentMessage())
         # The context menu offers the transaction under the mouse.
         v.selected = 0
         v.context_sample = int(fields[0]["start"])

@@ -34,6 +34,8 @@ from .sampling import PeriodicSampling
 from .timebase import parse_clock
 from .bookmarks_ui import BookmarkController
 from .measurements import EdgeMeasurementService, MeasurementFormatter
+from .spi import SpiQuery
+from .cpu import WorkerPool, available_cpus, detect as detect_cpu
 from .spi_ui import SpiController
 
 APP_NAME = "Waveform Reader"
@@ -48,12 +50,18 @@ SEARCH_HINTS = {
     "SIGNED_MAGNITUDE": ("DEC: -5", "Signed Magnitude: -5"),
     "REAL": ("REAL: 1.5", "Real: 1.5"),
 }
+SPI_SEARCH_HINT = ("SPI: 9F, @1000", "\n".join((
+    "Поиск по декодированной строке SPI, значения в HEX:",
+    "9F EF 40 — байты подряд в одной транзакции (команда, адрес, данные)",
+    "cmd 9F — команда · @1000 или @1000-1FFF — адрес · data 01 02 — только данные",
+    "Enter / F3 — следующее совпадение, Shift+F3 — предыдущее")))
 SEARCH_TOOLTIP = "\n".join(("Точное значение целой шины. Без префикса — в формате выбранного сигнала.",
                             "{hint}", "Enter / F3 — следующее совпадение, Shift+F3 — предыдущее"))
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, source=None, themes=None, source_navigator=None, menus=None, preferences_store=None, clipboard=None):
+    def __init__(self, source=None, themes=None, source_navigator=None, menus=None, preferences_store=None, clipboard=None,
+                 cpu=None):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
@@ -66,8 +74,12 @@ class MainWindow(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(300)
         self.save_timer.timeout.connect(self.save_preferences)
+        # Detected once; tests inject a CpuTopology. The pool starts its processes on first use.
+        self.cpu = cpu or detect_cpu()
+        self.worker_hint = None
+        self.worker_pool = WorkerPool(self.worker_count(self.preferences))
         self.source = source or AutoCaptureSource(wlf=WlfCaptureSource(
-            converter=QuestaWlfConverter(self.preferences.wlf2vcd_path or None)))
+            converter=QuestaWlfConverter(self.preferences.wlf2vcd_path or None)), pool=self.worker_pool)
         self.themes = themes or ThemeManager()
         self.themes.select(self.preferences.theme if self.preferences.theme in self.themes.themes else next(iter(self.themes.themes)))
         self.bit_expansion = BitExpansionService()
@@ -196,6 +208,37 @@ class MainWindow(QMainWindow):
             self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         if self.preferences_store.error:
             self.statusBar().showMessage("Не удалось прочитать настройки; используются значения по умолчанию.", 8000)
+        else:
+            self.suggest_workers()
+
+    def worker_count(self, preferences):
+        return preferences.worker_count or self.cpu.recommended_workers(available_cpus())
+
+    def suggest_workers(self):
+        """First start or a new CPU: a non-modal hint with a button to the performance tab."""
+        if self.preferences.cpu_signature == self.cpu.signature:
+            return
+        self.preferences.cpu_signature = self.cpu.signature
+        self.save_timer.start()
+        if self.preferences.worker_count:
+            return
+        button = QPushButton("Настроить…")
+        button.setFlat(True)
+        label = QLabel(f"{self.cpu.describe()} · процессов обработки: {self.worker_pool.workers}")
+        label.setProperty("role", "muted")
+
+        def dismiss():
+            if self.worker_hint is None:
+                return
+            for widget in self.worker_hint:
+                self.statusBar().removeWidget(widget)
+                widget.deleteLater()
+            self.worker_hint = None
+        button.clicked.connect(lambda: (dismiss(), self.show_appearance("performance")))
+        self.statusBar().addWidget(label)
+        self.statusBar().addWidget(button)
+        self.worker_hint = (label, button)
+        QTimer.singleShot(30000, self, dismiss)
 
     def add_action(self, container, text, callback, shortcut=None, tooltip=None):
         action = QAction(text, self)
@@ -589,13 +632,16 @@ class MainWindow(QMainWindow):
         self.preferences.value_width = self.view.value_width
         self.save_timer.start()
 
-    def show_appearance(self):
-        dialog = AppearanceDialog(self.preferences, self.themes, self)
+    def show_appearance(self, tab=None):
+        dialog = AppearanceDialog(self.preferences, self.themes, self, cpu=self.cpu)
+        if tab:
+            dialog.show_tab(tab)
         if dialog.exec():
             self.apply_preferences(dialog.result_preferences())
 
     def apply_preferences(self, preferences):
         self.preferences = preferences
+        self.worker_pool.set_workers(self.worker_count(preferences))
         if isinstance(self.source, AutoCaptureSource):
             converter = self.source.readers[".wlf"].converter
             if isinstance(converter, QuestaWlfConverter):
@@ -809,6 +855,12 @@ class MainWindow(QMainWindow):
 
     def update_selection(self):
         sig = self.view.current_signal
+        node = self.view.current_node
+        if node is not None and node.kind == "decoded":
+            self.search_edit.setPlaceholderText(SPI_SEARCH_HINT[0])
+            self.search_edit.setToolTip(SPI_SEARCH_HINT[1])
+            self.update_status()
+            return
         effective = FORMATS.effective(self.view.display_radix(), sig.radix) if sig else "HEX"
         placeholder, examples = SEARCH_HINTS.get(effective, ("Значение", ""))
         self.search_edit.setPlaceholderText(placeholder)
@@ -842,6 +894,9 @@ class MainWindow(QMainWindow):
         self.readout.setText("   |   ".join(parts))
 
     def find_value(self, direction):
+        node = self.view.current_node
+        if node is not None and node.kind == "decoded":
+            return self.find_decoded(node, direction)
         sig = self.view.current_signal
         if not sig or self.worker:
             return
@@ -856,6 +911,26 @@ class MainWindow(QMainWindow):
         self.start_work(lambda task: sig.search(value, sample, direction, task.isInterruptionRequested,
                                                 wrap),
                         self.found, f"Поиск в {sig.short_name}…")
+
+    def find_decoded(self, node, direction):
+        """Search a decoder row: command, address or a byte sequence (see SpiQuery)."""
+        if self.worker:
+            return
+        try:
+            query = SpiQuery.parse(self.search_edit.text())
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Поиск: {exc}", 7000)
+            self.search_edit.setFocus()
+            return
+        track, sample, wrap = node.track, self.view.cursor_a, self.loop_search.isChecked()
+
+        def done(result):
+            if result is None:
+                self.statusBar().showMessage(f"{query.describe()}: не найдено в строке {node.label}.", 6000)
+                return
+            self.found(result)
+        self.start_work(lambda task: track.search(query, sample, direction, task.isInterruptionRequested, wrap),
+                        done, f"Поиск в {node.label}…")
 
     def found(self, result):
         if result is None:
@@ -1029,6 +1104,7 @@ Ctrl+Shift+C — копировать байты между A и B (без B —
         self.save_preferences()
         self.highlights.reset()
         self.spi.dispose()
+        self.worker_pool.shutdown()
         if self.capture:
             self.view.capture = None
             self.view.auto_scroll.stop()

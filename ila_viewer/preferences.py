@@ -37,6 +37,8 @@ class ViewerPreferences:
     sample_period_ns: float = 0.0
     clock_edge: str = "rising"
     clock_before_edge: bool = True
+    worker_count: int = 0          # 0 = auto (physical cores - 1), else a fixed number of processes
+    cpu_signature: str = ""        # CPU the worker suggestion was last shown for
 
 
 class PreferencesStore:
@@ -92,6 +94,7 @@ class PreferencesStore:
             result.global_radix = "HEX"
         if not 0 <= result.sample_period_ns <= 1e12:
             result.sample_period_ns = 0.0
+        result.worker_count = max(0, min(1024, result.worker_count))
         if result.clock_edge not in {"rising", "falling", "both"}:
             result.clock_edge = "rising"
         if result.copy_separator not in {"space", "comma", "text", "tab", "newline"}:

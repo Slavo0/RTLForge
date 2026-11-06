@@ -204,21 +204,25 @@ class CopyValuesService:
                 chunks = every_sample()
             else:
                 def sampled():
-                    previous_candidate = None
-                    previous_value = None
-                    points = grid.points(request.start, request.end + 1, request.capture_count, cancel)
-                    for offset, (sample, _, _, at, previous) in enumerate(points):
-                        if offset % 4096 == 0 and cancel():
+                    previous_code = None
+                    for chunk in grid.point_chunks(request.start, request.end + 1, request.capture_count, cancel):
+                        if cancel():
                             raise LoadCancelled()
-                        if sample == request.exclude_sample:
+                        keep = chunk.sample != (-1 if request.exclude_sample is None else request.exclude_sample)
+                        if request.condition is not None:
+                            keep &= request.condition.evaluate(chunk.at, chunk.previous_at)
+                        samples = chunk.sample[keep]
+                        if not len(samples):
                             continue
-                        if request.condition is not None and not request.condition.matches(at, previous):
-                            continue
-                        code = int(source.codes[source.run_index(at)])
-                        if request.samples == "changes" and previous_candidate is not None and code == previous_value:
-                            continue
-                        previous_candidate, previous_value = sample, code
-                        yield sample, code
+                        runs = np.searchsorted(source.starts, chunk.at[keep], side="right") - 1
+                        codes = np.asarray(source.codes[np.maximum(runs, 0)], dtype=np.int64)
+                        if request.samples == "changes":
+                            fresh = np.empty(len(codes), dtype=bool)
+                            fresh[0] = previous_code is None or codes[0] != previous_code
+                            fresh[1:] = codes[1:] != codes[:-1]
+                            previous_code = int(codes[-1])
+                            samples, codes = samples[fresh], codes[fresh]
+                        yield from zip(samples.tolist(), codes.tolist())
                 chunks = sampled()
             for index, (sample, code) in enumerate(chunks):
                 if cancel():

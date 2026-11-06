@@ -7,6 +7,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                               QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                               QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+from .cpu import CpuTopology, available_cpus
 from .formats import FORMATS
 from .preferences import ViewerPreferences
 from .timebase import parse_clock
@@ -27,8 +28,9 @@ def _note(text):
 class AppearanceDialog(QDialog):
     """Tabs follow the user's mental model: general → signals → highlights → sources."""
 
-    def __init__(self, preferences, themes, parent=None):
+    def __init__(self, preferences, themes, parent=None, cpu=None):
         super().__init__(parent)
+        self.cpu = cpu or CpuTopology(1, 1)
         self.preferences = preferences
         self.themes = themes
         self.signal_colors = {key: dict(colors) for key, colors in preferences.signal_colors.items()}
@@ -42,6 +44,7 @@ class AppearanceDialog(QDialog):
         self.tabs.addTab(self._signals_page(), "Сигналы")
         self.tabs.addTab(self._highlight_page(), "Подсветка")
         self.tabs.addTab(self._sources_page(), "Источники")
+        self.tabs.addTab(self._performance_page(), "Производительность")
         layout.addWidget(self.tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
                                    | QDialogButtonBox.StandardButton.RestoreDefaults)
@@ -173,6 +176,27 @@ class AppearanceDialog(QDialog):
                           "Для .wlf укажите wlf2vcd.exe из установленного Questa/ModelSim."))
         return page
 
+    TABS = ("general", "signals", "highlights", "sources", "performance")
+
+    def show_tab(self, key):
+        self.tabs.setCurrentIndex(self.TABS.index(key))
+
+    def _performance_page(self):
+        page = QWidget()
+        form = QFormLayout(page)
+        recommended = self.cpu.recommended_workers(available_cpus())
+        self.workers_box = QSpinBox()
+        self.workers_box.setRange(0, max(1, self.cpu.logical))
+        self.workers_box.setSpecialValueText(f"Авто — {recommended}")
+        self.workers_box.setValue(min(self.preferences.worker_count, self.workers_box.maximum()))
+        self.workers_box.setToolTip("Большие CSV читаются частями в отдельных процессах. "
+                                    "1 — всё в одном процессе.")
+        form.addRow("Процессов обработки", self.workers_box)
+        cpu = QLabel(self.cpu.describe())
+        cpu.setProperty("role", "muted")
+        form.addRow("", cpu)
+        return page
+
     def result_preferences(self):
         return replace(self.preferences, theme=self.theme_box.currentData(),
                        global_radix=self.radix_box.currentData(), fill_high=self.fill_box.isChecked(),
@@ -184,7 +208,8 @@ class AppearanceDialog(QDialog):
                        full_names=self.names_box.isChecked(),
                        reverse_bit_rows=self.reverse_rows_box.isChecked(),
                        sample_period_ns=self.sample_period_ns(),
-                       wlf2vcd_path=self.wlf_converter_edit.text().strip())
+                       wlf2vcd_path=self.wlf_converter_edit.text().strip(),
+                       worker_count=self.workers_box.value())
 
     @staticmethod
     def _format_period(period_ns):
@@ -230,8 +255,10 @@ class AppearanceDialog(QDialog):
             for index, box in enumerate(self.highlight_opacity_boxes):
                 box.setValue(opacities[index % len(opacities)])
             self.refresh_highlight_colors()
-        else:
+        elif page == 3:
             self.wlf_converter_edit.clear()
+        else:
+            self.workers_box.setValue(defaults.worker_count)
 
     def choose_wlf_converter(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выбрать wlf2vcd", self.wlf_converter_edit.text(),

@@ -19,6 +19,9 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
 from ila_viewer.data import LoadCancelled, load_csv, parse_value
 from ila_viewer.window import MainWindow
+from ila_viewer.cpu import CpuTopology
+
+TEST_CPU = CpuTopology(physical=16, logical=32, name="Test CPU")
 from ila_viewer.themes import STYLE
 from ila_viewer.preferences import PreferencesStore
 from ila_viewer.sources import AutoCaptureSource, WlfCaptureSource, QuestaWlfConverter, WlfExportService
@@ -279,7 +282,7 @@ class GuiTests(unittest.TestCase):
         cls.app.setStyleSheet(STYLE)
 
     def setUp(self):
-        self.window = MainWindow(preferences_store=PreferencesStore())
+        self.window = MainWindow(preferences_store=PreferencesStore(), cpu=TEST_CPU)
         self.window.resize(1200, 720)
         self.window.show()
         self.window.loaded(load_csv(FIXTURE_CSV))

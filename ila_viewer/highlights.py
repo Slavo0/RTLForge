@@ -4,9 +4,7 @@
 """Capture-scoped, disk-backed intervals for conditional waveform highlighting."""
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import struct
 import tempfile
 from uuid import uuid4
 
@@ -148,6 +146,53 @@ class HighlightModel(QObject):
         self.changed.emit()
 
 
+class IntervalWriter:
+    """Merge sorted-by-start intervals into a disk-backed ``HighlightIntervals`` file.
+
+    An interval that starts at or before the end of the pending one extends it, so the
+    file holds disjoint spans; touching spans of neighbouring chunks are joined too.
+    """
+
+    def __init__(self, folder, prefix):
+        self.stream = tempfile.NamedTemporaryFile(dir=folder, prefix=prefix, suffix=".bin", delete=False)
+        self.path = Path(self.stream.name)
+        self.count = 0
+        self.pending = None
+
+    def add(self, starts, ends):
+        starts = np.asarray(starts, dtype=np.int64)
+        ends = np.asarray(ends, dtype=np.int64)
+        if not len(starts):
+            return
+        if self.pending is not None:
+            starts = np.concatenate(([self.pending[0]], starts))
+            ends = np.concatenate(([self.pending[1]], ends))
+        reach = np.maximum.accumulate(ends)
+        opens = np.empty(len(starts), dtype=bool)
+        opens[0] = True
+        opens[1:] = starts[1:] > reach[:-1]
+        first = np.flatnonzero(opens)
+        merged = np.column_stack((starts[first], np.maximum.reduceat(ends, first)))
+        merged[:-1].astype("<i8").tofile(self.stream)
+        self.count += len(merged) - 1
+        self.pending = int(merged[-1, 0]), int(merged[-1, 1])
+
+    def finish(self):
+        if self.pending is not None:
+            np.asarray([self.pending], dtype="<i8").tofile(self.stream)
+            self.count += 1
+            self.pending = None
+        self.stream.close()
+        if not self.count:
+            self.path.unlink(missing_ok=True)
+            return HighlightIntervals()
+        return HighlightIntervals(self.path, self.count)
+
+    def discard(self):
+        self.stream.close()
+        self.path.unlink(missing_ok=True)
+
+
 class HighlightService:
     """Evaluate one condition at each period phase without touching CSV samples."""
 
@@ -156,42 +201,27 @@ class HighlightService:
         """``period`` is a SamplingGrid, or a sample count combined with ``phase``."""
         sampling = as_sampling(period, phase)
         lower, upper = sorted((marker_a, marker_b))
-        path = None
-        count = 0
-        pending = None
+        # Paint the span the sampled values describe, clipped to A…B.
+        low = lower + (marker_b == lower)
+        high = min(capture.count, upper + (marker_b != upper))
+        writer = IntervalWriter(capture.storage.name, "highlight_")
         try:
-            with tempfile.NamedTemporaryFile(dir=capture.storage.name, prefix="highlight_", suffix=".bin", delete=False) as stream:
-                path = Path(stream.name)
-                points = sampling.points(lower, upper + 1, capture.count, cancel)
-                for index, point in enumerate(points):
-                    sample = point.sample
-                    if index % 4096 == 0:
-                        if cancel():
-                            raise LoadCancelled()
-                        progress(round(100 * (sample - lower) / max(1, upper - lower)), index)
-                    if sample == marker_b or (condition is not None and not condition.matches(point.at, point.previous_at)):
-                        continue
-                    # Paint the span the sampled values describe, clipped to A…B.
-                    start = max(point.start, lower + (marker_b == lower))
-                    end = min(point.end, capture.count, upper + (marker_b != upper))
-                    if end <= start:
-                        continue
-                    if pending and start <= pending[1]:
-                        pending = pending[0], max(pending[1], end)
-                    else:
-                        if pending:
-                            stream.write(struct.pack("<qq", *pending))
-                            count += 1
-                        pending = start, end
-                if pending:
-                    stream.write(struct.pack("<qq", *pending))
-                    count += 1
-            progress(100, count)
-            if not count:
-                path.unlink(missing_ok=True)
-                return HighlightIntervals()
-            return HighlightIntervals(path, count)
+            points = 0
+            for chunk in sampling.point_chunks(lower, upper + 1, capture.count, cancel):
+                if cancel():
+                    raise LoadCancelled()
+                keep = chunk.sample != marker_b
+                if condition is not None:
+                    keep &= condition.evaluate(chunk.at, chunk.previous_at)
+                start = np.maximum(chunk.start, low)
+                end = np.minimum(chunk.end, high)
+                keep &= end > start
+                writer.add(start[keep], end[keep])
+                points += len(chunk.sample)
+                progress(round(100 * (int(chunk.sample[-1]) - lower) / max(1, upper - lower)), points)
+            result = writer.finish()
+            progress(100, result.count)
+            return result
         except BaseException:
-            if path:
-                path.unlink(missing_ok=True)
+            writer.discard()
             raise

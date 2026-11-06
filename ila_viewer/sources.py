@@ -22,8 +22,11 @@ class CaptureSource(ABC):
 
 
 class VivadoCsvSource(CaptureSource):
+    def __init__(self, pool=None):
+        self.pool = pool  # a WorkerPool; large files are split over its processes
+
     def load(self, location, progress=lambda p, n: None, cancel=lambda: False):
-        return load_csv(location, progress, cancel)
+        return load_csv(location, progress, cancel, pool=self.pool)
 
 
 class VcdCaptureSource(CaptureSource):
@@ -132,8 +135,8 @@ class WlfExportService:
 
 
 class AutoCaptureSource(CaptureSource):
-    def __init__(self, csv=None, vcd=None, wlf=None):
-        self.readers = {".csv": csv or VivadoCsvSource(), ".vcd": vcd or VcdCaptureSource(),
+    def __init__(self, csv=None, vcd=None, wlf=None, pool=None):
+        self.readers = {".csv": csv or VivadoCsvSource(pool), ".vcd": vcd or VcdCaptureSource(),
                         ".wlf": wlf or WlfCaptureSource()}
 
     def load(self, location, progress=lambda p, n: None, cancel=lambda: False):

@@ -37,6 +37,18 @@ class GridPoint(NamedTuple):
     previous_at: int | None
 
 
+class GridChunk(NamedTuple):
+    """Consecutive grid points as int64 arrays; ``previous_at`` is -1 where there is none."""
+    sample: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+    at: np.ndarray
+    previous_at: np.ndarray
+
+
+CHUNK_POINTS = 262144
+
+
 def clock_score(signal):
     """Higher means a more likely clock; 0 means the name does not look like a clock."""
     name = signal.short_name.casefold()
@@ -60,6 +72,17 @@ class SamplingGrid(ABC):
     def points(self, lower, upper, count, cancel=lambda: False):
         """Yield grid points whose start lies in [lower, upper)."""
 
+    def point_chunks(self, lower, upper, count, cancel=lambda: False):
+        """``points`` as arrays, so callers can evaluate conditions with numpy."""
+        batch = []
+        for point in self.points(lower, upper, count, cancel):
+            batch.append(point)
+            if len(batch) == CHUNK_POINTS:
+                yield _chunk(batch)
+                batch = []
+        if batch:
+            yield _chunk(batch)
+
     @abstractmethod
     def describe(self) -> str: ...
 
@@ -81,6 +104,17 @@ class PeriodicSampling(SamplingGrid):
                 raise LoadCancelled()
             yield GridPoint(sample, sample, sample + period, sample,
                             sample - period if sample >= period else None)
+
+    def point_chunks(self, lower, upper, count, cancel=lambda: False):
+        period = self.period
+        first = lower + ((self.phase - lower) % period)
+        step = CHUNK_POINTS * period
+        for a in range(first, upper, step):
+            if cancel():
+                raise LoadCancelled()
+            sample = np.arange(a, min(upper, a + step), period, dtype=np.int64)
+            previous = np.where(sample >= period, sample - period, -1)
+            yield GridChunk(sample, sample, sample + period, sample, previous)
 
     def describe(self):
         return f"период {self.period:,} отсч."
@@ -199,6 +233,44 @@ class EdgeSampling(SamplingGrid):
         if current is not None:
             yield self._point(current, previous, count, span)
 
+    def point_chunks(self, lower, upper, count, cancel=lambda: False):
+        """Vectorized ``points``: each edge needs the previous and the next edge."""
+        typical = self.typical_interval()
+        span = max(1, int(round(typical))) if typical else 0
+        before = self._edge_before(lower, cancel)
+        carry = np.empty(0, dtype=np.int64)  # the last edge, whose next edge is not known yet
+        previous = -1 if before is None else before
+        for chunk in self.edges(lower, count, cancel):
+            edges = np.concatenate((carry, np.asarray(chunk, dtype=np.int64)))
+            beyond = int(np.searchsorted(edges, upper, side="left"))
+            if beyond < len(edges):
+                if beyond:
+                    yield self._chunk(edges[:beyond], previous, edges[1:beyond + 1], span)
+                return
+            if len(edges) > 1:
+                yield self._chunk(edges[:-1], previous, edges[1:], span)
+                previous = int(edges[-2])
+            carry = edges[-1:]
+        if len(carry):
+            yield self._chunk(carry, previous, np.array([count], dtype=np.int64), span)
+
+    def _chunk(self, edges, previous, following, span):
+        prior = np.empty(len(edges), dtype=np.int64)
+        prior[0] = previous
+        prior[1:] = edges[:-1]
+        has_prior = prior >= 0
+        shift = 1 if self.before_edge else 0
+        at = np.where(edges > 0, edges - shift, edges)
+        previous_at = np.where(has_prior, np.where(prior > 0, prior - shift, prior), -1)
+        if self.before_edge:
+            start = np.where(has_prior, prior, 0)
+            if span:
+                start = np.maximum(start, edges - span)
+            start = np.maximum(0, np.minimum(start, edges - 1))
+            return GridChunk(edges, start, edges.copy(), at, previous_at)
+        end = np.minimum(following, edges + span) if span else following.copy()
+        return GridChunk(edges, edges.copy(), np.maximum(edges + 1, end), at, previous_at)
+
     def _at(self, edge):
         return edge - 1 if self.before_edge and edge > 0 else edge
 
@@ -224,6 +296,12 @@ class EdgeSampling(SamplingGrid):
 
     def __hash__(self):
         return hash((id(self.signal), self.edge, self.before_edge))
+
+
+def _chunk(points):
+    columns = list(zip(*points))
+    previous = [-1 if value is None else value for value in columns[4]]
+    return GridChunk(*(np.asarray(column, dtype=np.int64) for column in (*columns[:4], previous)))
 
 
 def as_sampling(period, phase=0):

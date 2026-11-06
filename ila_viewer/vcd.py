@@ -120,19 +120,21 @@ class VcdCaptureReader:
                     in_comment = False
                     widths = [signal.width for signal in signals]
                     lines = (line for line in ([first_change] if first_change else []) if line)
+                    lookup = by_id.get
                     for line_number, line in enumerate(chain(lines, stream), 1):
                         if line_number % 16384 == 0 and cancel():
                             raise LoadCancelled()
                         line = line.strip()
+                        if not line:
+                            continue
                         if in_comment:
                             in_comment = not re.search(r"\$end(?=\s|$)", line)
                             continue
-                        if line.startswith("$comment"):
-                            in_comment = not re.search(r"\$end(?=\s|$)", line)
-                            continue
-                        if not line or line.startswith("$"):
-                            continue
-                        if line.startswith("#"):
+                        first = line[0]
+                        # Dispatch on the first character: scalar changes are the bulk of a dump.
+                        if first in "01xXzZ":
+                            symbol, value = line[1:].strip(), first.lower()
+                        elif first == "#":
                             timestamp = int(line[1:].strip())
                             if timestamp < 0 or timestamp > 2**63 - 1:
                                 raise ValueError("Временная отметка VCD вне диапазона int64.")
@@ -141,13 +143,18 @@ class VcdCaptureReader:
                             current_time = timestamp
                             started = True
                             continue
-                        if not started:
-                            started = True
-                        parsed = self._change(line)
-                        if parsed is None:
+                        elif first == "$":
+                            if line.startswith("$comment"):
+                                in_comment = not re.search(r"\$end(?=\s|$)", line)
                             continue
-                        symbol, value = parsed
-                        for index in by_id.get(symbol, ()):
+                        else:
+                            started = True
+                            parsed = self._change(line)
+                            if parsed is None:
+                                continue
+                            symbol, value = parsed
+                        started = True
+                        for index in lookup(symbol, ()):
                             # VCD left-extends short vectors with 0, or with a leading x/z.
                             if len(value) < widths[index] and value[0] in "xz":
                                 changes[index] = value.rjust(widths[index], value[0])
