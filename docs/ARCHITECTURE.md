@@ -9,7 +9,7 @@
 | Модуль | Ответственность и основные классы |
 |---|---|
 | `ila_viewer/__main__.py` | Тонкая точка запуска пакета |
-| `ila_viewer/application.py` | `WaveformApplication`: создание приложения и внедрение фабрики окна |
+| `ila_viewer/application.py` | `WaveformApplication`: создание приложения и внедрение фабрики окна; `install_translations` (Qt `qtbase_ru`) |
 | `ila_viewer/window.py` | `MainWindow`: сборка интерфейса и меню (Файл, Вид, Навигация, Анализ, Настройки, Справка), связывание событий, жизненный цикл захвата. Редакторы копирования и подсветки получают сигналы из дерева представления (`condition_nodes`), поэтому разрезанные биты VCD видны только внутри своей шины |
 | `ila_viewer/sources.py` | `CaptureSource`, выбор CSV/VCD/WLF и адаптер штатного `wlf2vcd`; `SourceNavigator`: переход к HDL |
 | `ila_viewer/data.py` | `Capture`, `SignalData`, потоковый CSV-парсер и дисковые индексы |
@@ -31,7 +31,9 @@
 | `ila_viewer/copying.py` | `CopyValuesService`, `CopyRequest`, `CopyChannel`: сборка выбранных битов, снимок настроек, отменяемый экспорт; `SystemClipboard`: запись в Qt clipboard |
 | `ila_viewer/conditions.py` | Безопасный разбор условий Copy Values и разрешение коротких/полных имён сигналов |
 | `ila_viewer/copy_dialog.py` | `CopyConditionDialog`: редактор условия с выбором сигнала и сохранением позиции курсора |
-| `ila_viewer/period_dialog.py` | `CopyPeriodBanner`: немодальная панель настройки периода по двум точкам диаграммы |
+| `ila_viewer/period_dialog.py` | `CopyPeriodBanner`: немодальная панель такта выборки — сигнал такта или маркеры 1/2 |
+| `ila_viewer/widgets.py` | `SegmentedChoice` (сегментный выбор с API как у `QComboBox`), `keycap`, `muted`, `plain_container` |
+| `ila_viewer/assets/` | SVG-галочки для флажков (тёмная и светлая), подставляются в QSS темы |
 | `ila_viewer/refresh.py` | Снимок оформления сигналов и правил подсветки для сверки после повторной загрузки CSV |
 | `ila_viewer/highlights.py` | `HighlightService`, `HighlightIntervals`, `HighlightModel`: фоновый поиск, дисковые интервалы и состояние групп текущего захвата |
 | `ila_viewer/bookmarks.py` | `Bookmark`, `BookmarkModel`: именованные маркеры текущего захвата, порядок, переход, ограничение длиной захвата |
@@ -99,6 +101,29 @@
 контролов; renderer использует роли темы вместо фиксированных цветов.
 Для более глубокого изменения диаграммы меняется `WaveformRenderer`,
 для формы значков — `RowIconPainter`, без изменения CSV-парсера и запуска.
+
+### UI conventions
+
+The target displays are Full HD and 4K (Windows scaling up to 200%); the app runs
+on Qt's Fusion style, so screenshots for review must use Fusion too.
+
+- The waveform carries the color: signal colors, markers A/B, X/Z and decoded
+  fields keep their meaning. The chrome around it uses the theme's neutral roles
+  plus one accent, `Theme.accent` (the theme's bus color): keyboard focus, checked
+  boxes and segments, progress, and buttons marked `primary`.
+- Only buttons with the dynamic property `primary=True` get the accent fill. The
+  `:default` state is not filled, because in dialogs it follows keyboard focus.
+- Toolbar buttons are flat (background on hover only) and grouped by separators:
+  file, zoom, navigation.
+- Hairlines use `grid`; the A…B band is `Theme.a_b_band()` (marker A at low alpha).
+- Labels and layout-only containers are transparent (`QWidget#plain`), so framed
+  panels such as the clock banner show one surface.
+- Two to four short, mutually exclusive options are a `SegmentedChoice`, not a combo
+  box. Gestures are keycaps. Settings that only matter for one mode live on that
+  mode's page or behind a toggle (IO2/IO3, the SPI command table), instead of
+  explaining them in text.
+- Dynamic properties used by the stylesheet: `primary`, `segment`/`first`/`last`,
+  `keycap`, `role` (`muted`, `readout`, `error`).
 
 ### Go to Source Code
 

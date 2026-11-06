@@ -37,6 +37,19 @@ from .measurements import EdgeMeasurementService, MeasurementFormatter
 from .spi_ui import SpiController
 
 APP_NAME = "Waveform Reader"
+# Value search: a short placeholder in the field, the full syntax in its tooltip.
+SEARCH_HINTS = {
+    "HEX": ("HEX: 0AC", "HEX: 0AC, 100; или 0xAC / 0b1010"),
+    "BINARY": ("BIN: 1010", "Binary: 1010; или 0xA"),
+    "OCTAL": ("OCT: 254", "Octal: 254; или 0o254"),
+    "ASCII": ("ASCII: AB", "ASCII: AB; пробелы в кавычках; \\x00 — байт 00"),
+    "UNSIGNED": ("DEC: 172", "Unsigned Decimal: 172"),
+    "SIGNED": ("DEC: -1", "Signed Decimal: -1"),
+    "SIGNED_MAGNITUDE": ("DEC: -5", "Signed Magnitude: -5"),
+    "REAL": ("REAL: 1.5", "Real: 1.5"),
+}
+SEARCH_TOOLTIP = "\n".join(("Точное значение целой шины. Без префикса — в формате выбранного сигнала.",
+                            "{hint}", "Enter / F3 — следующее совпадение, Shift+F3 — предыдущее"))
 
 
 class MainWindow(QMainWindow):
@@ -103,7 +116,12 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Навигация", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        self.open_action = self.add_action(toolbar, "Открыть захват", self.choose_file, "Ctrl+O")
+        self.open_action = self.add_action(toolbar, "Открыть захват", self.choose_file, "Ctrl+O",
+                                           tooltip="Ctrl+O — открыть CSV, VCD или WLF")
+        # File commands stay together: reopening from disk sits next to opening.
+        self.refresh_action = self.add_action(toolbar, "Обновить файл", self.refresh_csv, "F5",
+                                              tooltip="F5 — повторно открыть текущий захват с диска")
+        self.refresh_action.setEnabled(False)
         toolbar.addSeparator()
         self.zoom_in_action = self.add_action(toolbar, "+", lambda: self.view.zoom_toolbar(0.5), tooltip="Приблизить относительно середины A↔B")
         self.zoom_out_action = self.add_action(toolbar, "−", lambda: self.view.zoom_toolbar(2), tooltip="Отдалить относительно середины A↔B")
@@ -117,12 +135,6 @@ class MainWindow(QMainWindow):
         self.trigger_action = self.add_action(toolbar, "Триггер", self.goto_trigger,
                                               tooltip="Перейти к первому TRIGGER = 1")
         self.trigger_action.setVisible(False)
-        toolbar_spacer = QWidget()
-        toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(toolbar_spacer)
-        self.refresh_action = self.add_action(toolbar, "Обновить файл", self.refresh_csv, "F5",
-                                              tooltip="F5 — повторно открыть текущий захват с диска")
-        self.refresh_action.setEnabled(False)
         self.build_menus()
 
         central = QWidget()
@@ -137,8 +149,8 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.filter_edit)
         self.search_edit = QLineEdit()
         self.search_edit.setFixedWidth(self.search_edit.fontMetrics().horizontalAdvance("0" * 13) + 12)
-        self.search_edit.setPlaceholderText("HEX: 0AC, 100; или 0xAC / 0b1010")
-        self.search_edit.setToolTip("Точное значение целой шины. Без префикса — в выбранном формате. Enter: следующее совпадение.")
+        self.search_edit.setPlaceholderText(SEARCH_HINTS["HEX"][0])
+        self.search_edit.setToolTip(SEARCH_TOOLTIP.format(hint=SEARCH_HINTS["HEX"][1]))
         self.search_edit.returnPressed.connect(lambda: self.find_value(1))
         search_row.addWidget(self.search_edit)
         # The find buttons sit right next to the value they search for.
@@ -798,11 +810,9 @@ class MainWindow(QMainWindow):
     def update_selection(self):
         sig = self.view.current_signal
         effective = FORMATS.effective(self.view.display_radix(), sig.radix) if sig else "HEX"
-        hints = {"HEX": "HEX: 0AC; или 0xAC / 0b1010", "BINARY": "Binary: 1010; или 0xA",
-                 "OCTAL": "Octal: 254; или 0o254", "ASCII": 'ASCII: AB; пробелы в кавычках; \\x00 — байт 00',
-                 "UNSIGNED": "Unsigned Decimal: 172", "SIGNED": "Signed Decimal: -1",
-                 "SIGNED_MAGNITUDE": "Signed Magnitude: -5", "REAL": "Real: 1.5"}
-        self.search_edit.setPlaceholderText(hints.get(effective, "Значение"))
+        placeholder, examples = SEARCH_HINTS.get(effective, ("Значение", ""))
+        self.search_edit.setPlaceholderText(placeholder)
+        self.search_edit.setToolTip(SEARCH_TOOLTIP.format(hint=examples))
         self.update_status()
 
     def update_status(self):

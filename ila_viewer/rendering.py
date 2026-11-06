@@ -334,7 +334,7 @@ class WaveformRenderer:
             painter.drawText(QRectF(x + 4, 0, spacing - 8, v.HEADER), Qt.AlignmentFlag.AlignVCenter, label)
         if not v.period_mode and v.cursor_b is not None:
             xa, xb = sorted((v.sample_x(v.cursor_a), v.sample_x(v.cursor_b)))
-            painter.fillRect(QRectF(xa, v.HEADER, xb - xa, h - v.HEADER), QColor(255, 204, 116, 12))
+            painter.fillRect(QRectF(xa, v.HEADER, xb - xa, h - v.HEADER), theme.a_b_band())
         if v.zoom_band:
             xa, xb = sorted(v.sample_x(s) for s in v.zoom_band)
             color = QColor(theme.bus)
