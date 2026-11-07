@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 
+from .files import atomic_write
 from .formats import FORMATS
 
 
@@ -113,6 +114,6 @@ class PreferencesStore:
         if self.path is None:
             return
         # Atomic replacement avoids a truncated settings file after interruption.
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(asdict(preferences), ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.path)
+        # A unique temporary per writer keeps two running viewers from sharing one file.
+        with atomic_write(self.path, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(preferences), ensure_ascii=False, indent=2))

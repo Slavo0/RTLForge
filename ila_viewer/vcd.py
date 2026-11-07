@@ -53,7 +53,8 @@ class SplitBusAssembler:
         if row == 0:
             for index, writer in enumerate(writers):
                 if index not in self.members:
-                    writer.append(0, changes.get(index, "x"))
+                    # An undumped vector is unknown in every bit, like a later explicit bx.
+                    writer.append(0, changes.get(index, "x" * writer.signal.width))
             for parent, members in self.members.items():
                 state = self.states[parent]
                 for offset, index in enumerate(members):

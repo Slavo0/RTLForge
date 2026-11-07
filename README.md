@@ -51,7 +51,7 @@
 Для работы с кодом:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions
+.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review tests.test_remediation
 .\.venv\Scripts\python.exe -m scripts.benchmark_waveform
 .\.venv\Scripts\python.exe -m scripts.benchmark_parallel
 ```
@@ -143,5 +143,5 @@ See [performance evidence and limits](docs/PERFORMANCE.md) for memory budgets,
 executor comparisons and reproducible benchmarks. Regression command:
 
 ```powershell
-.venv/Scripts/python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review
+.venv/Scripts/python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review tests.test_remediation
 ```

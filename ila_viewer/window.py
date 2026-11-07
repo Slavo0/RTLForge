@@ -29,7 +29,7 @@ from .period_dialog import CopyPeriodBanner
 from .highlights import HighlightGroup, HighlightModel, HighlightService
 from .advanced import AdvancedHighlightService
 from .highlights_ui import HighlightConditionDialog, HighlightPanel
-from .refresh import CaptureRefreshState, legacy_period
+from .refresh import CaptureRefreshState, legacy_period, resolved_radixes
 from .sampling import PeriodicSampling
 from .timebase import parse_clock
 from .bookmarks_ui import BookmarkController
@@ -520,7 +520,8 @@ class MainWindow(QMainWindow):
 
         def complete(intervals):
             new_group = HighlightGroup(name, expression, color, intervals, marker_a, marker_b,
-                                       period, phase, opacity=opacity, mode=highlight_mode)
+                                       period, phase, opacity=opacity, mode=highlight_mode,
+                                       radixes=resolved_radixes(compiler, condition))
             if group and group in self.highlights.groups:
                 self.highlights.replace(group, new_group)
             elif group:

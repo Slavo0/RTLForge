@@ -19,3 +19,5 @@ artifacts/
 Thumbs.db
 *.wlf
 *.vcd
+spi_iladata_FIRST.csv
+.gitignore

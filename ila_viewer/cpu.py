@@ -13,6 +13,7 @@ from __future__ import annotations
 import concurrent.futures
 from dataclasses import dataclass
 import math
+import threading
 import multiprocessing
 import os
 import platform
@@ -125,18 +126,51 @@ def available_cpus():
     return os.cpu_count()
 
 
-class WorkerPool:
-    """One shared, lazily created process pool; ``workers`` 1 means everything runs in-process."""
+# ProcessPoolExecutor on Windows accepts at most 61 workers (WaitForMultipleObjects limit).
+WINDOWS_MAX_WORKERS = 61
 
-    def __init__(self, workers=1):
-        self.workers = max(1, int(workers))
+
+def max_pool_workers(platform=None):
+    return WINDOWS_MAX_WORKERS if (platform or sys.platform) == "win32" else 1024
+
+
+class WorkerPool:
+    """One shared, lazily created process pool; ``workers`` 1 means everything runs in-process.
+
+    Resizing while work is outstanding is deferred until the pool is idle, so a settings
+    change never cancels the futures of an import or highlight build in progress.
+    """
+
+    def __init__(self, workers=1, limit=None):
+        self.limit = limit or max_pool_workers()
+        self.workers = self._clamp(workers)
         self._executor = None
+        self._pending = None
+        self._active = set()
+        self._lock = threading.Lock()
+
+    def _clamp(self, workers):
+        return max(1, min(self.limit, int(workers)))
+
+    @property
+    def busy(self):
+        with self._lock:
+            return bool(self._active)
 
     def set_workers(self, workers):
-        workers = max(1, int(workers))
-        if workers != self.workers:
-            self.shutdown()
-            self.workers = workers
+        workers = self._clamp(workers)
+        if workers == self.workers:
+            self._pending = None
+            return
+        if self.busy:
+            self._pending = workers
+            return
+        self._resize(workers)
+
+    def _resize(self, workers):
+        self._pending = None
+        self.shutdown()
+        self.workers = workers
 
     def workers_for(self, size, min_chunk):
         """At most one worker per ``min_chunk`` of work, so small inputs skip process startup."""
@@ -144,13 +178,25 @@ class WorkerPool:
             return 1
         return max(1, min(self.workers, math.ceil(size / min_chunk)))
 
+    def _finished(self, future):
+        with self._lock:
+            self._active.discard(future)
+
     def submit(self, function, *args):
+        if self._pending is not None and not self.busy:
+            self._resize(self._pending)
         if self._executor is None:
             self._executor = concurrent.futures.ProcessPoolExecutor(
                 max_workers=self.workers, mp_context=multiprocessing.get_context("spawn"))
-        return self._executor.submit(function, *args)
+        future = self._executor.submit(function, *args)
+        with self._lock:
+            self._active.add(future)
+        future.add_done_callback(self._finished)
+        return future
 
     def shutdown(self):
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
+        with self._lock:
+            self._active.clear()

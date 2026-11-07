@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDockWidget,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
@@ -25,6 +25,7 @@ from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, TRUNCATED, UN
                   UNKNOWN_COMMAND, BusWidths, CommandSpec, DecodedTrack, FixedFormat,
                   SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
                   SpiSettings, default_commands, guess_pins, line_options, overlays, rebind)
+from .data import LoadCancelled
 from .tree import DecodedNode
 from .widgets import SegmentedChoice, muted, plain_container
 
@@ -464,7 +465,8 @@ class SpiTransactionModel(QAbstractTableModel):
         for lane, kinds in ((0, DATA_KINDS - {MISO}), (1, {MISO})):
             if lane >= result.lane_count:
                 continue
-            fields = result.frame_data(index, kinds, (lane,))
+            # One extra field says whether to show "…"; a long frame is never read whole.
+            fields = result.frame_data(index, kinds, (lane,), limit=self.PREVIEW + 1)
             if not len(fields) and lane:
                 continue
             shown = fields[:self.PREVIEW]
@@ -530,8 +532,30 @@ class ExportOptions:
                                 layout=self.layout, header=self.header, **where)
 
 
+class _SearchThread(QThread):
+    """Frame indices matching a query, computed off the GUI thread; cancellable."""
+
+    def __init__(self, query, result, parent=None):
+        super().__init__(parent)
+        self.query, self.result_data, self.frames, self.error = query, result, None, None
+
+    def run(self):
+        try:
+            self.frames = self.query.frames(self.result_data, self.isInterruptionRequested)
+        except LoadCancelled:
+            self.frames = None
+        except Exception as exc:
+            self.error = str(exc)
+
+
 class SpiPanel(QDockWidget):
-    """Transaction list with filters, navigation and byte export; dockable and nonmodal."""
+    """Transaction list with filters, navigation and byte export; dockable and nonmodal.
+
+    Searches over a large decode run in a background thread; frame-level filters (command,
+    problems, data only) are a pass over the frame table and stay synchronous.
+    """
+
+    SYNC_FIELDS = 500_000
 
     def __init__(self, controller, parent=None):
         super().__init__("Транзакции SPI / QSPI", parent)
@@ -617,7 +641,15 @@ class SpiPanel(QDockWidget):
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
         return [self.model.frame_index(row) for row in rows]
 
+    def stop_search(self):
+        thread, self._search = getattr(self, "_search", None), None
+        if thread is not None:
+            thread.requestInterruption()
+            thread.wait()
+            thread.deleteLater()
+
     def set_result(self, result):
+        self.stop_search()
         self.filter_box.blockSignals(True)
         self.filter_box.clear()
         self.filter_box.addItem("Все транзакции", "all")
@@ -633,6 +665,7 @@ class SpiPanel(QDockWidget):
         self.apply_filter()
 
     def apply_filter(self):
+        self.stop_search()
         result = getattr(self, "result", None)
         if result is None:
             self.model.set_result(None)
@@ -655,10 +688,35 @@ class SpiPanel(QDockWidget):
             except ValueError as exc:
                 self.summary.setText(f"Поиск: {exc}")
                 return
-            matching = np.zeros(result.frame_count, dtype=bool)
-            matching[query.frames(result)] = True
-            mask &= matching
             found = f"«{query.describe()}» · "
+            if sum(len(lane) for lane in result.lanes) > self.SYNC_FIELDS:
+                self.summary.setText(f"Поиск «{query.describe()}»…")
+                thread = _SearchThread(query, result, self)
+                thread.finished.connect(lambda: self._search_done(thread, mask, found))
+                self._search = thread
+                thread.start()
+                return
+            mask &= self._matching(result, query.frames(result))
+        self._show_rows(result, mask, found)
+
+    @staticmethod
+    def _matching(result, frames):
+        matching = np.zeros(result.frame_count, dtype=bool)
+        matching[frames] = True
+        return matching
+
+    def _search_done(self, thread, mask, found):
+        if thread is not getattr(self, "_search", None):
+            return  # superseded or stopped
+        self._search = None
+        thread.deleteLater()
+        if thread.error:
+            self.summary.setText(f"Поиск: {thread.error}")
+        elif thread.frames is not None:
+            self._show_rows(self.result, mask & self._matching(self.result, thread.frames), found)
+
+    def _show_rows(self, result, mask, found):
+        frames = result.frames
         rows = np.flatnonzero(mask)
         self.model.set_result(result, rows)
         total = int(np.asarray(frames["data_bytes"]).sum()) if result.frame_count else 0
@@ -839,11 +897,11 @@ class SpiController(QObject):
 
     def _close_result(self):
         self.view.annotations.clear(self)
+        if self.panel is not None:
+            self.panel.set_result(None)  # stops a background search before the files close
         if self.result is not None:
             self.result.close()
             self.result = None
-        if self.panel is not None:
-            self.panel.set_result(None)
 
     def remove_node(self, node):
         if node in self.nodes and node.parent is not None:

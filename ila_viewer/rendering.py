@@ -260,12 +260,15 @@ class WaveformRenderer:
             x = v.sample_x(sample)
             self.line(painter, x, v.HEADER, x, h)
         if v.highlight_model and v.highlight_model.master_enabled:
+            edges = None  # pixel boundaries on the real time axis, computed once per frame
             for group in v.highlight_model.groups:
                 if not group.visible:
                     continue
                 color = QColor(group.color)
                 color.setAlpha(round(255 * group.opacity / 100))
-                for start, end in group.intervals.visible(v.left, v.left + v.span, v.plot_width):
+                if edges is None:
+                    edges = self.pixel_edges()
+                for start, end in group.intervals.visible(v.left, v.left + v.span, v.plot_width, edges):
                     x1, x2 = v.sample_x(start), v.sample_x(end)
                     painter.fillRect(QRectF(x1, v.HEADER, x2 - x1, h - v.HEADER), color)
         for row in range(first, last):
@@ -349,15 +352,8 @@ class WaveformRenderer:
             self.line(painter, xb, v.HEADER, xb, h)
         if not v.period_mode:
             self.draw_bookmarks(painter, w, h, QColor(theme.text), background)
-        for label, sample, color in (() if v.period_mode else (("A", v.cursor_a, QColor(theme.marker_a)), ("B", v.cursor_b, QColor(theme.marker_b)))):
-            if sample is not None and v.left <= sample <= v.left + v.span:
-                x = min(w - 1, v.sample_x(sample))
-                painter.setPen(QPen(color, 1.4))
-                self.line(painter, x, 0, x, h)
-                label_x = min(x + 1, w - 19)
-                painter.fillRect(QRectF(label_x, v.HEADER - 18, 18, 18), color)
-                painter.setPen(background)
-                painter.drawText(QRectF(label_x, v.HEADER - 18, 18, 18), Qt.AlignmentFlag.AlignCenter, label)
+        if not v.period_mode:
+            self.draw_cursors(painter, w, h, theme, background, split)
         for label, sample, color in (("1", v.period_markers[0], QColor(theme.marker_a)),
                                      ("2", v.period_markers[1], QColor(theme.marker_b))):
             if sample is not None and v.left <= sample <= v.left + v.span:
@@ -371,4 +367,47 @@ class WaveformRenderer:
         painter.setPen(grid)
         self.line(painter, v.name_width, 0, v.name_width, h)
         self.line(painter, split, 0, split, h)
+
+    LABEL = 18
+
+    def cursor_badges(self, w, split):
+        """(text, x, colors) badges for markers A/B, kept apart when the lines are close.
+
+        Coincident markers share one ``A/B`` badge in both colors; markers closer than a
+        badge put the earlier label left of its line and the later one right of it.
+        """
+        v = self.view
+        theme = v.themes.current
+        size = self.LABEL
+        shown = [(label, sample, QColor(color)) for label, sample, color in
+                 (("A", v.cursor_a, theme.marker_a), ("B", v.cursor_b, theme.marker_b))
+                 if sample is not None and v.left <= sample <= v.left + v.span]
+        placed = [(label, min(w - 1, v.sample_x(sample)), color) for label, sample, color in shown]
+        if len(placed) == 2 and abs(placed[0][1] - placed[1][1]) < size + 1:
+            (_, xa, ca), (_, xb, cb) = placed
+            if v.cursor_a == v.cursor_b or abs(xa - xb) < 1:
+                width = 2 * size + 4
+                return [("A/B", max(split, min(xa + 1, w - width)), width, (ca, cb))]
+            (first, x1, c1), (second, x2, c2) = sorted(placed, key=lambda item: item[1])
+            return [(first, max(split, x1 - size), size, (c1,)), (second, min(x2 + 1, w - size - 1), size, (c2,))]
+        return [(label, min(x + 1, w - size - 1), size, (color,)) for label, x, color in placed]
+
+    def draw_cursors(self, painter, w, h, theme, background, split):
+        v = self.view
+        lines = [(sample, QColor(color)) for sample, color in
+                 ((v.cursor_a, theme.marker_a), (v.cursor_b, theme.marker_b))
+                 if sample is not None and v.left <= sample <= v.left + v.span]
+        for index, (sample, color) in enumerate(lines):
+            x = min(w - 1, v.sample_x(sample))
+            # B is dashed over a coincident A, so both colors stay visible on one line.
+            dashed = index == 1 and abs(x - min(w - 1, v.sample_x(lines[0][0]))) < 1
+            painter.setPen(QPen(color, 1.4, Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine))
+            self.line(painter, x, 0, x, h)
+        top = v.HEADER - self.LABEL
+        for text, x, width, colors in self.cursor_badges(w, split):
+            part = width / len(colors)
+            for index, color in enumerate(colors):
+                painter.fillRect(QRectF(x + index * part, top, part, self.LABEL), color)
+            painter.setPen(background)
+            painter.drawText(QRectF(x, top, width, self.LABEL), Qt.AlignmentFlag.AlignCenter, text)
 

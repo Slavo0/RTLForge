@@ -12,6 +12,7 @@ import time
 
 from .data import load_csv
 from .data import LoadCancelled
+from .files import same_file
 from .vcd import VcdCaptureReader
 
 
@@ -125,6 +126,8 @@ class WlfExportService:
 
     def export(self, source, destination, cancel=lambda: False):
         destination = Path(destination).resolve()
+        if same_file(source, destination):
+            raise ValueError("Файл VCD не может заменить исходный WLF; выберите другое имя.")
         with tempfile.TemporaryDirectory(prefix="ila_wlf_export_", dir=destination.parent) as folder:
             temporary = Path(folder) / "capture.vcd"
             self.converter.convert(Path(source).resolve(), temporary, cancel)

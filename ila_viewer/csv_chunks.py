@@ -197,6 +197,9 @@ def parse_digits(cells, base):
     digits = _DIGIT[cells.view(np.uint8).reshape(len(cells), width)]
     present = digits != 254
     ok = present[:, 0] & ~((digits >= base) & present).any(axis=1)
+    if width > 1:
+        # Only trailing NULs are padding; an embedded NUL is data (the scalar parser rejects it).
+        ok &= ~(present[:, 1:] & ~present[:, :-1]).any(axis=1)
     if not ok.all():
         digits = np.where(ok[:, None], digits, 0)
         present &= ok[:, None]
@@ -321,6 +324,10 @@ class ColumnEncoder:
                 required = max(1, value.bit_length() + (1 if value < 0 or spec.radix == "SIGNED" else 0))
                 if spec.explicit and (value >= (1 << self.width) or value < -(1 << (self.width - 1))):
                     raise ValueError(f"значение {text} выходит за ширину {self.width} бит")
+                if spec.explicit and spec.radix == "SIGNED" and value >= (1 << (self.width - 1)):
+                    # A two's-complement pattern (255 in 8 bits): store it as the signed value
+                    # it displays as, so search and conditions compare the same number.
+                    value -= 1 << self.width
                 if not spec.explicit:
                     self.width = max(self.width, required)
             elif not spec.explicit:
@@ -445,6 +452,8 @@ def _decimal(cells):
     digits = matrix.astype(np.int64) - 48
     if ((digits < 0) | (digits > 9))[present].any() or not present[:, 0].all():
         return None
+    if width > 1 and (present[:, 1:] & ~present[:, :-1]).any():
+        return None  # embedded NUL: not padding, let the scalar path report the cell
     result = np.zeros(len(cells), dtype=np.int64)
     for column in range(width):
         here = present[:, column]

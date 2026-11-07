@@ -135,7 +135,12 @@ class EdgeSampling(SamplingGrid):
     EDGES = {"rising": "↑", "falling": "↓", "both": "↕"}
     CHUNK = 262144
 
-    def __init__(self, signal, edge="rising", before_edge=True):
+    def __init__(self, signal, edge="rising", before_edge=True, times=None):
+        """``times`` holds a simulator capture's per-row timestamps (None for ILA CSV).
+
+        VCD rows are value changes, not clock cycles: the distance between two rows depends
+        on unrelated activity, so periods and idle caps are measured in real time there.
+        """
         if signal.width != 1:
             raise ValueError("Тактовым может быть только однобитный сигнал")
         if edge not in self.EDGES:
@@ -143,7 +148,9 @@ class EdgeSampling(SamplingGrid):
         self.signal = signal
         self.edge = edge
         self.before_edge = before_edge
+        self.times = times
         self._typical = None
+        self._typical_ticks = None
 
     @property
     def name(self):
@@ -155,7 +162,7 @@ class EdgeSampling(SamplingGrid):
 
     def rebind(self, capture):
         signal = next((s for s in capture.signals if s.name == self.signal.name and s.width == 1), None)
-        return EdgeSampling(signal, self.edge, self.before_edge) if signal is not None else None
+        return EdgeSampling(signal, self.edge, self.before_edge, capture.times) if signal is not None else None
 
     def _levels(self):
         lut = np.full(max(1, len(self.signal.values)), -1, dtype=np.int8)
@@ -198,28 +205,57 @@ class EdgeSampling(SamplingGrid):
                 return int(chunk[0])
         return None
 
-    def typical_interval(self, limit=65536):
-        """Median distance between consecutive chosen edges, robust to idle gaps."""
+    def _first_edges(self, limit, cancel=lambda: False):
+        collected = []
+        total = 0
+        for chunk in self.edges(0, int(self.signal.starts[-1]) + 1 if len(self.signal.starts) else 0, cancel):
+            collected.append(np.asarray(chunk[:limit - total], dtype=np.int64))
+            total += len(collected[-1])
+            if total >= limit:
+                break
+        return np.concatenate(collected) if collected else np.empty(0, dtype=np.int64)
+
+    def typical_interval(self, limit=65536, cancel=lambda: False):
+        """Median distance in rows between consecutive chosen edges, robust to idle gaps."""
         if self._typical is None:
-            collected = []
-            total = 0
-            for chunk in self.edges(0, int(self.signal.starts[-1]) + 1 if len(self.signal.starts) else 0):
-                collected.append(chunk[:limit - total])
-                total += len(collected[-1])
-                if total >= limit:
-                    break
-            positions = np.concatenate(collected) if collected else np.empty(0, dtype=np.int64)
-            gaps = np.diff(positions)
+            gaps = np.diff(self._first_edges(limit, cancel))
             self._typical = float(np.median(gaps)) if len(gaps) else None
         return self._typical
+
+    def typical_ticks(self, limit=65536, cancel=lambda: False):
+        """Median time between consecutive chosen edges in capture ticks (simulator dumps only)."""
+        if self.times is None:
+            return None
+        if self._typical_ticks is None:
+            positions = self._first_edges(limit, cancel)
+            gaps = np.diff(np.asarray(self.times[positions], dtype=np.int64))
+            gaps = gaps[gaps > 0]
+            self._typical_ticks = int(np.median(gaps)) if len(gaps) else None
+        return self._typical_ticks
+
+    def _span_starts(self, edges, ticks):
+        """First row whose time lies within one typical period before each edge."""
+        times = np.asarray(self.times[edges], dtype=np.int64)
+        return np.searchsorted(self.times, times - ticks, side="left").astype(np.int64)
+
+    def _span_ends(self, edges, ticks):
+        """Exclusive row bound one typical period after each edge."""
+        times = np.asarray(self.times[edges], dtype=np.int64)
+        return np.searchsorted(self.times, times + ticks, side="left").astype(np.int64)
+
+    def _span(self):
+        """Idle cap: (rows, None) for CSV rows, (None, ticks) for timestamped captures."""
+        if self.times is not None:
+            return None, self.typical_ticks()
+        typical = self.typical_interval()
+        return (max(1, int(round(typical))) if typical else None), None
 
     def count_edges(self, cancel=lambda: False):
         return sum(len(chunk) for chunk in self.edges(0, int(self.signal.starts[-1]) + 1, cancel)) \
             if len(self.signal.starts) else 0
 
     def points(self, lower, upper, count, cancel=lambda: False):
-        typical = self.typical_interval()
-        span = max(1, int(round(typical))) if typical else None
+        span = self._span()
         previous = self._edge_before(lower, cancel)
         current = None
         for chunk in self.edges(lower, count, cancel):
@@ -235,8 +271,7 @@ class EdgeSampling(SamplingGrid):
 
     def point_chunks(self, lower, upper, count, cancel=lambda: False):
         """Vectorized ``points``: each edge needs the previous and the next edge."""
-        typical = self.typical_interval()
-        span = max(1, int(round(typical))) if typical else 0
+        span = self._span()
         before = self._edge_before(lower, cancel)
         carry = np.empty(0, dtype=np.int64)  # the last edge, whose next edge is not known yet
         previous = -1 if before is None else before
@@ -262,13 +297,21 @@ class EdgeSampling(SamplingGrid):
         shift = 1 if self.before_edge else 0
         at = np.where(edges > 0, edges - shift, edges)
         previous_at = np.where(has_prior, np.where(prior > 0, prior - shift, prior), -1)
+        rows, ticks = span
         if self.before_edge:
             start = np.where(has_prior, prior, 0)
-            if span:
-                start = np.maximum(start, edges - span)
+            if rows:
+                start = np.maximum(start, edges - rows)
+            elif ticks:
+                start = np.maximum(start, self._span_starts(edges, ticks))
             start = np.maximum(0, np.minimum(start, edges - 1))
             return GridChunk(edges, start, edges.copy(), at, previous_at)
-        end = np.minimum(following, edges + span) if span else following.copy()
+        if rows:
+            end = np.minimum(following, edges + rows)
+        elif ticks:
+            end = np.minimum(following, self._span_ends(edges, ticks))
+        else:
+            end = following.copy()
         return GridChunk(edges, edges.copy(), np.maximum(edges + 1, end), at, previous_at)
 
     def _at(self, edge):
@@ -282,12 +325,21 @@ class EdgeSampling(SamplingGrid):
         gap, so either span is capped at one typical clock period.
         """
         previous_at = self._at(previous_edge) if previous_edge is not None else None
+        rows, ticks = span
+        single = np.array([edge], dtype=np.int64)
         if self.before_edge:
             start = previous_edge if previous_edge is not None else 0
-            if span:
-                start = max(start, edge - span)
+            if rows:
+                start = max(start, edge - rows)
+            elif ticks:
+                start = max(start, int(self._span_starts(single, ticks)[0]))
             return GridPoint(edge, max(0, min(start, edge - 1)), edge, self._at(edge), previous_at)
-        end = min(next_edge, edge + span) if span else next_edge
+        if rows:
+            end = min(next_edge, edge + rows)
+        elif ticks:
+            end = min(next_edge, int(self._span_ends(single, ticks)[0]))
+        else:
+            end = next_edge
         return GridPoint(edge, edge, max(edge + 1, end), self._at(edge), previous_at)
 
     def __eq__(self, other):

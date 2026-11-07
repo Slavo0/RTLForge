@@ -227,6 +227,20 @@ cancel/join the worker, and only then release memory maps. Loading resumes the
 controller after installing the new capture. `MeasurementFormatter` uses exact
 simulator tick differences or the general CSV sample period.
 
+`EdgeSampling(times=capture.times)` measures simulator clocks in time: the typical
+period is the median timestamp difference of real edges (`typical_ticks`) and the
+gated-clock cap is one such period found with `searchsorted` on the timestamps.
+CSV rows keep the row-count cap. `period_dialog.edge_statistics` computes the banner
+readout once per (signal, edge); indices above `SYNC_RUNS` transitions are counted in
+a cancellable thread. `HighlightIntervals.visible(..., edges)` bins dense intervals by
+the renderer's pixel boundaries, so a VCD bin never spans an idle stretch.
+
+Writes that replace a user file (`.bin`, settings) go through `files.atomic_write`: a
+unique `mkstemp` sibling, `os.replace` on success, the old file kept on error.
+`SpiExportService.write_binary` rejects UNKNOWN bytes. `WlfExportService` refuses a
+destination that is the source file. Highlight groups store `radixes` (dependency →
+literal radix) at creation; refresh recompiles with those, not the current view radix.
+
 ## Zoom и копирование
 
 Ввод различает `zoom_pending`/`zoom` и перетаскивание маркера. Обычный щелчок
@@ -304,6 +318,8 @@ Compare backends by workload before changing the process policy; see [performanc
    закрывается при выходе и передаётся источникам через конструктор
    (`AutoCaptureSource(pool=...)`). Число процессов — общая настройка `worker_count`
    (0 — авто: `CpuTopology.recommended_workers`, физические ядра минус одно).
+   Пул ограничен 61 процессом на Windows (`max_pool_workers`); `set_workers` во время
+   работы откладывает пересоздание пула до простоя и не отменяет текущие задачи.
    `load_csv` делит файл на диапазоны по границам строк (`line_aligned_ranges`),
    не меньше `MIN_PARALLEL_CHUNK` на процесс. Фаза 1 (`parse_range`): каждый процесс
    пишет свои локальные серии в файлы папки захвата и возвращает только таблицы
@@ -378,7 +394,7 @@ SPI-декодер (≈12 тыс. кадров/с) и VCD пока работа�
 ## Проверки
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review
+.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review tests.test_remediation
 .\.venv\Scripts\python.exe -m scripts.benchmark_waveform
 ```
 

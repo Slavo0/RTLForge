@@ -78,7 +78,7 @@ The user requires object-oriented, extensible design for this application.
   (cpu.py, spawn). Worker modules (csv_chunks, data, cpu) stay Qt-free; worker count is
   the general preference worker_count (0 = physical cores - 1). Vectorized paths must
   equal the scalar references in tests/reference.py. Tests inject CpuTopology.
-- Run `python -m unittest -v tests.test_waveform tests.test_extensions tests.test_review` for relevant
+- Run `python -m unittest -v tests.test_waveform tests.test_extensions tests.test_review tests.test_remediation` for relevant
   behavioral changes. Use `python -m scripts.benchmark_waveform` for changes affecting large captures.
 - Keep README.md, docs/USER_GUIDE.md and docs/ARCHITECTURE.md aligned with actual capabilities.
 

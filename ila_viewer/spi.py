@@ -25,6 +25,7 @@ import numpy as np
 
 from .bits import BitCodec
 from .data import LoadCancelled
+from .files import atomic_write
 
 # Field kinds.
 CMD, ADDR, DUMMY, READ, WRITE, MOSI, MISO, DATA = range(8)
@@ -824,9 +825,25 @@ class SpiDecodeResult:
         first, count = int(frame["first"][lane]), int(frame["count"][lane])
         return self.lanes[lane][first:first + count]
 
-    def frame_data(self, index, kinds=DATA_KINDS, lanes=(0,)):
-        parts = [fields[np.isin(fields["kind"], list(kinds))] for lane in lanes
-                 for fields in (self.frame_fields(index, lane),)]
+    def frame_data(self, index, kinds=DATA_KINDS, lanes=(0,), limit=None):
+        """Fields of the given kinds; with ``limit``, at most that many, read in bounded steps."""
+        kind_list = list(kinds)
+        parts, total = [], 0
+        for lane in lanes:
+            fields = self.frame_fields(index, lane)
+            if limit is None:
+                parts.append(fields[np.isin(fields["kind"], kind_list)])
+                continue
+            step = max(64, 4 * limit)
+            for a in range(0, len(fields), step):
+                chunk = np.asarray(fields[a:a + step])
+                taken = chunk[np.isin(chunk["kind"], kind_list)][:limit - total]
+                parts.append(taken)
+                total += len(taken)
+                if total >= limit:
+                    break
+            if limit is not None and total >= limit:
+                break
         return np.concatenate(parts) if parts else np.empty(0, dtype=FIELD_DTYPE)
 
     def frame_at(self, sample):
@@ -1375,24 +1392,28 @@ class SpiExportService:
         return CopyResult("".join(parts), count)
 
     def write_binary(self, request, path, progress=lambda p, n: None, cancel=lambda: False):
-        """Complete data bytes in order; returns the number of bytes written."""
-        path = Path(path)
-        temporary = path.with_name(path.name + ".part")
+        """Complete data bytes in order; returns the number of bytes written.
+
+        An unknown (X/Z) bit has no binary representation, so the export stops at the
+        first such byte and the destination keeps its previous content.
+        """
         written = 0
-        try:
-            with temporary.open("wb") as stream:
-                for _, fields in self._chunks(replace(request, content="data" if request.content == "all"
+        with atomic_write(Path(path), "wb") as stream:
+            for frame, fields in self._chunks(replace(request, content="data" if request.content == "all"
                                                       else request.content), cancel):
-                    complete = fields[(fields["bits"] == 8) & ((fields["flags"] & PARTIAL) == 0)]
-                    stream.write(complete["value"].astype(np.uint8).tobytes())
-                    written += len(complete)
-                    progress(0, written)
+                complete = fields[(fields["bits"] == 8) & ((fields["flags"] & PARTIAL) == 0)]
+                unknown = np.flatnonzero(complete["flags"] & UNKNOWN)
+                if len(unknown):
+                    first = int(unknown[0])
+                    raise ValueError(
+                        f"Транзакция #{frame + 1}: байт {written + first} файла (отсчёт "
+                        f"{int(complete['start'][first])}) содержит неизвестные биты X/Z. "
+                        "Двоичный файл не записан; сохраните текст или сузьте диапазон.")
+                stream.write(complete["value"].astype(np.uint8).tobytes())
+                written += len(complete)
+                progress(0, written)
             if cancel():
                 raise LoadCancelled()
-            temporary.replace(path)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
         progress(100, written)
         return written
 

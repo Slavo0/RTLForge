@@ -237,7 +237,10 @@ class ConditionCompiler:
     def __init__(self, signals, radix_by_name=None):
         self.signals = list(signals)
         self.radix_by_name = radix_by_name or {}
-        self.by_full = {s.name.casefold(): s for s in self.signals}
+        self.by_name = {s.name: s for s in self.signals}
+        self.by_full = {}
+        for signal in self.signals:
+            self.by_full.setdefault(signal.name.casefold(), []).append(signal)
         self.by_exact = {}
         self.by_short = {}
         for signal in self.signals:
@@ -252,9 +255,26 @@ class ConditionCompiler:
     def token_for(self, signal):
         matches = self.choices_for(signal.short_name)
         simple = re.fullmatch(r"[A-Za-z_]\w*(?:\[\d+(?::\d+)?\])?", signal.short_name)
-        if simple and len(matches) == 1:
+        if simple and len(matches) == 1 and not self.looks_literal(signal.short_name):
             return signal.short_name
         return f"`{signal.name}`"
+
+    @staticmethod
+    def looks_literal(name):
+        """A bare name the parser would read as a number or keyword (b1, hFF, abc, true)."""
+        stem = re.sub(r"\[[^\]]*\]$", "", name)
+        return bool(_EXPLICIT.fullmatch(stem) or re.fullmatch(r"[\da-fA-F]+", stem)
+                    or stem.casefold() in {"true", "false", "prev"})
+
+    def full_name(self, name):
+        """Exact full name first; a case-insensitive match only when it is unique."""
+        if name in self.by_name:
+            return self.by_name[name]
+        choices = self.by_full.get(name.casefold(), [])
+        if len(choices) > 1:
+            raise ValueError(f"Имя `{name}` совпадает с несколькими сигналами без учёта регистра; "
+                             "укажите точный регистр")
+        return choices[0] if choices else None
 
     def choices_for(self, name):
         """Prefer an exact short name over suffix aliases from other signals."""
@@ -385,7 +405,7 @@ class ConditionCompiler:
             name = token
         if not quoted and _EXPLICIT.fullmatch(name):
             return ("literal", Literal(name))
-        signal = self.by_full.get(name.casefold()) if quoted else None
+        signal = self.full_name(name) if quoted else None
         lag = 0
         if not quoted:
             choices = self.choices_for(name)

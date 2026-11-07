@@ -3,12 +3,20 @@
 
 """Inline controls for choosing the sampling clock: markers 1/2 or a clock signal's edges.
 
-Layout: one row of choices (source, signal, edge, sampling moment, actions) and one
-readout row that shows what the choice gives. Gestures for markers are keycaps, not
-instructions; everything the user must decide is a visible control.
+Layout: the first row holds the source switch and the actions, so Apply stays on screen
+in a 1366 px window; the second holds what that source needs (signal, edge, sampling
+moment, or the marker gestures); the third is the readout. Gestures for markers are
+keycaps, not instructions; everything the user must decide is a visible control.
+
+Edge statistics scan the whole clock index once per (signal, edge) choice. Short indices
+are counted in place; long ones in a cancellable background thread, so typing a clock
+frequency only re-formats a cached result.
 """
 
-from PySide6.QtCore import Signal
+from dataclasses import dataclass
+
+import numpy as np
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QVBoxLayout)
 
@@ -18,6 +26,35 @@ from .timebase import format_seconds, group_digits, parse_clock
 from .widgets import SegmentedChoice, keycap, muted, plain_container
 
 
+@dataclass(frozen=True)
+class EdgeStatistics:
+    edges: int
+    typical_rows: float | None   # median distance between chosen edges, in rows
+    period_rows: float | None    # median rising-to-rising distance, in rows (ILA sample period)
+    period_seconds: float | None  # median rising-to-rising time (simulator dumps only)
+
+
+def edge_statistics(signal, edge, times, tick_seconds, cancel=lambda: False):
+    sampling = EdgeSampling(signal, edge, times=times)
+    rising = sampling if edge == "rising" else EdgeSampling(signal, "rising", times=times)
+    edges = sampling.count_edges(cancel)
+    ticks = rising.typical_ticks(cancel=cancel) if times is not None else None
+    return EdgeStatistics(edges, sampling.typical_interval(cancel=cancel), rising.typical_interval(cancel=cancel),
+                          ticks * tick_seconds if ticks else None)
+
+
+class _StatisticsThread(QThread):
+    def __init__(self, key, work, parent=None):
+        super().__init__(parent)
+        self.key, self.work, self.result = key, work, None
+
+    def run(self):
+        try:
+            self.result = self.work(self.isInterruptionRequested)
+        except Exception:  # LoadCancelled or a capture closed underneath
+            self.result = None
+
+
 class CopyPeriodBanner(QFrame):
     confirmed = Signal(int, int)        # period and phase from markers 1/2
     clockConfirmed = Signal(object)     # EdgeSampling on a clock signal
@@ -25,6 +62,7 @@ class CopyPeriodBanner(QFrame):
 
     MARKERS = "markers"
     SIGNAL = "signal"
+    SYNC_RUNS = 200_000  # clock indices up to this many transitions are counted in place
 
     def __init__(self, view, parent=None, signals=(), current=None, edge="rising",
                  before_edge=True, sample_period_ns=0.0):
@@ -35,6 +73,8 @@ class CopyPeriodBanner(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
+        self._statistics = {}
+        self._thread = None
         row = QHBoxLayout()
         row.setSpacing(8)
         self.headline = QLabel("Такт выборки")
@@ -58,7 +98,19 @@ class CopyPeriodBanner(QFrame):
             (self.MARKERS, "По маркерам 1–2", "Период — расстояние между точками 1 и 2 на диаграмме")])
         self.mode_box.setItemEnabled(0, has_clock)
         row.addWidget(self.mode_box)
-        row.addSpacing(12)
+        row.addStretch(1)
+        cancel_button = QPushButton("Отмена")
+        cancel_button.setAutoDefault(False)
+        cancel_button.clicked.connect(self.cancelled)
+        row.addWidget(cancel_button)
+        self.confirm_button = QPushButton("Применить")
+        self.confirm_button.setProperty("primary", True)
+        self.confirm_button.clicked.connect(self.confirm)
+        row.addWidget(self.confirm_button)
+        layout.addLayout(row)
+
+        details = QHBoxLayout()
+        details.setSpacing(8)
 
         # Clock-signal controls.
         self.signal_controls = plain_container()
@@ -78,7 +130,7 @@ class CopyPeriodBanner(QFrame):
                                 "меняются в тот же момент времени, поэтому «на фронте» значение уже новое."),
             (False, "на фронте", "Значения в момент фронта")], before_edge)
         signal_row.addWidget(self.timing_box)
-        row.addWidget(self.signal_controls)
+        details.addWidget(self.signal_controls)
 
         # Marker controls: the two gestures as keycaps.
         self.marker_controls = plain_container()
@@ -94,18 +146,9 @@ class CopyPeriodBanner(QFrame):
         marker_row.addWidget(muted("линии можно перетаскивать"))
         self.marker_controls.setToolTip("Точка 2 — конец полного периода, начиная от точки 1. "
                                         "Ctrl+колесо меняет масштаб.")
-        row.addWidget(self.marker_controls)
-
-        row.addStretch(1)
-        cancel_button = QPushButton("Отмена")
-        cancel_button.setAutoDefault(False)
-        cancel_button.clicked.connect(self.cancelled)
-        row.addWidget(cancel_button)
-        self.confirm_button = QPushButton("Применить")
-        self.confirm_button.setProperty("primary", True)
-        self.confirm_button.clicked.connect(self.confirm)
-        row.addWidget(self.confirm_button)
-        layout.addLayout(row)
+        details.addWidget(self.marker_controls)
+        details.addStretch(1)
+        layout.addLayout(details)
 
         # Readout: what the current choice gives, plus the optional clock frequency for CSV.
         readout = QHBoxLayout()
@@ -121,7 +164,7 @@ class CopyPeriodBanner(QFrame):
         self.clock_edit.setToolTip("Необязательно. Частота или период такта (100 MHz, 10 ns) задаёт шкалу "
                                    "времени CSV: длительность одного отсчёта ILA.")
         self.clock_edit.setFixedWidth(self.clock_edit.fontMetrics().horizontalAdvance("0" * 14) + 16)
-        self.clock_edit.textChanged.connect(self.update_status)
+        self.clock_edit.textChanged.connect(self.clock_text_changed)
         readout.addWidget(self.clock_edit)
         layout.addLayout(readout)
         self.has_time = view.capture is not None and view.capture.times is not None
@@ -161,7 +204,56 @@ class CopyPeriodBanner(QFrame):
         if self.uses_markers:
             return None
         return EdgeSampling(self.source_box.currentData(), self.edge_box.currentData(),
-                            self.timing_box.currentData())
+                            self.timing_box.currentData(), self._times())
+
+    def _times(self):
+        capture = self.view.capture
+        return capture.times if capture is not None else None
+
+    def _key(self):
+        signal = self.source_box.currentData()
+        return (signal.name, self.edge_box.currentData()) if not self.uses_markers else None
+
+    def statistics(self):
+        """Cached edge statistics of the current choice, or None while they are counted."""
+        key = self._key()
+        if key is None:
+            return None
+        if key in self._statistics:
+            return self._statistics[key]
+        signal, edge = self.source_box.currentData(), self.edge_box.currentData()
+        axis = self.view.time_axis()
+        tick_seconds = axis.tick_seconds if axis is not None and self._times() is not None else 0.0
+        work = lambda cancel: edge_statistics(signal, edge, self._times(), tick_seconds, cancel)
+        if len(signal.starts) <= self.SYNC_RUNS:
+            self._statistics[key] = work(lambda: False)
+            return self._statistics[key]
+        if self._thread is None or self._thread.key != key:
+            self._stop_thread()
+            self._thread = _StatisticsThread(key, work, self)
+            self._thread.finished.connect(self._statistics_ready)
+            self._thread.start()
+        return None
+
+    def _statistics_ready(self):
+        thread = self.sender()
+        if thread is not self._thread:
+            return
+        self._thread = None
+        if thread.result is not None:
+            self._statistics[thread.key] = thread.result
+        thread.deleteLater()
+        self.update_status()
+
+    def _stop_thread(self):
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.requestInterruption()
+            thread.wait()
+            thread.deleteLater()
+
+    def clock_text_changed(self, *_):
+        self.update_status()
 
     def source_changed(self, *_):
         markers = self.uses_markers
@@ -183,7 +275,11 @@ class CopyPeriodBanner(QFrame):
         """Put markers 1/2 on two visible clock edges so the choice can be checked by eye."""
         left = max(0, int(self.view.left))
         found = []
-        for chunk in sampling.edges(left, self.view.capture.count):
+        # Look a bounded number of transitions ahead, never to the end of a long capture.
+        first = int(np.searchsorted(sampling.signal.starts, left, side="left"))
+        stop = min(len(sampling.signal.starts), first + 2 * sampling.CHUNK)
+        upper = int(sampling.signal.starts[stop - 1]) + 1 if stop > first else left
+        for chunk in sampling.edges(left, upper):
             found.extend(int(edge) for edge in chunk[:2 - len(found)])
             if len(found) == 2:
                 break
@@ -196,8 +292,8 @@ class CopyPeriodBanner(QFrame):
         if self.uses_markers:
             first, second = self.view.period_markers
             return abs(second - first) if first is not None and second is not None else None
-        rising = EdgeSampling(self.source_box.currentData(), "rising")
-        return rising.typical_interval()
+        statistics = self.statistics()
+        return statistics.period_rows if statistics else None
 
     def sample_period_ns(self):
         """ILA sample period derived from the entered clock, None if not entered or not needed."""
@@ -235,25 +331,24 @@ class CopyPeriodBanner(QFrame):
                              not valid_clock)
             self.confirm_button.setEnabled(valid_clock)
             return
-        sampling = self._sampling
-        edges = sampling.count_edges() if sampling else 0
-        if not edges:
+        statistics = self.statistics()
+        if statistics is None:
+            self._set_status("Подсчёт фронтов…")
+            self.confirm_button.setEnabled(False)
+            return
+        if not statistics.edges:
             self._set_status("У этого сигнала нет выбранных фронтов", True)
             self.confirm_button.setEnabled(False)
             return
-        typical = sampling.typical_interval()
-        parts = [f"фронтов {edges:,}"]
-        if typical:
-            parts.append(f"шаг {group_digits(typical, 2)} отсч.")
+        parts = [f"фронтов {statistics.edges:,}"]
+        seconds = statistics.period_seconds
+        if seconds:
+            # Simulator rows are value changes, so only real timestamps give the period.
             axis = self.view.time_axis()
-            if axis is not None and self.view.capture.times is not None:
-                rising = EdgeSampling(sampling.signal, "rising").typical_interval()
-                start = self.view.period_markers[0] or 0
-                if rising:
-                    ticks = abs(axis.to_ticks(start + rising) - axis.to_ticks(start))
-                    seconds = ticks * axis.tick_seconds
-                    if seconds > 0:
-                        parts.append(f"T ≈ {format_seconds(seconds, axis.resolution)}  ·  f ≈ {format_frequency(1 / seconds)}")
+            parts.append(f"T ≈ {format_seconds(seconds, axis.resolution if axis else 1e-12)}  ·  "
+                         f"f ≈ {format_frequency(1 / seconds)}")
+        elif statistics.typical_rows:
+            parts.append(f"шаг {group_digits(statistics.typical_rows, 2)} отсч.")
         self._set_status("  ·  ".join(parts) + clock_note, not valid_clock)
         self.confirm_button.setEnabled(valid_clock)
 
@@ -268,6 +363,7 @@ class CopyPeriodBanner(QFrame):
             self.clockConfirmed.emit(self._sampling)
 
     def detach(self):
+        self._stop_thread()
         try:
             self.view.periodMarkerPlaced.disconnect(self.update_status)
         except RuntimeError:

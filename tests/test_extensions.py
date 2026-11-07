@@ -1826,6 +1826,26 @@ class InteractionTests(unittest.TestCase):
         banner.close()
         v.end_period_setup()
 
+    def test_clock_banner_fits_small_screens_and_caches_edge_statistics(self):
+        from ila_viewer.sampling import EdgeSampling
+        v = self.window.view
+        self.assertTrue(v.begin_period_setup())
+        signals = self.window.condition_signals()
+        banner = CopyPeriodBanner(v, self.window, signals=signals)
+        self.addCleanup(banner.close)
+        self.addCleanup(banner.detach)
+        self.assertLess(banner.minimumSizeHint().width(), 1366 - 40)
+        if banner.source_box.count() > 1:
+            banner.source_box.setCurrentIndex(1)
+            calls = []
+            original = EdgeSampling.count_edges
+            with patch.object(EdgeSampling, "count_edges",
+                              lambda self, cancel=lambda: False: calls.append(1) or original(self, cancel)):
+                banner.clock_edit.setText("100 MHz")
+                banner.clock_edit.setText("25 MHz")
+            self.assertEqual(calls, [])  # typing re-formats the cached statistics
+        v.end_period_setup()
+
     def test_copy_period_reselect_keeps_markers_expression_and_prior_period_on_cancel(self):
         w, v = self.window, self.window.view
         v.set_cursor(1)

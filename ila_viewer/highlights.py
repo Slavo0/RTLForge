@@ -3,7 +3,7 @@
 
 """Capture-scoped, disk-backed intervals for conditional waveform highlighting."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
 from uuid import uuid4
@@ -21,13 +21,21 @@ class HighlightIntervals:
         self.count = count
         self.data = np.memmap(self.path, dtype="<i8", mode="r", shape=(count, 2)) if count else np.empty((0, 2), dtype="<i8")
 
-    def visible(self, start, end, pixels=None):
+    def visible(self, start, end, pixels=None, edges=None):
+        """Intervals intersecting [start, end); merged per pixel when there are too many.
+
+        ``edges`` are the sample positions of the plot's pixel boundaries. Simulator
+        captures are drawn on their time axis, where equal row counts are not equal widths,
+        so binning must follow those boundaries rather than an even split of rows.
+        """
         if not self.count:
             return
         first = int(np.searchsorted(self.data[:, 1], start, side="right"))
         stop = int(np.searchsorted(self.data[:, 0], end, side="left"))
         if pixels and stop - first > pixels * 2:
-            edges = np.linspace(start, end, max(1, pixels) + 1)
+            if edges is None:
+                edges = np.linspace(start, end, max(1, pixels) + 1)
+            edges = np.asarray(edges, dtype=np.float64)
             indices = np.searchsorted(self.data[:, 1], edges[:-1], side="right")
             valid = indices < self.count
             active = np.zeros(len(indices), dtype=bool)
@@ -87,6 +95,13 @@ class HighlightGroup:
     id: str = ""
     opacity: int = 28
     mode: str = "simple"
+    # Resolved at creation: full signal names and the radix each literal was written in.
+    # A later radix change in the view must not reinterpret the saved expression.
+    radixes: dict = field(default_factory=dict)
+
+    @property
+    def dependencies(self):
+        return frozenset(self.radixes)
 
     def __post_init__(self):
         if not self.id:

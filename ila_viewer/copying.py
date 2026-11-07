@@ -85,7 +85,11 @@ class CopyValuesService:
                 raise ValueError(f"Неверный диапазон битов: {token}")
             first = int(match[1])
             last = int(match[2]) if match[2] is not None else first
-            selected.update(range(min(first, last), max(first, last) + 1))
+            low, high = min(first, last), max(first, last)
+            # Check endpoints first: a typo such as 0-1000000000 must not build a huge set.
+            if not labels or low < min(labels) or high > max(labels):
+                raise ValueError("Выбранный диапазон содержит биты вне шины")
+            selected.update(range(low, high + 1))
         if not selected <= available:
             raise ValueError("Выбранный диапазон содержит биты вне шины")
         positions = {label: len(labels) - index - 1 for index, label in enumerate(labels)}
