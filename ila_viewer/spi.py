@@ -914,6 +914,28 @@ class SpiDecodeResult:
             path.unlink(missing_ok=True)
 
 
+def decode_summary(result):
+    """Status text after decoding; hints at the protocol when most commands are unknown."""
+    frames = result.frames
+    count = result.frame_count
+    data = int(np.asarray(frames["data_bytes"]).sum()) if count else 0
+    flags = np.asarray(frames["flags"]) if count else np.empty(0, dtype=np.uint8)
+    resets = int(np.count_nonzero(flags & RESET_FRAME))
+    problems = int(np.count_nonzero(flags & ~np.uint8(RESET_FRAME)))
+    text = f"SPI: {count:,} транзакций, {data:,} байт данных"
+    if resets:
+        text += f", сбросов режима: {resets:,}"
+    if problems:
+        text += f", с замечаниями: {problems:,}"
+    unknown = int(np.count_nonzero(flags & UNKNOWN_COMMAND))
+    s = result.settings
+    if s.mode == "commands" and unknown and 2 * unknown > count - resets:
+        text += (f". Команд нет в таблице в {unknown:,} кадрах — проверьте протокол"
+                 + (" (QPI/DPI: команда тоже на 4/2 линиях; обычный QSPI 1-4-4 — Extended)"
+                    if s.protocol != "extended" else " и фронт SCK"))
+    return text
+
+
 def field_label(result, record, short=False):
     """Text drawn on the decoded row and shown in the Value column."""
     kind, value, flags, bits = int(record["kind"]), int(record["value"]), int(record["flags"]), int(record["bits"])
@@ -929,7 +951,8 @@ def field_label(result, record, short=False):
         text = f"{value:0{max(1, (bits + 3) // 4)}X}"
     if kind == CMD:
         spec = None if short or flags else result.settings.command(value)
-        name = spec.name if spec else ""
+        name = spec.name if spec else ("" if short or flags or result.settings.mode != "commands"
+                                       else "нет в таблице")
         return f"CMD {text}" + (f" {name}" if name else "")
     if kind == ADDR:
         return text if short else f"ADDR {text}"
@@ -1175,9 +1198,11 @@ def bubble_label(result, record, short=False):
         text = f"0x{value:X} ({bits} бит)" if not short else f"{value:X}/{bits}b"
     else:
         text = f"0x{value:0{digits}X}"
-    if kind == CMD and not short and not flags:
+    if kind == CMD and not flags and result.settings.mode == "commands":
         spec = result.settings.command(value)
-        return f"{spec.name} ({text})" if spec else text
+        if short:
+            return text if spec else text + " ?"
+        return f"{spec.name} ({text})" if spec else f"{text} нет в таблице"
     if kind == ADDR:
         return ("@" if short else "адрес ") + text
     return text

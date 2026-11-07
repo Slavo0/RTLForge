@@ -907,7 +907,7 @@ class SpiDecoderTests(unittest.TestCase):
         self.assertTrue(field_label(result, fields[1]).startswith("RD X"))
         unknown = self.decode(self.capture([[((0,), [0x77, 0x01])]]))
         self.assertTrue(int(unknown.frames[0]["flags"]) & UNKNOWN_COMMAND)
-        self.assertEqual(self.labels(unknown, 0), ["CMD 77", "MOSI 01"])
+        self.assertEqual(self.labels(unknown, 0), ["CMD 77 нет в таблице", "MOSI 01"])
 
     def test_export_stream_frames_range_binary_and_cancel_cleanup(self):
         cap = self.capture(FLASH_FRAMES)

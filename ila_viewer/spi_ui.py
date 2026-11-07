@@ -24,7 +24,8 @@ from .actions import ContextActionProvider
 from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, RESET_FRAME, TRUNCATED, UNKNOWN,
                   UNKNOWN_COMMAND, BusWidths, CommandSpec, DecodedTrack, FixedFormat,
                   SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
-                  SpiSettings, bus_lines, config_to_dict, data_buses, default_commands, guess_pins,
+                  SpiSettings, bus_lines, config_to_dict, data_buses, decode_summary, default_commands,
+                  guess_pins,
                   line_options, overlays, pins_from_dict, rebind, settings_from_dict)
 from .data import LoadCancelled
 from .tree import DecodedNode
@@ -240,9 +241,10 @@ class SpiDecoderDialog(QDialog):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(6)
         self.protocol_box = SegmentedChoice([
-            ("extended", "Extended 1-x-x", "Команда на 1 линии, адрес и данные — по формату команды"),
-            ("dual", "Dual 2-2-2", "Все фазы на 2 линиях"),
-            ("quad", "Quad 4-4-4", "Все фазы на 4 линиях")], settings.protocol)
+            ("extended", "Extended 1-x-x", "Команда на IO0, адрес и данные — по формату команды\n"
+                                              "(обычный SPI и QSPI 1-1-4, 1-4-4)"),
+            ("dual", "DPI 2-2-2", "Микросхема в режиме DPI: команда тоже на 2 линиях"),
+            ("quad", "QPI 4-4-4", "Микросхема в режиме QPI: команда тоже на 4 линиях")], settings.protocol)
         self.address_box = SegmentedChoice([(3, "3 байта"), (4, "4 байта", "Команды с 3-байтовым адресом тоже читают 4 байта")],
                                            settings.address_bytes)
         self.dummy_box = QSpinBox()
@@ -932,10 +934,7 @@ class SpiController(QObject):
         self.view.refresh_rows(self.nodes[0])
         self.show_panel()
         self.panel.set_result(result)
-        bytes_total = int(np.asarray(result.frames["data_bytes"]).sum()) if result.frame_count else 0
-        problems = int(np.count_nonzero(np.asarray(result.frames["flags"]))) if result.frame_count else 0
-        text = f"SPI: {result.frame_count:,} транзакций, {bytes_total:,} байт данных"
-        self.message.emit(text + (f", с замечаниями: {problems:,}" if problems else ""))
+        self.message.emit(decode_summary(result))
 
     def _detach_nodes(self):
         """Remove decoder rows from the tree; return where the first one was."""
@@ -1046,7 +1045,9 @@ class SpiController(QObject):
                 self.message.emit("Таких байтов нет.")
                 return
             self.clipboard.write(result.text)
-            self.message.emit(f"Скопировано {result.count:,} значений SPI ({what}).")
+            content = CONTENTS.get(request.content, request.content)
+            self.message.emit(f"Скопировано {result.count:,} значений SPI ({what}; {content}). "
+                              "Состав — в панели «Транзакции SPI / QSPI».")
         self.runner.start_work(lambda task: self.exporter.build(request, task.progress.emit, task.isInterruptionRequested),
                                complete, "Подготовка байтов SPI для буфера обмена…", "значений")
         return True

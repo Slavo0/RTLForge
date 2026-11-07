@@ -334,6 +334,19 @@ class SpiResetAndMemoryTests(unittest.TestCase):
         # A data byte FF after a real command is data, not a reset.
         self.assertEqual(int(self.decode(self.capture([byte_clocks(0x66) + [0xF] * 8])).frames["flags"][0]), 0)
 
+    def test_wrong_protocol_is_named_and_hinted(self):
+        from ila_viewer.spi import bubble_label, decode_summary, field_label
+        cap = self.flash_boot()
+        right = self.decode(cap)
+        self.assertEqual(decode_summary(right), "SPI: 6 транзакций, 4 байт данных, сбросов режима: 3")
+        quad = self.decode(cap, SpiSettings(protocol="quad"))
+        command = quad.frame_fields(3)[0]
+        self.assertEqual(bubble_label(quad, command), "0xEF нет в таблице")
+        self.assertEqual(bubble_label(quad, command, short=True), "0xEF ?")
+        self.assertEqual(field_label(quad, command), "CMD EF нет в таблице")
+        self.assertIn("проверьте протокол (QPI/DPI", decode_summary(quad))
+        self.assertEqual(bubble_label(right, right.frame_fields(3)[0]), "RESET ENABLE (0x66)")
+
     def test_dialog_choices_round_trip_and_pins_need_every_signal(self):
         cap = self.flash_boot()
         custom = (*default_commands()[:3], CommandSpec(0x77, "X", ("1-1-4", "", ""), 3, (6, 6, 6), "read"))
