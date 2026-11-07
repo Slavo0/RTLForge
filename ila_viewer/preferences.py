@@ -40,6 +40,7 @@ class ViewerPreferences:
     clock_before_edge: bool = True
     worker_count: int = 0          # 0 = auto (physical cores - 1), else a fixed number of processes
     cpu_signature: str = ""        # CPU the worker suggestion was last shown for
+    spi_decoder: dict = field(default_factory=dict)  # last SPI dialog choices, prefill only
 
 
 class PreferencesStore:

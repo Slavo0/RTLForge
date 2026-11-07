@@ -1,4 +1,5 @@
 """Regressions for the review of 8dbe201 (HANDOFF.md items 1-6)."""
+import json
 import tempfile
 import time
 import tracemalloc
@@ -17,7 +18,10 @@ from ila_viewer.preferences import PreferencesStore, ViewerPreferences
 from ila_viewer.refresh import CaptureRefreshState, resolved_radixes
 from ila_viewer.sampling import EdgeSampling
 from ila_viewer.sources import WlfExportService
-from ila_viewer.spi import DATA, FIELD_DTYPE, UNKNOWN, SpiExportRequest, SpiExportService
+from ila_viewer.spi import (DATA, FIELD_DTYPE, PARTIAL, RESET_FRAME, UNKNOWN, UNKNOWN_COMMAND, BusWidths,
+                            CommandSpec, FixedFormat, SpiDecoder, SpiDecoderConfig, SpiExportRequest,
+                            SpiExportService, SpiSettings, config_to_dict, default_commands, guess_pins,
+                            pins_from_dict, settings_from_dict)
 from ila_viewer.vcd import VcdCaptureReader
 
 
@@ -250,6 +254,140 @@ class RemediationTests(unittest.TestCase):
         self.assertLessEqual(first[1] + first[2], second[1])
         view.cursor_b = 50
         self.assertEqual([b[0] for b in renderer.cursor_badges(1000, 200)], ["A", "B"])
+
+
+def qspi_reset_csv(frames, idle=3):
+    """Mode-0 frames on ``dq_in[3:0]`` like a Vivado ILA: each frame is a list of DQ values per clock."""
+    rows = []
+    for values in frames:
+        rows += [(1, 0, 0xF)] * idle
+        for value in values:
+            rows += [(0, 0, value)] * 2 + [(0, 1, value)] * 2
+        rows += [(0, 0, 0xF)] * 2
+    rows += [(1, 0, 0xF)] * idle
+    body = "".join(f"{cs},{sck},{dq:X}\n" for cs, sck, dq in rows)
+    return "top/phy/cs_n_ff,top/phy/sck,top/phy/dq_in[3:0]\nRadix - HEX,HEX,HEX\n" + body
+
+
+def byte_clocks(byte, mask=0xE):
+    """One byte on IO0, other lines high as pull-ups leave them."""
+    return [mask | (byte >> bit & 1) for bit in range(7, -1, -1)]
+
+
+def nibbles(data):
+    return [n for byte in data for n in (byte >> 4, byte & 0xF)]
+
+
+class SpiResetAndMemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def capture(self, frames):
+        path = Path(self.temp.name) / f"q{len(list(Path(self.temp.name).iterdir()))}.csv"
+        path.write_text(qspi_reset_csv(frames), encoding="utf-8")
+        cap = load_csv(path)
+        self.addCleanup(cap.close)
+        return cap
+
+    def decode(self, cap, settings=None):
+        result = SpiDecoder().decode(cap, SpiDecoderConfig(guess_pins(cap.signals), settings or SpiSettings()))
+        self.addCleanup(result.close)
+        return result
+
+    def flash_boot(self):
+        # Recovery sequence (all ones, odd clock counts), 66/99 in 1-1-1, then EB in 1-4-4.
+        read = (byte_clocks(0xEB) + nibbles([0x00, 0x01, 0x00]) + [0, 0] + [0xC] * 8
+                + nibbles([0x30, 0x00, 0x41, 0x2F]))
+        return self.capture([[0xF] * 7, [0xF] * 13, [0xF] * 16, byte_clocks(0x66), byte_clocks(0x99), read])
+
+    def test_bus_named_dq_in_gives_io_lines(self):
+        cap = self.flash_boot()
+        pins = guess_pins(cap.signals)
+        self.assertEqual((pins.sck.text, pins.cs.text), ("sck", "cs_n_ff"))
+        self.assertEqual([(line.signal, line.offset) for line in pins.io],
+                         [("top/phy/dq_in[3:0]", offset) for offset in range(4)])
+        self.assertEqual([line.text for line in pins.io], ["dq_in[0]", "dq_in[1]", "dq_in[2]", "dq_in[3]"])
+
+    def test_recovery_frames_are_reset_not_unknown_commands(self):
+        result = self.decode(self.flash_boot())
+        frames = result.frames
+        self.assertEqual(list(frames["flags"][:3] & RESET_FRAME), [RESET_FRAME] * 3)
+        self.assertFalse((frames["flags"][:3] & (UNKNOWN_COMMAND | PARTIAL)).any())
+        self.assertEqual([result.frame_format(i) for i in range(3)], ["сброс"] * 3)
+        self.assertEqual([int(f["value"]) for f in (result.frame_fields(i)[0] for i in range(3))], [7, 13, 16])
+        self.assertEqual(list(frames["opcode"][3:]), [0x66, 0x99, 0xEB])
+        self.assertEqual(int(frames["address"][5]), 0x000100)
+        data = result.frame_data(5)
+        self.assertEqual(list(data["value"]), [0x30, 0x00, 0x41, 0x2F])
+        self.assertEqual(int(frames["flags"][5]), 0)
+
+    def test_reset_option_off_or_ff_in_table_keeps_old_meaning(self):
+        cap = self.flash_boot()
+        off = self.decode(cap, SpiSettings(reset_frames=False))
+        self.assertTrue(off.frames["flags"][2] & UNKNOWN_COMMAND)
+        self.assertFalse(off.frames["flags"][2] & RESET_FRAME)
+        table = SpiSettings(commands=(*default_commands(), CommandSpec(0xFF, "MY FF", ("1-0-0", "", ""))))
+        listed = self.decode(cap, table)
+        self.assertEqual(int(listed.frames["opcode"][2]), 0xFF)
+        self.assertFalse(listed.frames["flags"][2] & RESET_FRAME)
+        # A data byte FF after a real command is data, not a reset.
+        self.assertEqual(int(self.decode(self.capture([byte_clocks(0x66) + [0xF] * 8])).frames["flags"][0]), 0)
+
+    def test_dialog_choices_round_trip_and_pins_need_every_signal(self):
+        cap = self.flash_boot()
+        custom = (*default_commands()[:3], CommandSpec(0x77, "X", ("1-1-4", "", ""), 3, (6, 6, 6), "read"))
+        settings = SpiSettings(mode="fixed", sample_edge="falling", before_edge=False, dummy_cycles=8,
+                               fixed=FixedFormat(BusWidths(0, 4, 4), 3, 6, "read", "off"), reset_frames=False,
+                               commands=custom)
+        config = SpiDecoderConfig(guess_pins(cap.signals), settings)
+        stored = json.loads(json.dumps(config_to_dict(config)))
+        self.assertEqual(settings_from_dict(stored), settings)
+        self.assertEqual(pins_from_dict(stored, cap.signals), config.pins)
+        self.assertNotIn("commands", config_to_dict(SpiDecoderConfig(config.pins))["settings"])
+        other = self.capture([byte_clocks(0x66)])
+        renamed = [s for s in other.signals]
+        self.assertIsNotNone(pins_from_dict(stored, renamed))
+        stored["pins"]["io"][3] = {"signal": "missing", "offset": 0}
+        self.assertIsNone(pins_from_dict(stored, cap.signals))
+        self.assertEqual(settings_from_dict({"settings": {"mode": "bogus"}}), SpiSettings())
+        self.assertEqual(settings_from_dict({}), SpiSettings())
+
+    def test_controller_remembers_last_decoder_choices(self):
+        from PySide6.QtWidgets import QApplication
+        from ila_viewer.spi_ui import SpiController, SpiDecoderDialog
+        QApplication.instance() or QApplication([])
+        cap = self.flash_boot()
+        dialog = SpiDecoderDialog(cap.signals)
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.bus_box.currentData(), "top/phy/dq_in[3:0]")
+        self.assertTrue(dialog.quad_toggle.isChecked())
+        dialog.io_boxes[3].setCurrentIndex(0)
+        self.assertIsNone(dialog.bus_box.currentData())
+        dialog.bus_box.setCurrentIndex(1)
+        self.assertEqual(dialog.config().pins.io, guess_pins(cap.signals).io)
+
+        preferences = ViewerPreferences()
+        saved = []
+        view = SimpleNamespace(capture=cap, menus=SimpleNamespace(providers=[]))
+        runner = SimpleNamespace(worker=None, start_work=lambda *args: None, clipboard=None)
+        controller = SpiController(view, runner, preferences=preferences, persist=lambda: saved.append(1))
+        config = SpiDecoderConfig(guess_pins(cap.signals), SpiSettings(mode="fixed", sample_edge="falling"))
+        controller.decode(config)
+        self.assertEqual(saved, [1])
+        self.assertEqual(preferences.spi_decoder["settings"]["mode"], "fixed")
+        store = PreferencesStore(Path(self.temp.name) / "prefs.json")
+        store.save(preferences)
+        again = SpiController(view, runner, preferences=store.load())
+        from PySide6.QtWidgets import QWidget
+        again.window = QWidget()
+        self.addCleanup(again.window.deleteLater)
+        self.assertEqual(again.settings, config.settings)
+        dialog = again.open_dialog()
+        self.addCleanup(dialog.reject)
+        self.assertEqual(dialog.mode_box.currentData(), "fixed")
+        self.assertEqual(dialog.edge_box.currentData(), "falling")
+        self.assertEqual(dialog.config().pins, config.pins)
 
 
 if __name__ == "__main__":

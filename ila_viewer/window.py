@@ -105,7 +105,8 @@ class MainWindow(QMainWindow):
         self.bookmark_controller = BookmarkController(self.view, parent=self)
         self.bookmark_controller.message.connect(lambda s: self.statusBar().showMessage(s, 5000))
         self.idle_actions = []
-        self.spi = SpiController(self.view, self, parent=self)
+        self.spi = SpiController(self.view, self, parent=self, preferences=self.preferences,
+                                 persist=self.save_preferences)
         self.spi.message.connect(lambda s: self.statusBar().showMessage(s, 7000))
         self.highlight_panel = HighlightPanel(self.highlights, self.view)
         self.view.attach_highlight_panel(self.highlights, self.highlight_panel)

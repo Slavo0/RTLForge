@@ -73,7 +73,11 @@ The user requires object-oriented, extensible design for this application.
 - SPI/QSPI decoding lives in spi.py (Qt-free, disk-backed, cancellable) and spi_ui.py.
   Every line and frame format is user-chosen (command table, fixed format such as 1-4-4
   or 0-4-4, raw bytes); never infer the mode from traffic. Decoder rows are DecodedNode
-  tracks; decoder config is capture state, not a preference. Docs say SPI/QSPI only.
+  tracks; decoder config is capture state. Only the last dialog choices persist
+  (preference spi_decoder) to prefill the dialog; remembered lines apply only when all
+  exist. A 2/4-bit data bus may prefill IO0-IO3. All-ones frames on the command lines
+  are RESET frames (option reset_frames) unless FF is in the command table.
+  Docs say SPI/QSPI only.
 - Heavy work is vectorized with numpy first, then split over the shared WorkerPool
   (cpu.py, spawn). Worker modules (csv_chunks, data, cpu) stay Qt-free; worker count is
   the general preference worker_count (0 = physical cores - 1). Vectorized paths must

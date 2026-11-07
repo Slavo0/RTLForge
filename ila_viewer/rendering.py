@@ -8,11 +8,11 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 
 from .timebase import sample_axis_ruler
-from .spi import ADDR, CMD, DATA, DUMMY, MISO, MOSI, READ, UNKNOWN, WRITE, bubble_label
+from .spi import ADDR, CMD, DATA, DUMMY, MISO, MOSI, READ, RESET, UNKNOWN, WRITE, bubble_label
 
 # Theme roles for decoded protocol fields.
 FIELD_ROLES = {CMD: "marker_a", ADDR: "marker_b", DUMMY: "muted", READ: "bit", WRITE: "bus",
-               MOSI: "bus", MISO: "bit", DATA: "bus"}
+               MOSI: "bus", MISO: "bit", DATA: "bus", RESET: "muted"}
 
 
 class WaveformRenderer:

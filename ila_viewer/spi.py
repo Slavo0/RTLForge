@@ -28,9 +28,9 @@ from .data import LoadCancelled
 from .files import atomic_write
 
 # Field kinds.
-CMD, ADDR, DUMMY, READ, WRITE, MOSI, MISO, DATA = range(8)
+CMD, ADDR, DUMMY, READ, WRITE, MOSI, MISO, DATA, RESET = range(9)
 KIND_LABELS = {CMD: "CMD", ADDR: "ADDR", DUMMY: "DUMMY", READ: "RD", WRITE: "WR",
-               MOSI: "MOSI", MISO: "MISO", DATA: "DATA"}
+               MOSI: "MOSI", MISO: "MISO", DATA: "DATA", RESET: "RESET"}
 DATA_KINDS = frozenset({READ, WRITE, MOSI, MISO, DATA})
 
 # Field flags.
@@ -40,6 +40,7 @@ PARTIAL = 2   # chip select ended before the unit was complete
 # Frame flags (UNKNOWN and PARTIAL keep their meaning for the frame as a whole).
 UNKNOWN_COMMAND = 4
 TRUNCATED = 8  # chip select was already active at the capture start, or still active at its end
+RESET_FRAME = 16  # only ones on the command lines: a mode-exit / power-loss recovery sequence
 
 FIELD_DTYPE = np.dtype([("start", "<i8"), ("end", "<i8"), ("value", "<i8"), ("frame", "<i4"),
                         ("kind", "u1"), ("flags", "u1"), ("bits", "u1"), ("lines", "u1")])
@@ -263,6 +264,9 @@ class SpiSettings:
     commands: tuple = field(default_factory=default_commands)
     fixed: FixedFormat = FixedFormat()
     raw_lines: int = 1
+    # Frames with only ones on the command lines (any clock count) are the controller's
+    # mode-exit / power-loss recovery sequence, shown as RESET instead of an unknown command.
+    reset_frames: bool = True
 
     def __post_init__(self):
         if self.mode not in ("commands", "fixed", "raw"):
@@ -673,6 +677,8 @@ class SpiDecoder:
         elif s.mode == "fixed":
             command_lines = s.fixed.widths.command
         dtr_command = (s.mode == "commands" and s.dtr) or (s.mode == "fixed" and s.fixed.dtr == "all")
+        if command_lines and self._reset_frame(start, end, _lines(command_lines, False), dtr_command, cancel):
+            return self._reset_record(record, flags, start, end, lanes, dtr_command, cancel)
         complete = True
         if command_lines:
             lines = _lines(command_lines, False)
@@ -741,6 +747,34 @@ class SpiDecoder:
             record["count"][0, lane_index] = count
         record["data_bytes"] = lanes[0].data_bytes + lanes[1].data_bytes
         record["flags"] = flags
+        return record
+
+    def _reset_frame(self, start, end, lines, dtr, cancel):
+        """True when every transfer of the frame reads 1 on every command line.
+
+        Only an all-ones first byte is examined further, so ordinary frames cost one
+        command read; ``FF`` listed in the command table keeps its table meaning.
+        """
+        s = self.settings
+        if not s.reset_frames or (s.mode == "commands" and s.command(0xFF) is not None):
+            return False
+        stream = _EdgeStream(self._edge_chunks(start, end, cancel))
+        head = stream.take(8 // len(lines), dtr)
+        if not len(head) or not (self._bits(head, lines) == 1).all():
+            return False
+        return all((self._bits(chunk, lines) == 1).all() for chunk in stream.rest(dtr))
+
+    def _reset_record(self, record, flags, start, end, lanes, dtr, cancel):
+        stream = _EdgeStream(self._edge_chunks(start, end, cancel))
+        first, count = None, 0
+        for chunk in stream.rest(dtr):
+            first = int(chunk[0]) if first is None else first
+            count += len(chunk)
+        final = min(end, stream.last + self._gap(stream))
+        lanes[0].push(np.array([first]), [count], RESET, 0, min(255, count), 0, [final])
+        for lane_index, lane in enumerate(lanes):
+            record["first"][0, lane_index], record["count"][0, lane_index] = lane.finish(final)
+        record["flags"] = flags | RESET_FRAME
         return record
 
     @staticmethod
@@ -860,6 +894,8 @@ class SpiDecodeResult:
 
     def frame_format(self, index):
         frame = self.frames[index]
+        if frame["flags"] & RESET_FRAME:
+            return "сброс"
         text = f"{frame['cmd_lines']}-{frame['addr_lines']}-{frame['data_lines']}"
         if frame["dtr"]:
             text += " DTR"
@@ -883,6 +919,8 @@ def field_label(result, record, short=False):
     kind, value, flags, bits = int(record["kind"]), int(record["value"]), int(record["flags"]), int(record["bits"])
     if kind == DUMMY:
         return f"dummy {value}" if not flags & PARTIAL else f"dummy {bits}/{value}"
+    if kind == RESET:
+        return "RESET" if short else f"RESET {value} такт."
     if flags & UNKNOWN:
         text = "X" * max(2, (bits + 3) // 4)
     elif flags & PARTIAL:
@@ -1128,6 +1166,8 @@ def bubble_label(result, record, short=False):
     kind, value, flags, bits = int(record["kind"]), int(record["value"]), int(record["flags"]), int(record["bits"])
     if kind == DUMMY:
         return f"dummy {value}" if not flags & PARTIAL else f"dummy {bits}/{value}"
+    if kind == RESET:
+        return "сброс" if short else f"сброс режима · {value} такт."
     digits = max(1, (bits + 3) // 4)
     if flags & UNKNOWN:
         text = "0x" + "X" * max(2, digits)
@@ -1440,7 +1480,35 @@ def guess_pins(signals):
                                    [r"(^|_)wp(_?n|#)?$"], [r"(^|_)hold(_?n|#)?$", r"(^|_)reset(_?n|#)?$"])):
         patterns = [rf"(^|_)(dq|io|sio|data|d)_?\[{index}\]$", rf"(^|_)(dq|io|sio)_?{index}$", *extra]
         io.append(find(patterns, (sck, cs, *io)))
+    if not any(io):
+        buses = data_buses(signals)
+        if buses:
+            io = list(bus_lines(buses[0]))
     return SpiPins(sck, cs, True, tuple(io)) if sck else None
+
+
+DATA_BUS_NAME = re.compile(r"(^|_)(dq|io|sio|qspi|spi|data|dat|d)(_?(in|out|i|o|io))?($|_)")
+
+
+def data_buses(signals):
+    """2- and 4-bit buses that can carry IO0…IO3, likely data-line names first.
+
+    Only a prefill for the dialog: with no 1-bit IO wires, a bus such as ``dq_in[3:0]``
+    gives IO0…IO3 from its bits; the user still sees and can change every line.
+    """
+    def stem(signal):
+        return re.sub(r"\[\d+\s*:\s*\d+\]$", "", signal.short_name).casefold()
+    buses = [signal for signal in signals if signal.width in (2, 4)]
+    named = [signal for signal in buses if DATA_BUS_NAME.search(stem(signal))]
+    return named or (buses if len(buses) == 1 else [])
+
+
+def bus_lines(signal):
+    """IO0…IO3 from the physical bits of a 2/4-bit bus (bit offset 0 is IO0)."""
+    labels = dict(zip(range(signal.width - 1, -1, -1), BitCodec.labels(signal)))
+    stem = re.sub(r"\[\d+\s*:\s*\d+\]$", "", signal.short_name)
+    lines = [LineRef(signal.name, offset, f"{stem}[{labels[offset]}]") for offset in range(signal.width)]
+    return tuple(lines + [None] * (4 - len(lines)))
 
 
 def rebind(config, capture):
@@ -1452,3 +1520,74 @@ def rebind(config, capture):
 
 def replace_settings(config, **changes):
     return replace(config, settings=replace(config.settings, **changes))
+
+
+# Remembered dialog choices ------------------------------------------------------
+# The decoder config of a capture is capture state. Only the last choices made in the
+# dialog are kept as a general preference, to prefill the dialog next time; lines are
+# kept by signal name and reused only when every one of them exists in the capture.
+
+def _line_dict(line):
+    return None if line is None else {"signal": line.signal, "offset": line.offset}
+
+
+def _line_from(data, options):
+    if data is None:
+        return None
+    key = LineRef(str(data["signal"]), int(data["offset"]))
+    match = next((option for option in options if option == key), None)
+    if match is None:
+        raise KeyError(key.signal)
+    return match
+
+
+def config_to_dict(config):
+    s, pins = config.settings, config.pins
+    settings = {"mode": s.mode, "sample_edge": s.sample_edge, "before_edge": s.before_edge,
+                "msb_first": s.msb_first, "protocol": s.protocol, "address_bytes": s.address_bytes,
+                "dummy_cycles": s.dummy_cycles, "dtr": s.dtr, "raw_lines": s.raw_lines,
+                "reset_frames": s.reset_frames,
+                "fixed": {"widths": s.fixed.widths.text, "address_bytes": s.fixed.address_bytes,
+                          "dummy": s.fixed.dummy, "direction": s.fixed.direction, "dtr": s.fixed.dtr}}
+    if s.commands != default_commands():
+        settings["commands"] = [[c.opcode, c.name, list(c.formats), c.address_bytes, list(c.dummy),
+                                 c.direction, c.dtr, c.configurable_dummy] for c in s.commands]
+    return {"settings": settings,
+            "pins": {"sck": _line_dict(pins.sck), "cs": _line_dict(pins.cs), "cs_active_low": pins.cs_active_low,
+                     "io": [_line_dict(line) for line in pins.io]}}
+
+
+def settings_from_dict(data):
+    """SpiSettings from remembered choices; defaults for anything missing or invalid."""
+    try:
+        data = dict(data["settings"])
+        fixed = dict(data.pop("fixed"))
+        commands = data.pop("commands", None)
+        fixed = FixedFormat(BusWidths.parse(fixed["widths"]), int(fixed["address_bytes"]), int(fixed["dummy"]),
+                            str(fixed["direction"]), str(fixed["dtr"]))
+        known = {"mode", "sample_edge", "before_edge", "msb_first", "protocol", "address_bytes",
+                 "dummy_cycles", "dtr", "raw_lines", "reset_frames"}
+        kwargs = {key: value for key, value in data.items() if key in known}
+        if commands is not None:
+            kwargs["commands"] = tuple(CommandSpec(int(c[0]), str(c[1]), tuple(map(str, c[2])), int(c[3]),
+                                                   tuple(map(int, c[4])), str(c[5]), bool(c[6]), bool(c[7]))
+                                       for c in commands)
+        return SpiSettings(fixed=fixed, **kwargs)
+    except (KeyError, TypeError, ValueError, IndexError):
+        return SpiSettings()
+
+
+def pins_from_dict(data, signals):
+    """Remembered lines when all of them exist among ``signals``, else None."""
+    try:
+        pins = data["pins"]
+        options = line_options(signals)
+        sck = _line_from(pins["sck"], options)
+        if sck is None:
+            return None
+        io = tuple(_line_from(line, options) for line in pins["io"])
+        if len(io) != 4:
+            return None
+        return SpiPins(sck, _line_from(pins["cs"], options), bool(pins["cs_active_low"]), io)
+    except (KeyError, TypeError, ValueError):
+        return None

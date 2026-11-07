@@ -21,10 +21,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .actions import ContextActionProvider
-from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, TRUNCATED, UNKNOWN,
+from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, RESET_FRAME, TRUNCATED, UNKNOWN,
                   UNKNOWN_COMMAND, BusWidths, CommandSpec, DecodedTrack, FixedFormat,
                   SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
-                  SpiSettings, default_commands, guess_pins, line_options, overlays, rebind)
+                  SpiSettings, bus_lines, config_to_dict, data_buses, default_commands, guess_pins,
+                  line_options, overlays, pins_from_dict, rebind, settings_from_dict)
 from .data import LoadCancelled
 from .tree import DecodedNode
 from .widgets import SegmentedChoice, muted, plain_container
@@ -57,12 +58,12 @@ class SpiDecoderDialog(QDialog):
     COLUMNS = ("Код", "Команда", "Extended", "Dual", "Quad", "Адрес, Б", "Dummy Ext",
                "Dummy Dual", "Dummy Quad", "Данные", "DTR", "Dummy из настройки")
 
-    def __init__(self, signals, config=None, settings=None, parent=None):
+    def __init__(self, signals, config=None, settings=None, parent=None, pins=None):
         super().__init__(parent)
         self.setWindowTitle("Декодер SPI / QSPI")
         self.setModal(False)
         self.options = line_options(signals)
-        pins = config.pins if config else guess_pins(signals)
+        pins = config.pins if config else (pins or guess_pins(signals))
         settings = config.settings if config else (settings or SpiSettings())
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -82,6 +83,16 @@ class SpiDecoderDialog(QDialog):
         form.addRow("CS", row)
         self.sck_box = self._line_box(pins.sck if pins else None, None)
         form.addRow("SCK", self.sck_box)
+        # A 2/4-bit data bus (dq[3:0]) assigns IO0…IO3 at once; the lines stay editable.
+        named = data_buses(signals)
+        self.buses = sorted((s for s in signals if s.width in (2, 4)), key=lambda s: s not in named)
+        self.bus_box = QComboBox()
+        self.bus_box.addItem("— отдельные линии", None)
+        for bus in self.buses:
+            self.bus_box.addItem(f"{bus.short_name} → IO{bus.width - 1}…IO0", bus.name)
+            self.bus_box.setItemData(self.bus_box.count() - 1, bus.name, Qt.ItemDataRole.ToolTipRole)
+        if self.buses:
+            form.addRow("Шина IO", self.bus_box)
         self.io_boxes = []
         hints = ("MOSI · IO0", "MISO · IO1", "IO2 · WP#", "IO3 · HOLD#")
         self.quad_rows = []
@@ -128,6 +139,12 @@ class SpiDecoderDialog(QDialog):
         mode_row = QHBoxLayout()
         mode_row.addWidget(self.mode_box)
         mode_row.addStretch(1)
+        self.reset_box = QCheckBox("Единицы на линиях команды — сброс режима")
+        self.reset_box.setToolTip("Кадры CS, где линии команды всё время в 1 (выход из XIP/QPI,\n"
+                                  "power-loss recovery: 7, 9, 13, 17, 25, 33… тактов),\n"
+                                  "показываются как «сброс», а не как неизвестная команда FF.")
+        self.reset_box.setChecked(settings.reset_frames)
+        mode_row.addWidget(self.reset_box)
         content_layout.addLayout(mode_row)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._raw_page(settings))
@@ -153,11 +170,36 @@ class SpiDecoderDialog(QDialog):
         buttons.addWidget(self.decode_button)
         layout.addLayout(buttons)
 
+        self._sync_bus_box()
+        self.bus_box.currentIndexChanged.connect(self._bus_chosen)
+        for box in self.io_boxes:
+            box.currentIndexChanged.connect(self._sync_bus_box)
         has_quad = any(box.currentData() is not None for _, box in self.quad_rows)
         self.quad_toggle.setChecked(has_quad)
         self._show_quad(has_quad)
         self._mode_changed()
         self.resize(760, 0)
+
+    def _bus_chosen(self, *_):
+        name = self.bus_box.currentData()
+        bus = next((s for s in self.buses if s.name == name), None)
+        if bus is None:
+            return
+        for box, line in zip(self.io_boxes, bus_lines(bus)):
+            index = next((i for i in range(box.count()) if box.itemData(i) == line), 0) if line else 0
+            box.blockSignals(True)
+            box.setCurrentIndex(index)
+            box.blockSignals(False)
+        if bus.width == 4:
+            self.quad_toggle.setChecked(True)
+
+    def _sync_bus_box(self, *_):
+        """Show the bus whose bits are exactly the chosen IO lines, else "separate lines"."""
+        chosen = tuple(box.currentData() for box in self.io_boxes)
+        match = next((bus.name for bus in self.buses if bus_lines(bus) == chosen), None)
+        self.bus_box.blockSignals(True)
+        self.bus_box.setCurrentIndex(max(0, self.bus_box.findData(match)) if match else 0)
+        self.bus_box.blockSignals(False)
 
     def _show_quad(self, shown):
         for label, box in self.quad_rows:
@@ -167,6 +209,7 @@ class SpiDecoderDialog(QDialog):
 
     def _mode_changed(self, *_):
         self.pages.setCurrentIndex(self.mode_box.currentIndex())
+        self.reset_box.setVisible(self.mode_box.currentData() != "raw")
         # Only the current page takes space; the table page is tall.
         for index in range(self.pages.count()):
             policy = QSizePolicy.Policy.Preferred if index == self.pages.currentIndex() else QSizePolicy.Policy.Ignored
@@ -394,7 +437,7 @@ class SpiDecoderDialog(QDialog):
             protocol=self.protocol_box.currentData(), address_bytes=self.address_box.currentData(),
             dummy_cycles=None if self.dummy_box.value() < 0 else self.dummy_box.value(),
             dtr=self.dtr_box.isChecked(), commands=self.table_commands(), fixed=fixed,
-            raw_lines=self.raw_lines.currentData())
+            raw_lines=self.raw_lines.currentData(), reset_frames=self.reset_box.isChecked())
         self._check_lines(settings, io)
         return SpiDecoderConfig(pins, settings)
 
@@ -499,6 +542,8 @@ class SpiTransactionModel(QAbstractTableModel):
             return axis.delta(start, end) if axis else f"{end - start:,} отсч."
         if column == 3:
             opcode = int(frame["opcode"])
+            if frame["flags"] & RESET_FRAME:
+                return "сброс режима"
             return f"{opcode:02X} {self.result.command_name(opcode)}" if opcode >= 0 else "—"
         if column == 4:
             return self.result.frame_format(frame_index)
@@ -768,13 +813,17 @@ class SpiController(QObject):
 
     message = Signal(str)
 
-    def __init__(self, view, runner, clipboard=None, parent=None):
+    def __init__(self, view, runner, clipboard=None, parent=None, preferences=None, persist=None):
         super().__init__(parent)
         self.view = view
         self.runner = runner
         self._clipboard = clipboard  # None: use the runner's (window's) injected clipboard
+        # General preferences keep the last dialog choices (prefill only, never capture state).
+        self.preferences = preferences
+        self.persist = persist or (lambda: None)
         self.config = None
-        self.settings = SpiSettings()  # last protocol choices, offered for the next capture
+        remembered = getattr(preferences, "spi_decoder", None) or {}
+        self.settings = settings_from_dict(remembered) if remembered else SpiSettings()
         self.result = None
         self.nodes = []
         self.panel = None
@@ -830,7 +879,10 @@ class SpiController(QObject):
             self.dialog.raise_()
             self.dialog.activateWindow()
             return self.dialog
-        dialog = SpiDecoderDialog(self.signals(), self.config, self.settings, self.window or self.view)
+        signals = self.signals()
+        remembered = getattr(self.preferences, "spi_decoder", None) or {}
+        pins = None if self.config else pins_from_dict(remembered, signals)
+        dialog = SpiDecoderDialog(signals, self.config, self.settings, self.window or self.view, pins=pins)
         dialog.decodeRequested.connect(self.decode)
         dialog.finished.connect(lambda _result: self._dialog_closed(dialog))
         self.dialog = dialog
@@ -852,6 +904,9 @@ class SpiController(QObject):
             return False
         self.config = config
         self.settings = config.settings
+        if self.preferences is not None:
+            self.preferences.spi_decoder = config_to_dict(config)
+            self.persist()
         self.runner.start_work(
             lambda task: SpiDecoder().decode(capture, config, None, task.progress.emit, task.isInterruptionRequested),
             lambda result: self.attach(result, capture), "Декодирование SPI / QSPI…", "кадров CS")
