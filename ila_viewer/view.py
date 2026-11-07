@@ -459,16 +459,19 @@ class WaveformView(QAbstractScrollArea):
 
     def sample_x(self, sample):
         if self.capture and self.capture.times is not None:
-            left = self.capture.time_at(self.left)
-            right = self.capture.time_at(self.left + self.span)
-            return self.plot_left + (self.capture.time_at(sample) - left) / max(1, right - left) * self.plot_width
+            origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(self.left)))])
+            left = self.capture.time_offset_at(self.left, origin)
+            right = self.capture.time_offset_at(self.left + self.span, origin)
+            return self.plot_left + (self.capture.time_offset_at(sample, origin) - left) / max(1, right - left) * self.plot_width
         return self.plot_left + (sample - self.left) / self.span * self.plot_width
 
     def x_sample(self, x):
         if self.capture and self.capture.times is not None:
-            left = self.capture.time_at(self.left)
-            right = self.capture.time_at(self.left + self.span)
-            return self.capture.sample_at_time(left + (x - self.plot_left) / self.plot_width * (right - left))
+            origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(self.left)))])
+            left = self.capture.time_offset_at(self.left, origin)
+            right = self.capture.time_offset_at(self.left + self.span, origin)
+            offset = left + (x - self.plot_left) / self.plot_width * (right - left)
+            return float(self.capture.samples_at_offsets([offset], origin)[0])
         return self.left + (x - self.plot_left) / self.plot_width * self.span
 
     def nearest_sample(self, x):

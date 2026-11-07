@@ -132,3 +132,16 @@ CSV командой `python -m scripts.generate_readme_images`.
 Copyright © 2026 Вячеслав Рудаков. Проект распространяется по
 [Apache License 2.0](LICENSE); сведения об авторстве — в [NOTICE](NOTICE).
 Зависимости PySide6 и NumPy устанавливаются отдельно и имеют собственные лицензии.
+
+## Reliability and performance checks
+
+Importers preserve multiline quoted CSV records and whitespace-separated VCD
+changes. Simulator rendering keeps adjacent ticks distinct at large timestamps;
+highlights use the earlier marker as the included boundary and the later marker
+as the excluded boundary. Unknown-state edge counts update asynchronously.
+See [performance evidence and limits](docs/PERFORMANCE.md) for memory budgets,
+executor comparisons and reproducible benchmarks. Regression command:
+
+```powershell
+.venv/Scripts/python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review
+```

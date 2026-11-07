@@ -88,11 +88,11 @@ def reference_highlight(capture, condition, marker_a, marker_b, sampling):
     """Per-point highlight build with ``Condition.matches``; returns merged (start, end) spans."""
     lower, upper = sorted((marker_a, marker_b))
     spans, pending = [], None
-    for point in sampling.points(lower, upper + 1, capture.count):
-        if point.sample == marker_b or (condition is not None and not condition.matches(point.at, point.previous_at)):
+    for point in sampling.points(lower, upper, capture.count):
+        if condition is not None and not condition.matches(point.at, point.previous_at):
             continue
-        start = max(point.start, lower + (marker_b == lower))
-        end = min(point.end, capture.count, upper + (marker_b != upper))
+        start = max(point.start, lower)
+        end = min(point.end, capture.count, upper)
         if end <= start:
             continue
         if pending and start <= pending[1]:
@@ -109,8 +109,8 @@ def reference_highlight(capture, condition, marker_a, marker_b, sampling):
 def reference_advanced(capture, pattern, marker_a, marker_b, sampling):
     """The original FSM of active stage paths."""
     lower, upper = sorted((marker_a, marker_b))
-    start_boundary = lower + (marker_b == lower)
-    end_boundary = min(capture.count, upper + (marker_b != upper))
+    start_boundary = lower
+    end_boundary = min(capture.count, upper)
     active, spans, pending = [], [], None
     for point in sampling.points(start_boundary, end_boundary, capture.count):
         at, previous = point.at, point.previous_at

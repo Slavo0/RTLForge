@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 import math
 import re
 from typing import Callable
@@ -37,14 +38,16 @@ def format_seconds(seconds, resolution=1e-12):
     """Cursor-style text in ns (or a coarser unit when the resolution is coarser), like Vivado."""
     unit_name, unit = next(((name, scale) for name, scale in reversed(UNITS)
                             if scale <= max(resolution, 1e-9)), ("ns", 1e-9))
-    return f"{group_digits(seconds / unit, _decimals(unit, resolution))} {unit_name}"
+    divisor = Decimal(str(unit)) if isinstance(seconds, Decimal) else unit
+    return f"{group_digits(seconds / divisor, _decimals(unit, resolution))} {unit_name}"
 
 
 def format_ruler(seconds, step_seconds):
     """Ruler label: the unit follows the tick step, so labels stay short and integral."""
     unit_name, unit = next(((name, scale) for name, scale in reversed(UNITS)
                             if scale <= step_seconds * (1 + 1e-9)), UNITS[0])
-    return f"{group_digits(seconds / unit, _decimals(unit, step_seconds))} {unit_name}"
+    divisor = Decimal(str(unit)) if isinstance(seconds, Decimal) else unit
+    return f"{group_digits(seconds / divisor, _decimals(unit, step_seconds))} {unit_name}"
 
 
 def nice_step(ideal):
@@ -90,13 +93,45 @@ def sample_axis_ruler(left, right, pixels, spacing=110):
     return [(k * step, group_digits(k * step)) for k in range(first, math.floor(right / step) + 1)]
 
 
+class SimulatorTimeAxis:
+    """Use a local integer origin for ruler positions and elapsed time."""
+
+    def __init__(self, capture):
+        self.capture = capture
+        self.tick_seconds = unit_seconds(capture.timescale) or 1e-9
+        self.resolution = self.tick_seconds
+        self.to_ticks = capture.time_at
+        self.to_sample = capture.sample_at_time
+
+    def readout(self, sample):
+        return self.capture.format_ticks(self.capture.time_at(sample))
+
+    def delta(self, first, second):
+        origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(first)))])
+        ticks = abs(self.capture.time_offset_at(second, origin) - self.capture.time_offset_at(first, origin))
+        return self.capture.format_ticks(ticks)
+
+    def ruler(self, left, right, pixels, spacing=110):
+        origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(left)))])
+        low = self.capture.time_offset_at(left, origin)
+        high = self.capture.time_offset_at(right, origin)
+        if high <= low:
+            return []
+        step = max(1, int(nice_step((high - low) / max(1.0, pixels / spacing))))
+        first = math.ceil((Decimal(origin) + Decimal(str(low))) / step)
+        last = math.floor((Decimal(origin) + Decimal(str(high))) / step)
+        seconds = Decimal(str(self.tick_seconds))
+        return [(self.capture.sample_at_time(k * step),
+                 format_ruler(Decimal(k * step) * seconds, step * self.tick_seconds))
+                for k in range(max(0, first), last + 1)]
+
+
 def capture_axis(capture, sample_period_ns=0.0):
     """Simulator time when the capture has timestamps, otherwise the user's sample period."""
     if capture is None:
         return None
     if capture.times is not None:
-        seconds = unit_seconds(capture.timescale) or 1e-9
-        return TimeAxis(capture.time_at, capture.sample_at_time, seconds, seconds)
+        return SimulatorTimeAxis(capture)
     if sample_period_ns and sample_period_ns > 0:
         period = float(sample_period_ns)
         return TimeAxis(lambda sample: sample * period, lambda ticks: ticks / period, 1e-9, 1e-12)

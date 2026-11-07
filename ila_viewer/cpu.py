@@ -3,9 +3,10 @@
 
 """CPU topology and the worker-process pool for heavy processing; Qt-free.
 
-The hot paths hold the GIL, so threads give no speed-up. Work that splits into
-independent chunks runs in processes (spawn on Windows). Workers read files by
-path and write results next to the capture indices; only small tables are pickled.
+NumPy kernels can release the GIL; parsing and value dictionaries also do Python
+work. The application uses processes (spawn on Windows); compare alternatives
+with scripts.benchmark_review before changing this policy. Workers exchange paths
+and value tables, whose memory cost grows with distinct-value cardinality.
 """
 from __future__ import annotations
 

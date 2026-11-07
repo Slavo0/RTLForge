@@ -672,3 +672,22 @@ GUI-тест использует
 Для интерфейса использованы
 [QAbstractScrollArea](https://doc.qt.io/qtforpython-6/PySide6/QtWidgets/QAbstractScrollArea.html)
 и [QThread](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThread.html).
+
+## Import and analysis reliability
+
+CSV cells may be quoted and span multiple physical lines. VCD changes may share
+a line, use tabs, or span lines; `$dumpvars` values are included. VCD/WLF waveform
+positions, hit testing, rulers and period measurements retain single-tick precision
+when zoomed into timestamps above 2⁵³.
+
+Copying and both highlight modes include the earlier A/B boundary and exclude
+the later one, regardless of marker order. An explicit condition selection is
+unsigned even when it includes every bit: for a signed byte containing −1,
+`` `s[7:0]`[7:0] == d255 `` is true. Without the explicit trailing selection,
+`` `s[7:0]` == d-1 `` retains the signal's signed interpretation.
+
+For signals containing X/Z, edge measurements appear after a short background
+calculation. Changing markers or the selected signal discards an obsolete result;
+closing or refreshing the capture cancels the calculation. Clean 0/1 signals
+continue to update immediately. [Performance notes](PERFORMANCE.md) explain how
+to compare worker counts for a particular workload.

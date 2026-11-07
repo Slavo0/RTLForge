@@ -4,7 +4,6 @@
 """Streaming VCD importer for simulator captures, with disk-backed transitions."""
 
 from array import array
-from itertools import chain
 from pathlib import Path
 import re
 import tempfile
@@ -84,7 +83,8 @@ class VcdCaptureReader:
         mapped = []
         try:
             with path.open("r", encoding="utf-8", errors="replace") as stream:
-                signals, by_id, timescale, first_change = self._header(stream)
+                tokens = self._tokens(stream, cancel)
+                signals, by_id, timescale = self._header(tokens)
                 if not signals:
                     raise ValueError("В VCD нет поддерживаемых битовых сигналов.")
                 buses = SplitBusAssembler(signals)
@@ -117,25 +117,14 @@ class VcdCaptureReader:
                             progress(min(99, int(stream.buffer.tell() / size * 100)), count)
 
                     started = False
-                    in_comment = False
                     widths = [signal.width for signal in signals]
-                    lines = (line for line in ([first_change] if first_change else []) if line)
                     lookup = by_id.get
-                    for line_number, line in enumerate(chain(lines, stream), 1):
-                        if line_number % 16384 == 0 and cancel():
-                            raise LoadCancelled()
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if in_comment:
-                            in_comment = not re.search(r"\$end(?=\s|$)", line)
-                            continue
-                        first = line[0]
-                        # Dispatch on the first character: scalar changes are the bulk of a dump.
+                    for token in tokens:
+                        first = token[0]
                         if first in "01xXzZ":
-                            symbol, value = line[1:].strip(), first.lower()
+                            symbol, value = token[1:], first.lower()
                         elif first == "#":
-                            timestamp = int(line[1:].strip())
+                            timestamp = int(token[1:])
                             if timestamp < 0 or timestamp > 2**63 - 1:
                                 raise ValueError("Временная отметка VCD вне диапазона int64.")
                             if started and timestamp != current_time:
@@ -144,18 +133,24 @@ class VcdCaptureReader:
                             started = True
                             continue
                         elif first == "$":
-                            if line.startswith("$comment"):
-                                in_comment = not re.search(r"\$end(?=\s|$)", line)
+                            if token not in {"$dumpvars", "$dumpall", "$dumpon", "$dumpoff", "$end"}:
+                                for item in tokens:
+                                    if item == "$end":
+                                        break
                             continue
+                        elif first in "bBrRsS":
+                            symbol = next(tokens, None)
+                            if symbol is None:
+                                raise ValueError(f"Незавершённое изменение VCD: {token[:80]}")
+                            if first not in "bB":
+                                continue  # real/string declarations are deliberately unsupported
+                            value = token[1:].lower()
                         else:
-                            started = True
-                            parsed = self._change(line)
-                            if parsed is None:
-                                continue
-                            symbol, value = parsed
+                            raise ValueError(f"Некорректное изменение VCD: {token[:80]}")
+                        if not symbol or not value:
+                            raise ValueError(f"Некорректное изменение VCD: {token[:80]}")
                         started = True
                         for index in lookup(symbol, ()):
-                            # VCD left-extends short vectors with 0, or with a leading x/z.
                             if len(value) < widths[index] and value[0] in "xz":
                                 changes[index] = value.rjust(widths[index], value[0])
                             else:
@@ -187,50 +182,55 @@ class VcdCaptureReader:
             raise
 
     @staticmethod
-    def _header(stream):
-        signals = []
-        by_id = {}
-        scopes = []
-        timescale = "1 ns"
-        pending = ""
-        for line in stream:
-            pending += " " + line.strip()
-            while match := re.search(r"\$end(?=\s|$)", pending):
-                statement, pending = pending[:match.start()], pending[match.end():]
-                parts = statement.split()
-                if not parts:
-                    continue
-                directive = parts[0]
-                if directive == "$scope" and len(parts) >= 3:
-                    scopes.append(parts[2])
-                elif directive == "$upscope" and scopes:
-                    scopes.pop()
-                elif directive == "$timescale":
-                    timescale = " ".join(parts[1:]).replace(" ", "")
-                elif directive == "$var" and len(parts) >= 5 and parts[1].lower() not in {"real", "realtime", "string"}:
-                    width = int(parts[2])
-                    if width < 1:
-                        raise ValueError("Некорректная ширина сигнала VCD.")
-                    symbol = parts[3]
-                    reference = parts[4].lstrip("\\")
-                    suffix = "".join(parts[5:])
-                    if suffix.startswith("[") and not reference.endswith("]"):
-                        reference += suffix
-                    name = "/".join([*scopes, reference])
-                    signal = SignalData(name, "BINARY", width, True)
-                    by_id.setdefault(symbol, []).append(len(signals))
-                    signals.append(signal)
-                elif directive == "$enddefinitions":
-                    return signals, by_id, timescale, pending.strip() or None
-        raise ValueError("В VCD нет завершения заголовка $enddefinitions.")
+    def _tokens(stream, cancel=lambda: False, block_chars=65536):
+        """Whitespace tokens with carry across bounded reads, independent of lines."""
+        tail = ""
+        while True:
+            if cancel():
+                raise LoadCancelled()
+            block = stream.read(block_chars)
+            if not block:
+                if tail:
+                    yield tail
+                return
+            text = tail + block
+            parts = text.split()
+            tail = ""
+            if text and not text[-1].isspace():
+                tail = parts.pop() if parts else text
+            yield from parts
 
     @staticmethod
-    def _change(line):
-        if line[0] in "01xXzZ":
-            return line[1:].strip(), line[0].lower()
-        if line[0] in "bB":
-            value, separator, symbol = line[1:].partition(" ")
-            if not separator:
-                raise ValueError(f"Некорректное изменение VCD: {line[:80]}")
-            return symbol.strip(), value.lower()
-        return None
+    def _header(tokens):
+        signals, by_id, scopes = [], {}, []
+        timescale = "1 ns"
+        for directive in tokens:
+            parts = []
+            for token in tokens:
+                if token == "$end":
+                    break
+                if directive in {"$scope", "$var", "$timescale"}:
+                    parts.append(token)
+            else:
+                break
+            if directive == "$scope" and len(parts) >= 2:
+                scopes.append(parts[1])
+            elif directive == "$upscope" and scopes:
+                scopes.pop()
+            elif directive == "$timescale":
+                timescale = "".join(parts)
+            elif directive == "$var" and len(parts) >= 4 and parts[0].lower() not in {"real", "realtime", "string"}:
+                width = int(parts[1])
+                if width < 1:
+                    raise ValueError("Некорректная ширина сигнала VCD.")
+                symbol = parts[2]
+                reference = parts[3].lstrip("\\")
+                suffix = "".join(parts[4:])
+                if suffix.startswith("[") and not reference.endswith("]"):
+                    reference += suffix
+                name = "/".join([*scopes, reference])
+                by_id.setdefault(symbol, []).append(len(signals))
+                signals.append(SignalData(name, "BINARY", width, True))
+            elif directive == "$enddefinitions":
+                return signals, by_id, timescale
+        raise ValueError("В VCD нет завершения заголовка $enddefinitions.")

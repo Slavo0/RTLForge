@@ -97,6 +97,9 @@ class HighlightGroup:
         """``period`` holds a SamplingGrid, or a legacy sample count used with ``phase``."""
         return as_sampling(self.period, self.phase)
 
+    def close(self):
+        self.intervals.close()
+
 
 class HighlightModel(QObject):
     changed = Signal()
@@ -202,15 +205,15 @@ class HighlightService:
         sampling = as_sampling(period, phase)
         lower, upper = sorted((marker_a, marker_b))
         # Paint the span the sampled values describe, clipped to A…B.
-        low = lower + (marker_b == lower)
-        high = min(capture.count, upper + (marker_b != upper))
+        low = max(0, lower)
+        high = min(capture.count, upper)
         writer = IntervalWriter(capture.storage.name, "highlight_")
         try:
             points = 0
-            for chunk in sampling.point_chunks(lower, upper + 1, capture.count, cancel):
+            for chunk in sampling.point_chunks(low, high, capture.count, cancel):
                 if cancel():
                     raise LoadCancelled()
-                keep = chunk.sample != marker_b
+                keep = np.ones(len(chunk.sample), dtype=bool)
                 if condition is not None:
                     keep &= condition.evaluate(chunk.at, chunk.previous_at)
                 start = np.maximum(chunk.start, low)

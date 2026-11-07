@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .workers import BackgroundTask
+from .workers import BackgroundTask, dispose_result
 from .themes import ThemeManager
 from .sources import AutoCaptureSource, WlfCaptureSource, QuestaWlfConverter, WlfExportService
 from .bits import BitExpansionService
@@ -33,7 +33,8 @@ from .refresh import CaptureRefreshState, legacy_period
 from .sampling import PeriodicSampling
 from .timebase import parse_clock
 from .bookmarks_ui import BookmarkController
-from .measurements import EdgeMeasurementService, MeasurementFormatter
+from .measurements import MeasurementFormatter
+from .measurements_ui import EdgeMeasurementController
 from .spi import SpiQuery
 from .cpu import WorkerPool, available_cpus, detect as detect_cpu
 from .spi_ui import SpiController
@@ -86,7 +87,8 @@ class MainWindow(QMainWindow):
         self.copy_service = CopyValuesService()
         self.highlight_service = HighlightService()
         self.advanced_highlight_service = AdvancedHighlightService()
-        self.edge_measurements = EdgeMeasurementService()
+        self.edge_measurements = EdgeMeasurementController(parent=self)
+        self.edge_measurements.changed.connect(self.update_status)
         self.measurement_formatter = MeasurementFormatter()
         self.highlights = HighlightModel(self)
         self.copy_period = None
@@ -764,8 +766,8 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.cancel_button.hide()
         if self.closing:
-            if hasattr(task.result, "close"):
-                task.result.close()
+            dispose_result(task.result)
+            task.result = None
             task.deleteLater()
             self.close()
             return
@@ -796,6 +798,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Отмена операции…")
 
     def loaded(self, capture):
+        self.edge_measurements.clear()
         if self.active_editor is not None:
             self.active_editor.reject()
         if self.copy_period_banner is not None:
@@ -842,6 +845,8 @@ class MainWindow(QMainWindow):
         changes = sum(len(sig.starts) - 1 for sig in shown)
         self.statusBar().showMessage(f"{capture.count:,} отсчётов · {len(shown)} сигналов · {changes:,} изменений")
         self.view.setFocus()
+        self.edge_measurements.resume()
+        self.update_status()
         if state and state.highlights:
             compiler = self.condition_compiler()
             def restored(groups):
@@ -868,7 +873,7 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def update_status(self):
-        if not self.capture or not hasattr(self, "readout"):
+        if self.closing or not self.capture or not hasattr(self, "readout"):
             return
         v = self.view
         axis = v.time_axis()
@@ -880,9 +885,11 @@ class MainWindow(QMainWindow):
             if axis is not None:
                 parts.append(f"Δt: {axis.delta(v.cursor_a, v.cursor_b)}")
             sig = v.current_signal
-            measurement = self.edge_measurements.measure(sig, v.cursor_a, v.cursor_b)
+            measurement = self.edge_measurements.request(sig, v.cursor_a, v.cursor_b)
             parts.extend(self.measurement_formatter.parts(measurement, self.capture, v.period_ns,
                                                           sig.short_name if sig else ""))
+        else:
+            self.edge_measurements.request(None, 0, 0)
         for name, data in self.capture.metadata.items():
             parts.append(f"{name}: {int(data[v.cursor_a])}")
         group = self.highlights.active_group
@@ -1093,6 +1100,7 @@ Ctrl+Shift+C — копировать байты между A и B (без B —
                 break
 
     def closeEvent(self, event):
+        self.edge_measurements.clear()
         if self.worker:
             self.closing = True
             self.cancel_work()

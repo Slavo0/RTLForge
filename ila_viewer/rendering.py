@@ -16,6 +16,13 @@ FIELD_ROLES = {CMD: "marker_a", ADDR: "marker_b", DUMMY: "muted", READ: "bit", W
 
 
 class WaveformRenderer:
+    @staticmethod
+    def _time_edges(v):
+        origin = int(v.capture.times[max(0, min(v.capture.count - 1, int(v.left)))])
+        offsets = np.linspace(v.capture.time_offset_at(v.left, origin),
+                              v.capture.time_offset_at(v.left + v.span, origin), v.plot_width + 1)
+        return v.capture.samples_at_offsets(offsets, origin)
+
     def __init__(self, view):
         self.view = view
 
@@ -23,8 +30,7 @@ class WaveformRenderer:
         """Sample positions of the plot's pixel boundaries, following the real time axis."""
         v = self.view
         if v.capture.times is not None:
-            time_edges = np.linspace(v.capture.time_at(v.left), v.capture.time_at(v.left + v.span), v.plot_width + 1)
-            return v.capture.samples_at_times(time_edges)
+            return self._time_edges(v)
         return np.linspace(v.left, v.left + v.span, v.plot_width + 1)
 
     def draw_track(self, painter, track, y):
@@ -177,9 +183,7 @@ class WaveformRenderer:
             # Preserve subpixel activity: shade any pixel containing transitions.
             # Work is bounded by viewport width, regardless of capture length.
             if v.capture.times is not None:
-                time_edges = np.linspace(v.capture.time_at(v.left),
-                                         v.capture.time_at(v.left + v.span), v.plot_width + 1)
-                edges = v.capture.samples_at_times(time_edges)
+                edges = self._time_edges(v)
             else:
                 edges = np.linspace(v.left, v.left + v.span, v.plot_width + 1)
             indices = np.maximum(0, np.searchsorted(sig.starts, edges, side="right") - 1)

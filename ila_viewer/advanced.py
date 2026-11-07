@@ -23,8 +23,8 @@ class AdvancedHighlightService:
         """``period`` is a SamplingGrid, or a sample count combined with ``phase``."""
         sampling = as_sampling(period, phase)
         lower, upper = sorted((marker_a, marker_b))
-        start_boundary = lower + (marker_b == lower)
-        end_boundary = min(capture.count, upper + (marker_b != upper))
+        start_boundary = max(0, lower)
+        end_boundary = min(capture.count, upper)
         stages = pattern.stages
         k = len(stages)
         writer = IntervalWriter(capture.storage.name, "advanced_")

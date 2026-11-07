@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 
 BLOCK_BYTES = 8 << 20
+GATHER_BUDGET = 16 << 20  # padded output limit; gather scratch is separately batched
 _COMMA, _NEWLINE, _RETURN = 44, 10, 13
 _BLANK = np.zeros(256, dtype=bool)
 _BLANK_BYTES = bytes([_COMMA, 32, 9, _RETURN, _NEWLINE])
@@ -133,22 +134,40 @@ class ValueTable:
             first_new, largest = int(first[fresh[0]]), int(unique[fresh].max())
         return result[inverse.reshape(-1)], first_new, largest
 
-    def lut_for(self, exported):
+    def lut_for(self, exported, cancel=lambda: False, chunk_values=262144):
         """Global codes for a worker's local table (see ``ColumnEncoder.exported_values``)."""
         kind = exported[0]
         if kind == "list":
             values = exported[1]
-            return np.fromiter(map(self.code, values), dtype=np.uint32, count=len(values))
+            result = np.empty(len(values), dtype=np.uint32)
+            for a in range(0, len(values), chunk_values):
+                if cancel():
+                    raise LoadCancelled()
+                b = min(len(values), a + chunk_values)
+                result[a:b] = np.fromiter(map(self.code, values[a:b]), dtype=np.uint32, count=b - a)
+            return result
         if kind == "ints":
-            return self.codes_for(exported[1])[0] if len(exported[1]) else np.zeros(0, dtype=np.uint32)
+            values = exported[1]
+            result = np.empty(len(values), dtype=np.uint32)
+            for a in range(0, len(values), chunk_values):
+                if cancel():
+                    raise LoadCancelled()
+                result[a:a + chunk_values] = self.codes_for(values[a:a + chunk_values])[0]
+            return result
         _, ints, positions, others = exported
         lut = np.empty(len(ints) + len(others), dtype=np.uint32)
         begin = 0
         # Walk in local code order so new values keep their first-appearance order.
         for code, value in [*others, (len(lut), None)]:
+            if cancel():
+                raise LoadCancelled()
             stop = int(np.searchsorted(positions, code))
             if stop > begin:
-                lut[positions[begin:stop]] = self.codes_for(ints[begin:stop])[0]
+                for a in range(begin, stop, chunk_values):
+                    if cancel():
+                        raise LoadCancelled()
+                    b = min(stop, a + chunk_values)
+                    lut[positions[a:b]] = self.codes_for(ints[a:b])[0]
             if value is not None:
                 lut[code] = self.code(value)
             begin = stop
@@ -169,6 +188,8 @@ _DIGIT[0] = 254  # padding of the fixed-width cell array
 def parse_digits(cells, base):
     """Plain digit cells -> (int64 values, ok mask); cells with X/Z, 0x, _ … are not ok."""
     width = cells.dtype.itemsize
+    if cells.dtype.kind != "S":
+        return None, np.zeros(len(cells), dtype=bool)
     if not len(cells):
         return np.zeros(0, dtype=np.int64), np.ones(0, dtype=bool)
     if width > _MAX_DIGITS[base]:
@@ -381,13 +402,27 @@ def split_block(block, columns, first_line=0):
 
 
 def _gather(buffer, starts, ends):
-    """Byte slices -> one fixed-width ``S`` array; the gather is bounded by the block size."""
+    """Byte slices -> fixed-width cells, or compact objects for skewed cell widths."""
     lengths = ends - starts
     if not len(lengths):
         return np.zeros(0, dtype="S1")
     width = int(lengths.max())
     if width == 0:
         return np.zeros(len(starts), dtype="S1")
+    scratch_per_row = width * 10
+    if len(starts) * width > GATHER_BUDGET or scratch_per_row > GATHER_BUDGET:
+        # Copy slices directly when padding or even one row's gather scratch is too large.
+        return np.fromiter((buffer[a:b].tobytes() for a, b in zip(starts, ends)),
+                           dtype=object, count=len(starts))
+    if len(starts) * scratch_per_row > GATHER_BUDGET:
+        # Keep ordinary numeric columns vectorized, splitting the gather scratch
+        # space instead of falling back to Python merely because there are many rows.
+        result = np.empty(len(starts), dtype=f"S{width}")
+        batch = GATHER_BUDGET // scratch_per_row
+        for a in range(0, len(starts), batch):
+            b = min(len(starts), a + batch)
+            result[a:b] = _gather(buffer, starts[a:b], ends[a:b])
+        return result
     offsets = np.arange(width, dtype=np.int64)
     if int(lengths.min()) == width:
         matrix = buffer[starts[:, None] + offsets]
@@ -403,7 +438,7 @@ def _decimal(cells):
     if not len(cells):
         return np.zeros(0, dtype=np.int64)
     width = cells.dtype.itemsize
-    if width > 18:
+    if cells.dtype.kind != "S" or width > 18:
         return None
     matrix = cells.view(np.uint8).reshape(len(cells), width)
     present = matrix != 0
@@ -427,30 +462,45 @@ def _split_quoted(block, columns, first_line):
             raise CellError(first_line + reader.line_num, f"ожидалось {columns} столбцов, получено {len(row)}.")
         rows.append(row)
         numbers.append(first_line + reader.line_num)
-    cells = [np.array([cell.encode("utf-8") for cell in column], dtype="S") if rows else np.zeros(0, "S1")
+    cells = [_cell_array([cell.encode("utf-8") for cell in column]) if rows else np.zeros(0, "S1")
              for column in (zip(*rows) if rows else [()] * columns)]
     return cells, np.asarray(numbers, dtype=np.int64)
 
 
-def iter_blocks(stream, start, end, block_bytes=BLOCK_BYTES):
-    """Yield (bytes, line count) of complete lines in [start, end); ``end`` None means EOF."""
+def _cell_array(values):
+    width = max((len(value) for value in values), default=1)
+    dtype = object if len(values) * width > GATHER_BUDGET else "S"
+    return np.array(values, dtype=dtype)
+
+
+def iter_blocks(stream, start, end, block_bytes=BLOCK_BYTES, cancel=lambda: False):
+    """Yield complete CSV records; quoted newlines never split a record between blocks."""
     stream.seek(start)
     position, tail = start, b""
     while end is None or position < end:
+        if cancel():
+            raise LoadCancelled()
         size = block_bytes if end is None else min(block_bytes, end - position)
         data = stream.read(size)
         position += len(data)
         if not data:
             break
         data = tail + data
-        cut = data.rfind(b"\n") + 1
+        if b'"' in data:
+            buffer = np.frombuffer(data, dtype=np.uint8)
+            quotes = np.flatnonzero(buffer == 34)
+            newlines = np.flatnonzero(buffer == _NEWLINE)
+            complete = newlines[np.searchsorted(quotes, newlines) % 2 == 0]
+            cut = int(complete[-1]) + 1 if len(complete) else 0
+        else:
+            cut = data.rfind(b"\n") + 1
         if not cut:
             tail = data
             continue
         block, tail = data[:cut], data[cut:]
         yield block, block.count(b"\n")
     if tail:
-        yield tail + b"\n", 1
+        yield tail + b"\n", tail.count(b"\n") + 1
 
 
 def line_aligned_ranges(path, start, parts):
@@ -486,13 +536,16 @@ def parse_range(path, start, end, specs, folder, tag, cancel_path=None):
     rows = lines = 0
     try:
         with open(path, "rb") as stream:
-            for block, block_lines in iter_blocks(stream, start, end):
+            for block, block_lines in iter_blocks(stream, start, end,
+                                                  cancel=lambda: bool(cancel_path and os.path.exists(cancel_path))):
                 if cancel_path and os.path.exists(cancel_path):
                     raise LoadCancelled()
                 if b'"' in block:
                     raise QuotedCsv()
                 cells, numbers = split_block(block, len(specs), lines)
                 for encoder, column in zip(encoders, cells):
+                    if cancel_path and os.path.exists(cancel_path):
+                        raise LoadCancelled()
                     encoder.feed(column, rows, numbers)
                 rows += len(numbers)
                 lines += block_lines
@@ -507,25 +560,36 @@ def parse_range(path, start, end, specs, folder, tag, cancel_path=None):
             "columns": [(e.sink.runs, e.exported_values(), e.width, e.first_code, e.last_code) for e in encoders]}
 
 
-def place_range(folder, tag, jobs):
-    """Worker entry point, second phase: write one range's runs into the final column files.
-
-    ``jobs`` holds per column (index, lut or None for metadata, row offset, drop first run,
-    run offset in the final file). Each range owns a disjoint slice of every file.
-    """
+def place_range(folder, tag, jobs, cancel_path=None, chunk_runs=262144):
+    """Merge disjoint worker slices with bounded buffers and cooperative cancellation."""
     folder = Path(folder)
     for index, lut, row_offset, drop, offset in jobs:
         start_path = folder / f"{tag}_{index}.starts"
-        starts = np.fromfile(start_path, dtype=np.int64)
+        code_path = folder / f"{tag}_{index}.codes"
+        with start_path.open("rb") as source, (folder / f"{index}.starts").open("r+b") as target:
+            source.seek(drop * 8)
+            target.seek(offset * 8)
+            codes_source = code_path.open("rb") if lut is not None else None
+            codes_target = (folder / f"{index}.codes").open("r+b") if lut is not None else None
+            try:
+                if codes_source is not None:
+                    codes_source.seek(drop * 4)
+                    codes_target.seek(offset * 4)
+                while True:
+                    if cancel_path and os.path.exists(cancel_path):
+                        raise LoadCancelled()
+                    starts = np.fromfile(source, dtype=np.int64, count=chunk_runs)
+                    if not len(starts):
+                        break
+                    if codes_source is not None:
+                        codes = np.fromfile(codes_source, dtype=np.uint32, count=len(starts))
+                        lut[codes].tofile(codes_target)
+                        starts += row_offset
+                    starts.tofile(target)
+            finally:
+                if codes_source is not None:
+                    codes_source.close()
+                    codes_target.close()
         start_path.unlink()
         if lut is not None:
-            code_path = folder / f"{tag}_{index}.codes"
-            codes = lut[np.fromfile(code_path, dtype=np.uint32)] if len(lut) else np.zeros(0, np.uint32)
             code_path.unlink()
-            starts = starts[drop:] + row_offset
-            with open(folder / f"{index}.codes", "r+b") as stream:
-                stream.seek(offset * 4)
-                codes[drop:].tofile(stream)
-        with open(folder / f"{index}.starts", "r+b") as stream:
-            stream.seek(offset * 8)
-            starts.tofile(stream)

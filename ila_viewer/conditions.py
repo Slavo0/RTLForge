@@ -40,8 +40,7 @@ def bit_selection(signal, text):
             if offsets[label] in chosen:
                 raise ValueError(f"Бит {label} указан в [{text}] дважды")
             chosen.append(offsets[label])
-    whole = tuple(range(signal.width - 1, -1, -1))
-    return None if tuple(chosen) == whole else tuple(chosen)
+    return tuple(chosen)
 
 
 @dataclass(frozen=True)

@@ -548,21 +548,20 @@ class SpiDecoder:
         self.count = capture.count
         self.has_cs = pins.cs is not None
         folder = folder or capture.storage.name
-        frames = self._frames(capture, pins)
+        frames = self._frames(capture, pins, cancel)
         writers = [_RecordWriter(folder, "spi_lane0_", FIELD_DTYPE), _RecordWriter(folder, "spi_lane1_", FIELD_DTYPE)]
         frame_writer = _RecordWriter(folder, "spi_frames_", FRAME_DTYPE)
         try:
-            total = len(frames)
             for index, (start, end) in enumerate(frames):
                 if index % 64 == 0:
                     if cancel():
                         raise LoadCancelled()
-                    progress(round(100 * index / max(1, total)), index)
+                    progress(round(100 * int(start) / max(1, capture.count)), index)
                 record = self._frame(index, int(start), int(end), writers, cancel)
                 frame_writer.write(record)
             for writer in (*writers, frame_writer):
                 writer.close()
-            progress(100, total)
+            progress(100, frame_writer.count)
             return SpiDecodeResult(config, frame_writer.path, frame_writer.count,
                                    [w.path for w in writers], [w.count for w in writers], capture.count)
         except BaseException:
@@ -570,19 +569,32 @@ class SpiDecoder:
                 writer.discard()
             raise
 
-    def _frames(self, capture, pins):
+    def _frames(self, capture, pins, cancel=lambda: False):
+        """Stream CS-active spans with state carried over transition blocks."""
+        if cancel():
+            raise LoadCancelled()
         if pins.cs is None:
-            return np.array([[0, capture.count]], dtype=np.int64)
+            yield 0, capture.count
+            return
         cs = pins.cs.resolve(capture)
-        levels = line_levels(cs, pins.cs.offset)[np.asarray(cs.codes, dtype=np.int64)]
-        active = (levels == (0 if pins.cs_active_low else 1)).astype(np.int8)
-        steps = np.diff(np.concatenate(([0], active, [0])))
-        begin = np.flatnonzero(steps == 1)
-        stop = np.flatnonzero(steps == -1)
-        starts = np.asarray(cs.starts, dtype=np.int64)
-        frame_starts = starts[begin]
-        frame_ends = np.where(stop < len(starts), starts[np.minimum(stop, len(starts) - 1)], capture.count)
-        return np.stack((frame_starts, frame_ends), axis=1) if len(begin) else np.empty((0, 2), dtype=np.int64)
+        levels = line_levels(cs, pins.cs.offset)
+        active_level = 0 if pins.cs_active_low else 1
+        previous, pending = False, None
+        for a in range(0, len(cs.starts), self.BLOCK):
+            if cancel():
+                raise LoadCancelled()
+            b = min(len(cs.starts), a + self.BLOCK)
+            active = levels[np.asarray(cs.codes[a:b], dtype=np.int64)] == active_level
+            changes = np.flatnonzero(np.r_[active[0] != previous, active[1:] != active[:-1]])
+            for offset in changes:
+                if active[offset]:
+                    pending = int(cs.starts[a + offset])
+                else:
+                    yield pending, int(cs.starts[a + offset])
+                    pending = None
+            previous = bool(active[-1])
+        if pending is not None:
+            yield pending, capture.count
 
     def _edge_chunks(self, start, end, cancel):
         starts, codes = self.sck.starts, self.sck.codes

@@ -217,13 +217,15 @@ Shift в колонках расширяет выделение, Shift на wave
 `install(menu, window)`. Контекстные команды добавляет `BookmarkActions`, используя
 `WaveformView.context_sample` — ближайший отсчёт правого щелчка.
 
-`EdgeMeasurementService.measure(signal, a, b)` считает переходы с отсчётом в
-`(min, max]` только по индексу серий. У сигнала со значениями лишь 0/1 серии
-чередуются, поэтому число фронтов, первый и последний фронт получаются двумя
-бинарными поисками за O(log n) независимо от длины диапазона; при X/Z выполняется
-векторный проход по переходам диапазона. `MeasurementFormatter` переводит результат
-в текст: для `Capture.times` — через `time_at` и `$timescale`, для CSV — в отсчётах
-и через период ILA clock.
+`EdgeMeasurementService.measure(signal, a, b, cancel)` counts real 0→1 and 1→0
+transitions in `(min(a,b), max(a,b)]`. Clean binary signals use O(log n) index
+searches. Unknown-state signals scan at most 262,144 transitions per batch with
+cancellation between batches. `measurements_ui.EdgeMeasurementController` coalesces
+requests for 60 ms, runs scans in a dedicated `BackgroundTask`, and accepts results
+only for the current signal/range. Capture replacement and close disable requests,
+cancel/join the worker, and only then release memory maps. Loading resumes the
+controller after installing the new capture. `MeasurementFormatter` uses exact
+simulator tick differences or the general CSV sample period.
 
 ## Zoom и копирование
 
@@ -284,7 +286,8 @@ memmap. `WaveformRenderer` выбирает только интервалы ви
 
 ## Загрузка и обработка на нескольких ядрах
 
-Горячие пути держат GIL, поэтому потоки не ускоряют работу. Два рычага, в таком порядке:
+NumPy kernels can release the GIL; parsing and dictionaries also perform Python work.
+Compare backends by workload before changing the process policy; see [performance evidence](PERFORMANCE.md).
 
 1. **Векторизация.** `csv_chunks.py` (без Qt) делит блок строк на ячейки по байтам
    (`split_block`), сравнивает соседние ячейки столбца массивом и разбирает только
@@ -375,7 +378,7 @@ SPI-декодер (≈12 тыс. кадров/с) и VCD пока работа�
 ## Проверки
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions
+.\.venv\Scripts\python.exe -m unittest -v tests.test_waveform tests.test_extensions tests.test_review
 .\.venv\Scripts\python.exe -m scripts.benchmark_waveform
 ```
 
@@ -384,3 +387,32 @@ SPI-декодер (≈12 тыс. кадров/с) и VCD пока работа�
 курсоры, контекстные команды и темы. Изменения производительности проверяются
 на синтетическом миллионе отсчётов, в том числе с раскрытой 9-битной шиной
 и с поиском последовательности Advanced Highlight.
+
+## Import, coordinate and ownership guarantees
+
+VCD headers and body share a bounded-read whitespace-token stream. Dump commands,
+scalar/vector changes and comments can span or share physical lines. CSV blocks
+end at complete records, including quoted multiline cells; a parallel quote
+encounter restarts through the single-process path. `_gather` budgets padded cell
+storage and index scratch space separately (16 MiB each); ordinary columns retain
+vectorized batches and skewed-width columns use compact byte objects.
+
+`Capture.time_at` preserves integral absolute ticks as Python integers and
+fractional absolute ticks as Decimal. Rendering and hit testing subtract a local
+integer timestamp origin before any float conversion (`time_offset_at`,
+`samples_at_offsets`); integer inverse queries search int64 timestamps directly.
+`SimulatorTimeAxis` applies the same rule to rulers and elapsed-time readouts.
+
+Simple and advanced highlight builders select grid points in ordered half-open
+`[min(A,B), max(A,B))` ranges and clip painted spans to those boundaries. Explicit
+condition bit selections retain their unsigned intent even when they select the
+entire physical bus. A quoted complete signal name without a following selection
+retains its original signedness.
+
+CSV merge copies runs in 262,144-run batches, checks the cancellation flag between
+batches, and cancels queued futures before waiting for active workers to release
+files. Value-table remapping checks cancellation between batches too. SPI CS
+frame discovery yields spans from bounded transition blocks with a carried active
+start, rather than materializing every frame. Completed task output that is not
+transferred into the view is released by `workers.dispose_result`, including lists
+of restored `HighlightGroup` owners, before capture storage cleanup.

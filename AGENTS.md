@@ -78,6 +78,11 @@ The user requires object-oriented, extensible design for this application.
   (cpu.py, spawn). Worker modules (csv_chunks, data, cpu) stay Qt-free; worker count is
   the general preference worker_count (0 = physical cores - 1). Vectorized paths must
   equal the scalar references in tests/reference.py. Tests inject CpuTopology.
-- Run `python -m unittest -v tests.test_waveform tests.test_extensions` for relevant
+- Run `python -m unittest -v tests.test_waveform tests.test_extensions tests.test_review` for relevant
   behavioral changes. Use `python -m scripts.benchmark_waveform` for changes affecting large captures.
 - Keep README.md, docs/USER_GUIDE.md and docs/ARCHITECTURE.md aligned with actual capabilities.
+
+- Unknown-state edge measurements use `EdgeMeasurementController`; clear/join and disable it
+  before closing capture maps, then resume only after a new capture is installed.
+- See `docs/PERFORMANCE.md` for workload/memory evidence and `scripts.benchmark_review`
+  for executor comparisons. Input block size alone does not bound padded-cell allocation.

@@ -6,6 +6,15 @@ from PySide6.QtCore import QThread, Signal
 from .data import LoadCancelled
 
 
+def dispose_result(result):
+    """Release unclaimed task output before its capture storage is removed."""
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            dispose_result(item)
+    elif hasattr(result, "close"):
+        result.close()
+
+
 class BackgroundTask(QThread):
     progress = Signal(int, int)
 

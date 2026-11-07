@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+from decimal import Decimal
+import math
 import re
 import tempfile
 from array import array
@@ -133,41 +135,60 @@ class Capture:
     timescale: str = ""
     split_buses: dict[str, list[SignalData]] = field(default_factory=dict)
 
+    def _time_parts(self, sample):
+        index = float(sample)
+        low = max(0, min(self.count - 1, int(index)))
+        if low == self.count - 1:
+            return int(self.times[low]), index - low
+        return int(self.times[low]), (index - low) * int(self.times[low + 1] - self.times[low])
+
     def time_at(self, sample):
-        """Interpolate a simulator timestamp at an event index, including the end boundary."""
+        """Absolute ticks; integral positions stay Python integers, fractions use Decimal."""
         if self.times is None:
             return sample
-        index = float(sample)
-        if self.count == 1:
-            return float(self.times[0]) + index
-        if index >= self.count - 1:
-            return float(self.times[-1]) + (index - self.count + 1)
-        low = max(0, int(index))
-        return float(self.times[low]) + (index - low) * int(self.times[low + 1] - self.times[low])
+        base, fraction = self._time_parts(sample)
+        return base if not fraction else Decimal(base) + Decimal(str(fraction))
+
+    def time_offset_at(self, sample, origin=None):
+        """Subtract an integer local origin *before* converting to floating point."""
+        base, fraction = self._time_parts(sample)
+        origin = int(self.times[0]) if origin is None else int(origin)
+        return (base - origin) + fraction
 
     def sample_at_time(self, timestamp):
         if self.times is None:
             return float(timestamp)
-        if self.count == 1:
-            return float(timestamp) - float(self.times[0])
-        if timestamp >= self.times[-1]:
-            return self.count - 1 + (timestamp - float(self.times[-1]))
-        index = max(0, int(np.searchsorted(self.times, timestamp, side="right")) - 1)
-        return index + (timestamp - float(self.times[index])) / int(self.times[index + 1] - self.times[index])
+        # Searching with a float coerces int64 timestamps to float64 inside numpy.
+        tick = math.floor(timestamp)
+        query = max(0, min(2**63 - 1, tick))
+        index = max(0, int(np.searchsorted(self.times, query, side="right")) - 1)
+        offset = float(timestamp - int(self.times[index]))
+        if index == self.count - 1:
+            return index + offset
+        return index + offset / int(self.times[index + 1] - self.times[index])
+
+    def samples_at_offsets(self, offsets, origin=None):
+        """Viewport-sized inverse using offsets from an integer timestamp origin."""
+        origin = int(self.times[0]) if origin is None else int(origin)
+        ticks = np.asarray(offsets, dtype=np.float64)
+        queries = np.fromiter((max(0, min(2**63 - 1, origin + math.floor(t))) for t in ticks.flat),
+                              dtype=np.int64, count=ticks.size).reshape(ticks.shape)
+        indices = np.clip(np.searchsorted(self.times, queries, side="right") - 1, 0, self.count - 1)
+        low = (self.times[indices] - origin).astype(np.float64)
+        following = np.minimum(indices + 1, self.count - 1)
+        widths = np.maximum(1, self.times[following] - self.times[indices])
+        return indices + (ticks - low) / widths
 
     def samples_at_times(self, timestamps):
-        """Vectorized inverse for viewport-width rendering only."""
-        ticks = np.asarray(timestamps, dtype=np.float64)
-        if self.count == 1:
-            return ticks - float(self.times[0])
-        indices = np.clip(np.searchsorted(self.times, ticks, side="right") - 1, 0, self.count - 2)
-        low = self.times[indices].astype(np.float64)
-        high = self.times[indices + 1].astype(np.float64)
-        result = indices + (ticks - low) / (high - low)
-        beyond = ticks >= self.times[-1]
-        if np.any(beyond):
-            result[beyond] = self.count - 1 + (ticks[beyond] - float(self.times[-1]))
-        return result
+        """Absolute integer ticks retain precision; rendering uses local offsets instead."""
+        ticks = np.asarray(timestamps)
+        if ticks.dtype.kind in "iu":
+            ticks = ticks.astype(np.int64)
+            indices = np.clip(np.searchsorted(self.times, ticks, side="right") - 1, 0, self.count - 1)
+            following = np.minimum(indices + 1, self.count - 1)
+            widths = np.maximum(1, self.times[following] - self.times[indices])
+            return indices + (ticks - self.times[indices]) / widths
+        return np.asarray([self.sample_at_time(t) for t in ticks.flat]).reshape(ticks.shape)
 
     def format_time(self, sample):
         if self.times is None:
@@ -177,7 +198,7 @@ class Capture:
     def format_ticks(self, ticks):
         seconds = unit_seconds(self.timescale)
         if seconds:
-            return format_seconds(ticks * seconds, seconds)
+            return format_seconds(Decimal(str(ticks)) * Decimal(str(seconds)), seconds)
         return f"{group_digits(ticks, 3)} × {self.timescale}"
 
     def close(self):
@@ -344,12 +365,14 @@ def _load_single(path, body, specs, folder, progress, cancel):
     size = max(1, path.stat().st_size)
     try:
         with path.open("rb") as stream:
-            for block, block_lines in iter_blocks(stream, body, None):
+            for block, block_lines in iter_blocks(stream, body, None, cancel=cancel):
                 if cancel():
                     raise LoadCancelled()
                 try:
                     cells, numbers = split_block(block, len(specs), lines)
                     for encoder, column in zip(encoders, cells):
+                        if cancel():
+                            raise LoadCancelled()
                         encoder.feed(column, rows, numbers)
                 except CellError as exc:
                     raise _cell_error(exc, 2) from exc
@@ -389,8 +412,8 @@ def _load_parallel(path, body, specs, folder, pool, workers, progress, cancel):
     for index, spec in enumerate(specs):
         if cancel():
             raise LoadCancelled()
-        merged.append(_plan_column(folder, index, spec, results, jobs))
-    _run([pool.submit(place_range, str(folder), f"part{k}", chunk_jobs) for k, chunk_jobs in enumerate(jobs)],
+        merged.append(_plan_column(folder, index, spec, results, jobs, cancel))
+    _run([pool.submit(place_range, str(folder), f"part{k}", chunk_jobs, str(flag)) for k, chunk_jobs in enumerate(jobs)],
          flag, cancel)
     rows = sum(result["rows"] for result in results)
     progress(99, rows)
@@ -410,11 +433,13 @@ def _run(futures, flag, cancel, progress=None):
     except BaseException:
         # Workers stop at their next block; their files must be closed before cleanup.
         flag.touch()
+        for future in futures:
+            future.cancel()  # queued ranges need not run before the capture can be released
         concurrent.futures.wait(futures)
         raise
 
 
-def _plan_column(folder, index, spec, results, jobs):
+def _plan_column(folder, index, spec, results, jobs, cancel=lambda: False):
     """Global value codes and the place of every range in the final column file.
 
     Local codes map to global ones in first-appearance order; a range whose first run
@@ -425,12 +450,14 @@ def _plan_column(folder, index, spec, results, jobs):
     last = None
     row_offset = offset = 0
     for k, result in enumerate(results):
+        if cancel():
+            raise LoadCancelled()
         runs, exported, local_width, first, final = result["columns"][index]
         if spec.meta:
             jobs[k].append((index, None, 0, 0, offset))
             offset += runs
             continue
-        lut = table.lut_for(exported)
+        lut = table.lut_for(exported, cancel)
         drop = int(bool(runs) and last is not None and int(lut[first]) == last)
         if runs:
             last = int(lut[final])

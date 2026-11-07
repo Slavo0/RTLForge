@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .timebase import format_seconds, group_digits
+from .data import LoadCancelled
 
 
 @dataclass(frozen=True)
@@ -34,11 +35,16 @@ class EdgeMeasurementService:
     """Reads the run-length index only; samples are never decoded or modified.
 
     A clean 0/1 signal alternates on every run, so counts come from binary
-    searches in O(log n). Signals with unknown states fall back to a scan of
-    the transitions inside the range.
+    searches in O(log n). Unknown states use a bounded, cancellable scan;
+    the GUI schedules that scan through EdgeMeasurementController.
     """
 
-    def measure(self, signal, start, end):
+    CHUNK = 262144
+
+    def is_fast(self, signal):
+        return signal is None or signal.width != 1 or len(signal.values) <= 2 and (self._levels(signal) >= 0).all()
+
+    def measure(self, signal, start, end, cancel=lambda: False):
         if signal is None or signal.width != 1 or len(signal.starts) == 0:
             return None
         start, end = sorted((int(start), int(end)))
@@ -51,7 +57,7 @@ class EdgeMeasurementService:
         levels = self._levels(signal)
         if len(signal.values) <= 2 and (levels >= 0).all():
             return self._alternating(signal, levels, start, end, first, last)
-        return self._scan(signal, levels, start, end, first, last)
+        return self._scan(signal, levels, start, end, first, last, cancel)
 
     @staticmethod
     def _levels(signal):
@@ -74,15 +80,23 @@ class EdgeMeasurementService:
                                int(signal.starts[first_rise_index]) if has_rise else None,
                                int(signal.starts[last_rise_index]) if has_rise else None)
 
-    def _scan(self, signal, levels, start, end, first, last):
-        before = levels[np.asarray(signal.codes[first - 1:last - 1], dtype=np.int64)]
-        after = levels[np.asarray(signal.codes[first:last], dtype=np.int64)]
-        rises = np.flatnonzero((before == 0) & (after == 1))
-        falls = int(np.count_nonzero((before == 1) & (after == 0)))
-        if not len(rises):
-            return EdgeMeasurement(start, end, 0, falls, None, None)
-        return EdgeMeasurement(start, end, len(rises), falls,
-                               int(signal.starts[first + rises[0]]), int(signal.starts[first + rises[-1]]))
+    def _scan(self, signal, levels, start, end, first, last, cancel):
+        rising = falling = 0
+        first_rise = last_rise = None
+        for a in range(first, last, self.CHUNK):
+            if cancel():
+                raise LoadCancelled()
+            b = min(last, a + self.CHUNK)
+            states = levels[np.asarray(signal.codes[a - 1:b], dtype=np.int64)]
+            before, after = states[:-1], states[1:]
+            rises = np.flatnonzero((before == 0) & (after == 1))
+            falling += int(np.count_nonzero((before == 1) & (after == 0)))
+            if len(rises):
+                if first_rise is None:
+                    first_rise = int(signal.starts[a + rises[0]])
+                last_rise = int(signal.starts[a + rises[-1]])
+                rising += len(rises)
+        return EdgeMeasurement(start, end, rising, falling, first_rise, last_rise)
 
 
 _UNITS = {"fs": 1e-15, "ps": 1e-12, "ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0}
