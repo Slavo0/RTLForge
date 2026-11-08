@@ -962,6 +962,137 @@ class SpiDecoderTests(unittest.TestCase):
             SpiDecoder().decode(cap, SpiDecoderConfig(SpiPins(LineRef("missing_sck"))))
 
 
+class SpiModeTrackingTests(unittest.TestCase):
+    """Commands of the table change protocol, dummy and XIP; chip files load exactly."""
+
+    setUp, capture, decode = SpiDecoderTests.setUp, SpiDecoderTests.capture, SpiDecoderTests.decode
+    labels = staticmethod(SpiDecoderTests.labels)
+
+    def micron(self, **changes):
+        from ila_viewer import spi_profiles
+        sets = {item.name: item for item in spi_profiles.builtin()}
+        return SpiSettings(commands=sets["Micron MT25QL128ABA"].commands, profile="Micron MT25QL128ABA", **changes)
+
+    def test_enter_and_reset_quad_mode_switch_the_command_lines(self):
+        from ila_viewer.spi import STATE_CHANGE, decode_summary
+        cap = self.capture([
+            [((0,), [0x35])],
+            [(QUAD, [0x0B, 0x00, 0x00, 0x40]), ("dummy", 10), (QUAD, [0x5A])],
+            [(QUAD, [0xF5])],
+            [((0,), [0x03, 0x00, 0x10, 0x00]), ((1,), [0x11])]])
+        result = self.decode(cap)
+        self.assertEqual([result.frame_format(i) for i in range(4)], ["1-0-0", "4-4-4", "4-0-0", "1-1-1"])
+        self.assertEqual(self.labels(result, 1), ["CMD 0B FAST READ", "ADDR 000040", "dummy 10", "RD 5A"])
+        self.assertEqual([bool(f & STATE_CHANGE) for f in result.frames["flags"]], [True, False, True, False])
+        self.assertIn("смен режима: 2 (в конце: Extended)", decode_summary(result))
+        # The same capture without following the commands stays in the starting protocol.
+        fixed = self.decode(cap, SpiSettings(track_state=False))
+        self.assertNotEqual(int(fixed.frames["opcode"][1]), 0x0B)
+        self.assertEqual(int(fixed.frames["cmd_lines"][1]), 1)
+        self.assertFalse(np.asarray(fixed.frames["flags"] & STATE_CHANGE).any())
+
+    def test_micron_register_writes_set_protocol_dummy_and_xip(self):
+        from ila_viewer.spi import XIP_FRAME, decode_summary, state_text
+        cap = self.capture([
+            [((0,), [0x06])],
+            [((0,), [0x81, 0x87])],                       # VCR: 8 dummy clocks, XIP enabled
+            [((0,), [0xEB]), (QUAD, [0x12, 0x34, 0x56]), ((0,), [0x00]), (QUAD, [0xA1, 0xA2])],  # confirm 0
+            [(QUAD, [0x00, 0x01, 0x00]), ((0,), [0x00]), (QUAD, [0xB1])],    # XIP: no command
+            [(QUAD, [0x00, 0x02, 0x00]), ((0,), [0x80]), (QUAD, [0xC1])],    # confirm 1: last XIP frame
+            [((0,), [0x06])],
+            [((0,), [0x61, 0x7F])],                       # EVCR bit 7 = 0: quad protocol
+            [(QUAD, [0x05]), (QUAD, [0x00])]])
+        result = self.decode(cap, self.micron())
+        formats = [result.frame_format(i) for i in range(result.frame_count)]
+        self.assertEqual(formats, ["1-0-0", "1-0-1", "1-4-4", "0-4-4", "0-4-4", "1-0-0", "1-0-1", "4-0-4"])
+        self.assertEqual(state_text(result.frames[1]), "Extended, dummy 8, XIP разрешён")
+        self.assertEqual(self.labels(result, 2)[2:], ["dummy 8 XIP", "RD A1", "RD A2"])
+        self.assertEqual(self.labels(result, 3), ["ADDR 000100", "dummy 8 XIP", "RD B1"])
+        self.assertEqual(self.labels(result, 4), ["ADDR 000200", "dummy 8 выход XIP", "RD C1"])
+        self.assertEqual(list(result.frames["opcode"][3:5]), [0xEB, 0xEB])
+        self.assertTrue(all(result.frames["flags"][3:5] & XIP_FRAME))
+        self.assertEqual(state_text(result.frames[4]), "Extended, dummy 8")
+        self.assertEqual(state_text(result.frames[6]), "Quad 4-4-4, dummy 8")
+        self.assertEqual(self.labels(result, 7), ["CMD 05 READ STATUS REGISTER", "RD 00"])
+        self.assertIn("в XIP без кода команды: 2", decode_summary(result))
+
+    def test_xip_at_capture_start_and_reset_memory_needs_reset_enable(self):
+        cap = self.capture([
+            [(QUAD, [0x00, 0x30, 0x00]), ((0,), [0x00]), (QUAD, [0x42])],
+            [((0,), [0x99])],                     # no 66h before: ignored
+            [(QUAD, [0x00, 0x40, 0x00]), ((0,), [0x00]), (QUAD, [0x43])]])
+        settings = self.micron(xip_opcode=0xEB, dummy_cycles=8)
+        result = self.decode(cap, settings)
+        self.assertEqual(self.labels(result, 0), ["ADDR 003000", "dummy 8 XIP", "RD 42"])
+        with self.assertRaises(ValueError):
+            SpiSettings(xip_opcode=0x03)          # 03h READ has no confirmation bit
+        quad = self.capture([[((0,), [0x35])], [(QUAD, [0x66])], [(QUAD, [0x99])], [((0,), [0x05, 0x00])]])
+        result = self.decode(quad, self.micron())
+        self.assertEqual(result.frame_format(3), "1-0-1")  # 66h, 99h: back to the starting protocol
+
+    def test_command_set_files_load_save_and_name_their_errors(self):
+        from ila_viewer import spi_profiles
+        from ila_viewer.spi import config_to_dict, settings_from_dict
+        folder = Path(self.temp.name)
+        settings = self.micron(xip_opcode=0xEB, track_state=True)
+        target = folder / "chip.json"
+        spi_profiles.save(target, "My chip", settings.commands, "datasheet")
+        loaded = spi_profiles.load(target)
+        self.assertEqual((loaded.name, loaded.source, loaded.commands), ("My chip", "datasheet", settings.commands))
+        stored = json.loads(json.dumps(config_to_dict(SpiDecoderConfig(spi_pins(), settings))))
+        self.assertEqual(settings_from_dict(stored), settings)
+        text = {"format": "spi-command-set", "version": 1, "name": "x", "commands": [
+            {"code": ["C7", "60"], "name": "ERASE", "extended": "1-0-0"},
+            {"code": "0xEBh", "extended": "1-4-4"}]}
+        bad_cases = [
+            ({"code": "35", "extended": "1-0-0", "adress": 3}, "неизвестные ключи adress"),
+            ({"code": "61", "extended": "1-0-1", "effects": [{"set": "protocol", "bits": "7:6",
+                                                              "values": {"0": "quad"}}]}, "2 бит"),
+            ({"code": "61", "extended": "1-0-1", "effects": [{"set": "protocol", "value": "qpi"}]},
+             "extended, dual или quad"),
+            ({"code": "1G", "extended": "1-0-0"}, "HEX 00…FF"),
+            ({"code": "C7", "extended": "1-0-0"}, "уже описан"),
+        ]
+        path = folder / "good.json"
+        path.write_text(json.dumps(text), encoding="utf-8")
+        self.assertEqual([spec.opcode for spec in spi_profiles.load(path).commands][:2], [0xC7, 0x60])
+        for entry, message in bad_cases:
+            broken = dict(text, commands=[*text["commands"][:1], entry])
+            path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaises(spi_profiles.CommandSetError, msg=message) as caught:
+                spi_profiles.load(path)
+            self.assertIn("команда 2", str(caught.exception))
+            self.assertIn(message, str(caught.exception))
+        path.write_text("{\"commands\": [", encoding="utf-8")
+        with self.assertRaisesRegex(spi_profiles.CommandSetError, "строке 1"):
+            spi_profiles.load(path)
+
+    def test_dialog_loads_a_chip_file_and_keeps_its_effects(self):
+        from ila_viewer import spi_profiles
+        from ila_viewer.spi_ui import SpiDecoderDialog
+        QApplication.instance() or QApplication([])
+        cap = self.capture(FLASH_FRAMES)
+        dialog = SpiDecoderDialog(cap.signals)
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.set_box.currentText(), spi_profiles.GENERIC_NAME)
+        micron = self.micron()
+        path = Path(self.temp.name) / "mt25q.json"
+        spi_profiles.save(path, "MT25Q copy", micron.commands)
+        self.assertTrue(dialog.load_command_set(path))
+        self.assertEqual(dialog.set_box.currentText(), "MT25Q copy")
+        dialog.xip_box.setCurrentIndex(dialog.xip_box.findData(0xEB))
+        settings = dialog.config().settings
+        self.assertEqual(settings.commands, micron.commands)
+        self.assertEqual((settings.profile, settings.xip_opcode), ("MT25Q copy", 0xEB))
+        path.write_text("[]", encoding="utf-8")
+        self.assertFalse(dialog.load_command_set(path))
+        self.assertIn("mt25q.json", dialog.error.text())
+        again = SpiDecoderDialog(cap.signals, settings=settings)
+        self.addCleanup(again.deleteLater)
+        self.assertEqual(again.set_box.currentText(), "Micron MT25QL128ABA")  # same table as the built-in one
+        self.assertEqual(again.xip_box.currentData(), 0xEB)
+
+
 def wire_spi_csv(frames, idle=3):
     """Mode-0 single-line SPI on separate 1-bit wires; ``frames`` holds (mosi, miso) byte pairs."""
     rows = []

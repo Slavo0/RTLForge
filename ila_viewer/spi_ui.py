@@ -20,13 +20,13 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTableView,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from . import spi_profiles
 from .actions import ContextActionProvider
-from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, RESET_FRAME, TRUNCATED, UNKNOWN,
-                  UNKNOWN_COMMAND, BusWidths, CommandSpec, DecodedTrack, FixedFormat,
-                  SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
-                  SpiSettings, bus_lines, config_to_dict, data_buses, decode_summary, default_commands,
-                  guess_pins,
-                  line_options, overlays, pins_from_dict, rebind, settings_from_dict)
+from .spi import (CONTENTS, DATA_KINDS, LINE_NAMES, MISO, PARTIAL, PROBLEMS, RESET_FRAME, STATE_CHANGE,
+                  TRUNCATED, UNKNOWN, UNKNOWN_COMMAND, XIP_FRAME, BusWidths, CommandSpec, DecodedTrack,
+                  FixedFormat, SpiDecoder, SpiDecoderConfig, SpiExportRequest, SpiExportService, SpiPins, SpiQuery,
+                  SpiSettings, bus_lines, config_to_dict, data_buses, decode_summary,
+                  guess_pins, line_options, overlays, pins_from_dict, rebind, settings_from_dict, state_text)
 from .data import LoadCancelled
 from .tree import DecodedNode
 from .widgets import SegmentedChoice, muted, plain_container
@@ -38,6 +38,7 @@ SEARCH_TOOLTIP = "\n".join((
     "Enter — применить; F3 на строке SPI — к следующему совпадению"))
 FIXED_PRESETS = ("1-1-1", "1-1-2", "1-2-2", "1-1-4", "1-4-4", "2-2-2", "4-4-4", "0-4-4", "0-1-1", "1-0-1", "1-1-0", "1-0-0")
 DIRECTION_TEXT = {"read": "чтение", "write": "запись", "none": "нет"}
+YES = {"да", "yes", "1", "true", "+"}
 SEPARATORS = {"space": ("Пробел", " "), "none": ("Без разделителя", ""), "comma": ("Запятая", ","),
               "comma_space": ("Запятая и пробел", ", "), "tab": ("Табуляция", "\t"), "newline": ("Новая строка", "\n")}
 
@@ -57,7 +58,8 @@ class SpiDecoderDialog(QDialog):
 
     decodeRequested = Signal(object)
     COLUMNS = ("Код", "Команда", "Extended", "Dual", "Quad", "Адрес, Б", "Dummy Ext",
-               "Dummy Dual", "Dummy Quad", "Данные", "DTR", "Dummy из настройки")
+               "Dummy Dual", "Dummy Quad", "Данные", "DTR", "Dummy из настройки", "XIP", "Меняет режим")
+    EFFECTS = 13  # read-only column; the effects come from the command set file
 
     def __init__(self, signals, config=None, settings=None, parent=None, pins=None):
         super().__init__(parent)
@@ -240,11 +242,42 @@ class SpiDecoderDialog(QDialog):
         form = QFormLayout()
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(6)
+        # Command set: built-in tables and chip files; the table below shows the chosen one.
+        self.set_box = QComboBox()
+        self.set_box.setMinimumWidth(260)
+        self.command_sets = []
+        for command_set in spi_profiles.builtin():
+            self._add_set(command_set)
+        current = next((i for i, item in enumerate(self.command_sets) if item.commands == settings.commands), None)
+        if current is None:
+            self._add_set(spi_profiles.CommandSet(settings.profile or "Своя таблица", settings.commands))
+            current = len(self.command_sets) - 1
+        self.set_box.setCurrentIndex(current)
+        self.set_box.currentIndexChanged.connect(self._set_chosen)
+        load = QPushButton("Загрузить…")
+        load.setToolTip("Файл JSON с командами микросхемы (формат — в docs/USER_GUIDE.md)")
+        load.clicked.connect(self._ask_load)
+        save = QPushButton("Сохранить как…")
+        save.setToolTip("Записать текущую таблицу в файл JSON, чтобы дополнить её для другой микросхемы")
+        save.clicked.connect(self._ask_save)
+        set_row = QHBoxLayout()
+        set_row.addWidget(self.set_box, 1)
+        for button in (load, save):
+            button.setAutoDefault(False)
+            set_row.addWidget(button)
+        form.addRow("Микросхема", set_row)
         self.protocol_box = SegmentedChoice([
-            ("extended", "Extended 1-x-x", "Команда на IO0, адрес и данные — по формату команды\n"
-                                              "(обычный SPI и QSPI 1-1-4, 1-4-4)"),
-            ("dual", "DPI 2-2-2", "Микросхема в режиме DPI: команда тоже на 2 линиях"),
-            ("quad", "QPI 4-4-4", "Микросхема в режиме QPI: команда тоже на 4 линиях")], settings.protocol)
+            ("extended", "Extended · 1-1-1 … 1-4-4", "Команда на IO0; адрес и данные — по формату команды:\n"
+                                                     "03h 1-1-1, 6Bh 1-1-4, EBh 1-4-4"),
+            ("dual", "Dual · 2-2-2", "Микросхема в режиме DPI: команда тоже на 2 линиях"),
+            ("quad", "Quad · 4-4-4", "Микросхема в режиме QPI: команда тоже на 4 линиях")], settings.protocol)
+        self.track_box = QCheckBox("Команды меняют режим")
+        self.track_box.setToolTip("Действия из столбца «Меняет режим»: 35h/F5h, запись регистров\n"
+                                  "конфигурации, бит подтверждения XIP. Режим выше — состояние в начале захвата.")
+        self.track_box.setChecked(settings.track_state)
+        self.xip_box = QComboBox()
+        self.xip_box.setToolTip("Захват начался в XIP: кадры без кода команды продолжают выбранную")
+        self._xip_start = settings.xip_opcode
         self.address_box = SegmentedChoice([(3, "3 байта"), (4, "4 байта", "Команды с 3-байтовым адресом тоже читают 4 байта")],
                                            settings.address_bytes)
         self.dummy_box = QSpinBox()
@@ -254,8 +287,19 @@ class SpiDecoderDialog(QDialog):
         self.dummy_box.setToolTip("Dummy-такты команд FAST READ. Должно совпадать с настройкой микросхемы.")
         self.dtr_box = QCheckBox("DTR: все фазы на обоих фронтах")
         self.dtr_box.setChecked(settings.dtr)
-        form.addRow("Протокол", self.protocol_box)
-        form.addRow("Адрес", self.address_box)
+        protocol_row = QHBoxLayout()
+        protocol_row.addWidget(self.protocol_box)
+        protocol_row.addSpacing(16)
+        protocol_row.addWidget(self.track_box)
+        protocol_row.addStretch(1)
+        form.addRow("Режим в начале", protocol_row)
+        address_row = QHBoxLayout()
+        address_row.addWidget(self.address_box)
+        address_row.addSpacing(16)
+        address_row.addWidget(muted("XIP в начале"))
+        address_row.addWidget(self.xip_box)
+        address_row.addStretch(1)
+        form.addRow("Адрес", address_row)
         dummy_row = QHBoxLayout()
         dummy_row.addWidget(self.dummy_box)
         dummy_row.addSpacing(16)
@@ -269,7 +313,9 @@ class SpiDecoderDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setToolTip("Формат: команда-адрес-данные в линиях. Пусто в Dual/Quad — "
-                              "те же фазы на 2/4 линиях. Данные: чтение, запись или нет.")
+                              "те же фазы на 2/4 линиях. Данные: чтение, запись или нет.\n"
+                              "«Меняет режим» задаётся в файле набора команд.")
+        self.table.itemChanged.connect(lambda item: self._fill_xip() if item.column() == 12 else None)
         self.fill_table(settings.commands)
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -285,9 +331,7 @@ class SpiDecoderDialog(QDialog):
         add.clicked.connect(self.add_row)
         remove = QPushButton("Удалить выбранные")
         remove.clicked.connect(self.remove_rows)
-        reset = QPushButton("По умолчанию")
-        reset.clicked.connect(lambda: self.fill_table(default_commands()))
-        for button in (add, remove, reset):
+        for button in (add, remove):
             button.setAutoDefault(False)
             tools.addWidget(button)
         tools.addStretch(1)
@@ -306,10 +350,80 @@ class SpiDecoderDialog(QDialog):
         if self.isVisible():
             self._mode_changed()
 
+    def _add_set(self, command_set):
+        self.command_sets.append(command_set)
+        self.set_box.addItem(command_set.name)
+        tip = "\n".join(filter(None, (command_set.source, str(command_set.path or ""))))
+        self.set_box.setItemData(self.set_box.count() - 1, tip or command_set.name, Qt.ItemDataRole.ToolTipRole)
+
+    def _set_chosen(self, index):
+        if 0 <= index < len(self.command_sets):
+            self.fill_table(self.command_sets[index].commands)
+            self.error.clear()
+
+    def load_command_set(self, path):
+        """Add a command set file to the list and show it; False with the reason on error."""
+        try:
+            command_set = spi_profiles.load(path)
+        except spi_profiles.CommandSetError as exc:
+            self.error.setText(str(exc))
+            return False
+        self._add_set(command_set)
+        self.set_box.setCurrentIndex(len(self.command_sets) - 1)
+        self.error.setText(f"Загружено команд: {len(command_set.commands)} — {command_set.name}")
+        return True
+
+    def save_command_set(self, path):
+        try:
+            commands = self.table_commands()
+            name = self.set_box.currentText() or Path(path).stem
+            spi_profiles.save(path, name, commands, self.command_sets[self.set_box.currentIndex()].source
+                              if self.set_box.currentIndex() >= 0 else "")
+        except (OSError, ValueError) as exc:
+            self.error.setText(f"Не сохранено: {exc}")
+            return False
+        self.error.setText(f"Сохранено: {path}")
+        return True
+
+    def _ask_load(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Набор команд SPI", "", "Набор команд (*.json);;Все файлы (*)")
+        if path:
+            self.load_command_set(path)
+
+    def _ask_save(self):
+        name = (self.set_box.currentText() or "commands").replace(" ", "_").replace("/", "_")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить набор команд", f"{name}.json",
+                                              "Набор команд (*.json)")
+        if path:
+            self.save_command_set(path)
+
+    def _fill_xip(self):
+        """XIP-at-start choices: commands of the table marked XIP."""
+        chosen = self.xip_box.currentData() if self.xip_box.count() else self._xip_start
+        self.xip_box.blockSignals(True)
+        self.xip_box.clear()
+        self.xip_box.addItem("нет", None)
+        for row in range(self.table.rowCount()):
+            code, name, xip = (self.table.item(row, c) for c in (0, 1, 12))
+            if code and xip and xip.text().strip().casefold() in YES:
+                try:
+                    opcode = int(code.text().strip().removesuffix("h").removesuffix("H"), 16)
+                except ValueError:
+                    continue
+                self.xip_box.addItem(f"{opcode:02X}h {name.text() if name else ''}".strip(), opcode)
+        self.xip_box.setCurrentIndex(max(0, self.xip_box.findData(chosen)) if chosen is not None else 0)
+        self.xip_box.blockSignals(False)
+
     def fill_table(self, commands):
+        self.table.blockSignals(True)
         self.table.setRowCount(0)
         for spec in commands:
             self.add_row(spec)
+        self.table.blockSignals(False)
+        self._fill_xip()
+        if hasattr(self, "table_toggle"):
+            self.table_toggle.setText(("▾ " if self.table.isVisibleTo(self) else "▸ ")
+                                      + f"Таблица команд ({self.table.rowCount()})")
 
     def add_row(self, spec=None):
         if not isinstance(spec, CommandSpec):
@@ -318,9 +432,14 @@ class SpiDecoderDialog(QDialog):
         self.table.insertRow(row)
         cells = (f"{spec.opcode:02X}", spec.name, *spec.formats, str(spec.address_bytes),
                  *map(str, spec.dummy), DIRECTION_TEXT[spec.direction], "да" if spec.dtr else "нет",
-                 "да" if spec.configurable_dummy else "нет")
+                 "да" if spec.configurable_dummy else "нет", "да" if spec.xip else "нет")
         for column, text in enumerate(cells):
             self.table.setItem(row, column, QTableWidgetItem(text))
+        effects = QTableWidgetItem(spec.effects_text())
+        effects.setFlags(effects.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        effects.setData(Qt.ItemDataRole.UserRole, spec.effects)
+        effects.setToolTip(spec.effects_text().replace("; ", "\n") or "Режим не меняет")
+        self.table.setItem(row, self.EFFECTS, effects)
         if spec.opcode == 0 and spec.name == "НОВАЯ КОМАНДА":
             self.table.scrollToBottom()
             self.table.setCurrentCell(row, 0)
@@ -331,7 +450,7 @@ class SpiDecoderDialog(QDialog):
 
     def table_commands(self):
         commands = []
-        yes = {"да", "yes", "1", "true", "+"}
+        yes = YES
         directions = {"чтение": "read", "read": "read", "запись": "write", "write": "write",
                       "нет": "none", "none": "none", "": "none"}
         for row in range(self.table.rowCount()):
@@ -361,8 +480,11 @@ class SpiDecoderDialog(QDialog):
             direction = directions.get(text[9].casefold())
             if direction is None:
                 raise ValueError(f"{where}: данные — «чтение», «запись» или «нет»")
+            effects = self.table.item(row, self.EFFECTS)
+            effects = tuple(effects.data(Qt.ItemDataRole.UserRole) or ()) if effects else ()
             commands.append(CommandSpec(opcode, text[1] or f"CMD {opcode:02X}", tuple(formats), address, dummy,
-                                        direction, text[10].casefold() in yes, text[11].casefold() in yes))
+                                        direction, text[10].casefold() in yes, text[11].casefold() in yes,
+                                        text[12].casefold() in yes, effects))
         return tuple(commands)
 
     def _fixed_page(self, fixed):
@@ -439,7 +561,10 @@ class SpiDecoderDialog(QDialog):
             protocol=self.protocol_box.currentData(), address_bytes=self.address_box.currentData(),
             dummy_cycles=None if self.dummy_box.value() < 0 else self.dummy_box.value(),
             dtr=self.dtr_box.isChecked(), commands=self.table_commands(), fixed=fixed,
-            raw_lines=self.raw_lines.currentData(), reset_frames=self.reset_box.isChecked())
+            raw_lines=self.raw_lines.currentData(), reset_frames=self.reset_box.isChecked(),
+            track_state=self.track_box.isChecked(),
+            xip_opcode=self.xip_box.currentData() if mode == "commands" else None,
+            profile=self.set_box.currentText())
         self._check_lines(settings, io)
         return SpiDecoderConfig(pins, settings)
 
@@ -532,6 +657,8 @@ class SpiTransactionModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ToolTipRole and column == 3:
             return self.result.command_name(int(frame["opcode"]))
+        if role == Qt.ItemDataRole.ToolTipRole and column == 9 and state_text(frame):
+            return "После транзакции: " + state_text(frame)
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         start, end = int(frame["start"]), int(frame["end"])
@@ -546,7 +673,9 @@ class SpiTransactionModel(QAbstractTableModel):
             opcode = int(frame["opcode"])
             if frame["flags"] & RESET_FRAME:
                 return "сброс режима"
-            return f"{opcode:02X} {self.result.command_name(opcode)}" if opcode >= 0 else "—"
+            if opcode < 0:
+                return "—"
+            return f"{opcode:02X} {self.result.command_name(opcode)}" + (" · XIP" if frame["flags"] & XIP_FRAME else "")
         if column == 4:
             return self.result.frame_format(frame_index)
         if column == 5:
@@ -561,6 +690,8 @@ class SpiTransactionModel(QAbstractTableModel):
         flags = int(frame["flags"])
         names = [text for bit, text in ((UNKNOWN_COMMAND, "нет в таблице"), (UNKNOWN, "X/Z"),
                                         (PARTIAL, "неполный"), (TRUNCATED, "обрезан")) if flags & bit]
+        if flags & STATE_CHANGE:
+            names.append("→ " + state_text(frame))
         return ", ".join(names)
 
 
@@ -706,10 +837,30 @@ class SpiPanel(QDockWidget):
                 if opcode >= 0:
                     self.filter_box.addItem(f"{int(opcode):02X} {result.command_name(int(opcode))} ({count:,})",
                                             int(opcode))
+            for text, count, key in self._formats(result):
+                self.filter_box.addItem(f"Формат {text} ({count:,})", f"format:{key}")
+            changes = int(np.count_nonzero(np.asarray(result.frames["flags"]) & STATE_CHANGE))
+            if changes:
+                self.filter_box.addItem(f"Смена режима ({changes:,})", "state")
             self.filter_box.addItem("С ошибками / нет в таблице", "problems")
         self.filter_box.blockSignals(False)
         self.result = result
         self.apply_filter()
+
+    @staticmethod
+    def _format_keys(frames):
+        """One integer per frame: command, address and data lines and DTR (reset frames: -1)."""
+        keys = (np.asarray(frames["cmd_lines"], dtype=np.int64) << 12 | np.asarray(frames["addr_lines"], dtype=np.int64)
+                << 8 | np.asarray(frames["data_lines"], dtype=np.int64) << 4
+                | (np.asarray(frames["dtr"], dtype=np.int64) != 0))
+        keys[(np.asarray(frames["flags"]) & RESET_FRAME) != 0] = -1
+        return keys
+
+    def _formats(self, result):
+        """(format text, frame count, key) for every format that occurs, e.g. ("1-4-4", 340, key)."""
+        keys, first, counts = np.unique(self._format_keys(result.frames), return_index=True, return_counts=True)
+        return [(result.frame_format(int(index)), int(count), int(key)) for key, index, count in
+                zip(keys, first, counts) if key >= 0]
 
     def apply_filter(self):
         self.stop_search()
@@ -724,7 +875,11 @@ class SpiPanel(QDockWidget):
         if isinstance(choice, int):
             mask &= np.asarray(frames["opcode"]) == choice
         elif choice == "problems":
-            mask &= np.asarray(frames["flags"]) != 0
+            mask &= (np.asarray(frames["flags"]) & PROBLEMS) != 0
+        elif choice == "state":
+            mask &= (np.asarray(frames["flags"]) & STATE_CHANGE) != 0
+        elif isinstance(choice, str) and choice.startswith("format:"):
+            mask &= self._format_keys(frames) == int(choice.split(":", 1)[1])
         if self.data_only.isChecked():
             mask &= np.asarray(frames["data_bytes"]) > 0
         found = ""

@@ -72,7 +72,12 @@ The user requires object-oriented, extensible design for this application.
   copy/highlight editors nonmodal so navigation and zoom remain available.
 - SPI/QSPI decoding lives in spi.py (Qt-free, disk-backed, cancellable) and spi_ui.py.
   Every line and frame format is user-chosen (command table, fixed format such as 1-4-4
-  or 0-4-4, raw bytes); never infer the mode from traffic. Decoder rows are DecodedNode
+  or 0-4-4, raw bytes); never infer the mode from traffic heuristically. In the command
+  mode the protocol/DTR/dummy/address/XIP state starts from the dialog choices and changes
+  only through effects declared in the command table (35h/F5h, register-write bit fields,
+  XIP confirmation bit), in capture order; option track_state turns this off. Chip command
+  sets are JSON files (spi_profiles.py, built-ins in assets/spi) validated with errors that
+  name the entry; unknown keys are errors. Decoder rows are DecodedNode
   tracks; decoder config is capture state. Only the last dialog choices persist
   (preference spi_decoder) to prefill the dialog; remembered lines apply only when all
   exist. A 2/4-bit data bus may prefill IO0-IO3. All-ones frames on the command lines

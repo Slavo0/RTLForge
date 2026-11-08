@@ -13,6 +13,13 @@ Results are written to disk next to the capture indices and mapped read-only, so
 long logs do not need the decoded bytes in memory. Every user choice (lines, sample
 edge, frame format, command table, dummy cycles) is explicit; nothing is guessed from
 the traffic.
+
+In the command mode the decoder keeps a ``DecoderState`` (protocol, DTR, dummy clocks,
+address size, XIP) that starts from the dialog choices. Only the effects listed in the
+command table change it, in capture order: ``35h`` switches to quad, a register write
+sets the fields its effect names, and an XIP confirmation bit makes the next frames
+start without a command (``0-4-4``). A chip's table with its effects can be loaded
+from a file (``spi_profiles``).
 """
 from __future__ import annotations
 
@@ -36,11 +43,16 @@ DATA_KINDS = frozenset({READ, WRITE, MOSI, MISO, DATA})
 # Field flags.
 UNKNOWN = 1   # a bit was X/Z, or its line is not assigned
 PARTIAL = 2   # chip select ended before the unit was complete
+XIP_HOLD = 4  # dummy field: XIP confirmation bit 0, the next frames carry no command
+XIP_EXIT = 8  # dummy field: XIP confirmation bit 1, XIP ends after this frame
 
 # Frame flags (UNKNOWN and PARTIAL keep their meaning for the frame as a whole).
 UNKNOWN_COMMAND = 4
 TRUNCATED = 8  # chip select was already active at the capture start, or still active at its end
 RESET_FRAME = 16  # only ones on the command lines: a mode-exit / power-loss recovery sequence
+XIP_FRAME = 32    # no command phase: the opcode is the one XIP continues
+STATE_CHANGE = 64  # the decoder state (protocol, DTR, dummy, address, XIP) changed after this frame
+PROBLEMS = UNKNOWN | PARTIAL | UNKNOWN_COMMAND | TRUNCATED
 
 FIELD_DTYPE = np.dtype([("start", "<i8"), ("end", "<i8"), ("value", "<i8"), ("frame", "<i4"),
                         ("kind", "u1"), ("flags", "u1"), ("bits", "u1"), ("lines", "u1")])
@@ -48,7 +60,11 @@ FRAME_DTYPE = np.dtype([("start", "<i8"), ("end", "<i8"), ("address", "<i8"), ("
                         ("cmd_lines", "u1"), ("addr_lines", "u1"), ("data_lines", "u1"),
                         ("address_bytes", "u1"), ("dummy", "u1"), ("flags", "u1"), ("dtr", "u1"),
                         ("direction", "u1"), ("first", "<i8", (2,)), ("count", "<i8", (2,)),
-                        ("data_bytes", "<i8")])
+                        ("data_bytes", "<i8"),
+                        # Decoder state after the frame (command mode): command lines 1/2/4,
+                        # STATE_* bits and dummy clocks (255: by the table).
+                        ("next_lines", "u1"), ("next_flags", "u1"), ("next_dummy", "u1")])
+STATE_DTR, STATE_XIP_ENABLED, STATE_XIP_ACTIVE, STATE_ADDRESS4 = 1, 2, 4, 8
 
 DIRECTIONS = ("none", "read", "write")
 PROTOCOLS = {"extended": 1, "dual": 2, "quad": 4}
@@ -123,6 +139,99 @@ class BusWidths:
         return BusWidths(*(lines if width else 0 for width in (self.command, self.address, self.data)))
 
 
+PROTOCOL_TITLES = {"extended": "Extended", "dual": "Dual 2-2-2", "quad": "Quad 4-4-4"}
+STATE_TARGETS = ("protocol", "dtr", "dummy", "address_bytes", "xip", "reset")
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class CommandEffect:
+    """How a command changes the decoder state once its frame ends.
+
+    Without ``bits`` the value is fixed (``35h``: protocol quad). With ``bits`` (high, low)
+    the value is a field of data byte ``byte`` of the frame: ``values`` maps the field
+    to a value; a field that ``values`` does not list is taken as a number for ``dummy``
+    and ignored otherwise. ``after`` requires that opcode in the previous frame
+    (``99h`` RESET MEMORY after ``66h`` RESET ENABLE).
+    """
+
+    target: str
+    value: object = None
+    byte: int = 0
+    bits: tuple | None = None
+    values: tuple = ()        # ((field value, state value), ...)
+    after: int | None = None
+
+    HINTS = {"protocol": "extended, dual или quad", "dtr": "true или false", "xip": "true или false",
+             "dummy": "0…255 или default", "address_bytes": "3 или 4", "reset": ""}
+
+    def __post_init__(self):
+        if self.target not in STATE_TARGETS:
+            raise ValueError(f"действие «{self.target}»: допустимо " + ", ".join(STATE_TARGETS))
+        if self.bits is not None:
+            high, low = self.bits
+            if not 7 >= high >= low >= 0:
+                raise ValueError(f"биты {high}:{low}: ожидается старший:младший в пределах 7…0")
+            if not 0 <= self.byte <= 255:
+                raise ValueError("номер байта данных: 0…255")
+            for field_value, state_value in self.values:
+                if not 0 <= field_value < 1 << (high - low + 1):
+                    raise ValueError(f"значение поля {field_value} не помещается в биты {high}:{low}")
+                self.check(state_value)
+            if self.target == "reset" or (self.target != "dummy" and not self.values):
+                raise ValueError(f"«{self.target}» из битов данных: нужна таблица значений")
+        elif self.target != "reset":
+            self.check(self.value)
+        if self.after is not None and not 0 <= self.after <= 0xFF:
+            raise ValueError("after: код предыдущей команды 00…FF")
+
+    def check(self, value):
+        valid = {"protocol": lambda v: v in PROTOCOLS,
+                 "dtr": lambda v: isinstance(v, bool), "xip": lambda v: isinstance(v, bool),
+                 "dummy": lambda v: v == "default" or (isinstance(v, int) and not isinstance(v, bool)
+                                                       and 0 <= v <= 254),
+                 "address_bytes": lambda v: v in (3, 4), "reset": lambda v: True}[self.target]
+        if not valid(value):
+            raise ValueError(f"«{self.target}»: значение {value!r} недопустимо ({self.HINTS[self.target]})")
+
+    def resolve(self, data):
+        """New state value from the frame's data bytes (None marks an unknown byte)."""
+        if self.bits is None:
+            return self.value
+        if self.byte >= len(data) or data[self.byte] is None:
+            return _MISSING
+        high, low = self.bits
+        field_value = (data[self.byte] >> low) & ((1 << (high - low + 1)) - 1)
+        for key, value in self.values:
+            if key == field_value:
+                return value
+        return field_value if self.target == "dummy" else _MISSING
+
+    def _value_text(self, value):
+        if self.target == "protocol":
+            return PROTOCOL_TITLES[value]
+        if self.target in ("dtr", "xip"):
+            return "вкл." if value else "выкл."
+        if self.target == "dummy":
+            return "по таблице" if value == "default" else f"{value} такт."
+        if self.target == "address_bytes":
+            return f"{value} Б"
+        return ""
+
+    def describe(self):
+        name = {"protocol": "протокол", "dtr": "DTR", "dummy": "dummy", "address_bytes": "адрес",
+                "xip": "XIP", "reset": "сброс режима"}[self.target]
+        prefix = f"после {self.after:02X}h: " if self.after is not None else ""
+        if self.target == "reset":
+            return prefix + name
+        if self.bits is None:
+            return f"{prefix}{name} → {self._value_text(self.value)}"
+        high, low = self.bits
+        where = f"байт {self.byte} [{high}:{low}]" if high != low else f"байт {self.byte} [{high}]"
+        cases = ", ".join(f"{key:0{high - low + 1}b}→{self._value_text(value)}" for key, value in self.values)
+        return f"{prefix}{name} из {where}" + (f": {cases}" if cases else "")
+
+
 @dataclass(frozen=True)
 class CommandSpec:
     opcode: int
@@ -133,6 +242,11 @@ class CommandSpec:
     direction: str = "none"   # data phase: "read" (from device), "write" (to device), "none"
     dtr: bool = False         # address and data transfer on both clock edges
     configurable_dummy: bool = False  # follows the "dummy cycles" setting (FAST READ family)
+    xip: bool = False         # the first dummy clock on IO0 is the XIP confirmation bit
+    effects: tuple = ()       # CommandEffect items applied after the frame
+
+    def effects_text(self):
+        return "; ".join(effect.describe() for effect in self.effects)
 
     def widths(self, protocol):
         index = ("extended", "dual", "quad").index(protocol)
@@ -146,8 +260,14 @@ class CommandSpec:
         return int(self.dummy[("extended", "dual", "quad").index(protocol)])
 
 
-def _spec(opcode, name, formats, address=0, dummy=(0, 0, 0), direction="none", dtr=False, configurable=False):
-    return CommandSpec(opcode, name, tuple(formats), address, tuple(dummy), direction, dtr, configurable)
+def _spec(opcode, name, formats, address=0, dummy=(0, 0, 0), direction="none", dtr=False, configurable=False,
+          effects=()):
+    return CommandSpec(opcode, name, tuple(formats), address, tuple(dummy), direction, dtr, configurable,
+                       effects=tuple(effects))
+
+
+def _set(target, value=None, after=None):
+    return CommandEffect(target, value, after=after)
 
 
 def default_commands():
@@ -158,7 +278,7 @@ def default_commands():
     a = ("1-1-0", "2-2-0", "4-4-0")
     m = ("1-1-1", "2-2-2", "4-4-4")
     return (
-        s(0x66, "RESET ENABLE", q), s(0x99, "RESET MEMORY", q),
+        s(0x66, "RESET ENABLE", q), s(0x99, "RESET MEMORY", q, effects=[_set("reset", after=0x66)]),
         s(0x9E, "READ ID", ("1-0-1", "", ""), direction="read"),
         s(0x9F, "READ ID", ("1-0-1", "", ""), direction="read"),
         s(0xAF, "MULTIPLE I/O READ ID", rr, direction="read"),
@@ -207,8 +327,10 @@ def default_commands():
         s(0x75, "PROGRAM/ERASE SUSPEND", q), s(0x7A, "PROGRAM/ERASE RESUME", q),
         s(0x4B, "READ OTP ARRAY", m, 3, (8, 8, 10), "read", configurable=True),
         s(0x42, "PROGRAM OTP ARRAY", m, 3, direction="write"),
-        s(0x35, "ENTER QUAD I/O MODE", q), s(0xF5, "RESET QUAD I/O MODE", q),
-        s(0xB7, "ENTER 4-BYTE ADDRESS MODE", q), s(0xE9, "EXIT 4-BYTE ADDRESS MODE", q),
+        s(0x35, "ENTER QUAD I/O MODE", q, effects=[_set("protocol", "quad")]),
+        s(0xF5, "RESET QUAD I/O MODE", q, effects=[_set("protocol", "extended")]),
+        s(0xB7, "ENTER 4-BYTE ADDRESS MODE", q, effects=[_set("address_bytes", 4)]),
+        s(0xE9, "EXIT 4-BYTE ADDRESS MODE", q, effects=[_set("address_bytes", 3)]),
         s(0xB9, "ENTER DEEP POWER-DOWN", q), s(0xAB, "RELEASE FROM DEEP POWER-DOWN", q),
         s(0x2D, "READ SECTOR PROTECTION", rr, direction="read"),
         s(0x2C, "PROGRAM SECTOR PROTECTION", rr, direction="write"),
@@ -267,6 +389,11 @@ class SpiSettings:
     # Frames with only ones on the command lines (any clock count) are the controller's
     # mode-exit / power-loss recovery sequence, shown as RESET instead of an unknown command.
     reset_frames: bool = True
+    # Command mode: the effects in the table (35h, register writes, XIP) change the
+    # protocol, DTR, dummy and address size chosen above, frame by frame.
+    track_state: bool = True
+    xip_opcode: int | None = None  # XIP already active at the capture start, continuing this command
+    profile: str = ""              # name of the command set (built-in or loaded file), display only
 
     def __post_init__(self):
         if self.mode not in ("commands", "fixed", "raw"):
@@ -288,6 +415,10 @@ class SpiSettings:
         opcodes = [spec.opcode for spec in self.commands]
         if len(set(opcodes)) != len(opcodes):
             raise ValueError("Коды команд в таблице повторяются")
+        if self.xip_opcode is not None:
+            spec = self.command(self.xip_opcode)
+            if spec is None or not spec.xip:
+                raise ValueError(f"XIP при старте: в таблице нет команды {self.xip_opcode:02X}h с признаком XIP")
 
     def command(self, opcode):
         return next((spec for spec in self.commands if spec.opcode == opcode), None)
@@ -301,8 +432,10 @@ class SpiSettings:
             return (f"фиксированный {f.widths.text}, адрес {f.address_bytes} Б, dummy {f.dummy}"
                     + (f", DTR {f.dtr}" if f.dtr != "off" else "") + f", SCK {edge}")
         dummy = "по таблице" if self.dummy_cycles is None else str(self.dummy_cycles)
-        return (f"по командам, {self.protocol}{' DTR' if self.dtr else ''}, адрес {self.address_bytes} Б, "
-                f"dummy {dummy}, SCK {edge}")
+        xip = f", XIP {self.xip_opcode:02X}h" if self.xip_opcode is not None else ""
+        return (f"{self.profile or 'по командам'}, {'старт ' if self.track_state else ''}{self.protocol}"
+                f"{' DTR' if self.dtr else ''}{xip}, адрес {self.address_bytes} Б, dummy {dummy}, SCK {edge}"
+                + ("" if self.track_state else ", без смены режима"))
 
 
 @dataclass(frozen=True)
@@ -312,6 +445,68 @@ class SpiDecoderConfig:
 
     def describe(self):
         return self.settings.describe()
+
+
+@dataclass
+class DecoderState:
+    """What the device is set to at a point of the capture, as the decoder follows it."""
+
+    protocol: str
+    dtr: bool
+    dummy: int | None
+    address_bytes: int
+    xip_enabled: bool = False      # XIP allowed (volatile configuration): a confirmation bit 0 activates it
+    xip_opcode: int | None = None  # XIP active: frames carry no command and continue this one
+
+    @classmethod
+    def initial(cls, settings):
+        return cls(settings.protocol, settings.dtr, settings.dummy_cycles, settings.address_bytes,
+                   settings.xip_opcode is not None, settings.xip_opcode)
+
+    def key(self):
+        return (self.protocol, self.dtr, self.dummy, self.address_bytes, self.xip_enabled, self.xip_opcode)
+
+    def apply(self, target, value, settings):
+        if target == "reset":
+            self.__dict__.update(DecoderState.initial(replace(settings, xip_opcode=None)).__dict__)
+        elif target == "protocol":
+            self.protocol = value
+        elif target == "dtr":
+            self.dtr = bool(value)
+        elif target == "dummy":
+            self.dummy = None if value == "default" else int(value)
+        elif target == "address_bytes":
+            self.address_bytes = int(value)
+        elif target == "xip":
+            self.xip_enabled = bool(value)
+            if not value:
+                self.xip_opcode = None
+
+    def store(self, record):
+        record["next_lines"] = PROTOCOLS[self.protocol]
+        record["next_flags"] = ((STATE_DTR if self.dtr else 0) | (STATE_XIP_ENABLED if self.xip_enabled else 0)
+                                | (STATE_XIP_ACTIVE if self.xip_opcode is not None else 0)
+                                | (STATE_ADDRESS4 if self.address_bytes == 4 else 0))
+        record["next_dummy"] = 255 if self.dummy is None else self.dummy
+
+
+def state_text(frame):
+    """Decoder state stored after a frame: ``Quad 4-4-4, DTR, dummy 8, XIP``."""
+    lines, flags, dummy = int(frame["next_lines"]), int(frame["next_flags"]), int(frame["next_dummy"])
+    if not lines:
+        return ""
+    parts = [{1: "Extended", 2: "Dual 2-2-2", 4: "Quad 4-4-4"}.get(lines, f"{lines} лин.")]
+    if flags & STATE_DTR:
+        parts.append("DTR")
+    if dummy != 255:
+        parts.append(f"dummy {dummy}")
+    if flags & STATE_ADDRESS4:
+        parts.append("адрес 4 Б")
+    if flags & STATE_XIP_ACTIVE:
+        parts.append("XIP")
+    elif flags & STATE_XIP_ENABLED:
+        parts.append("XIP разрешён")
+    return ", ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -333,6 +528,8 @@ class _Plan:
     data_lines: int = 0
     direction: str = "none"
     known: bool = True
+    spec: CommandSpec | None = None
+    xip: bool = False  # the first dummy clock carries the XIP confirmation bit
 
 
 def _lines(width, incoming):
@@ -552,6 +749,9 @@ class SpiDecoder:
                          for line in pins.io]
         self.count = capture.count
         self.has_cs = pins.cs is not None
+        # The command mode follows the device state through the capture; frames are decoded in order.
+        self.state = DecoderState.initial(settings) if settings.mode == "commands" else None
+        self.previous = None  # opcode of the previous frame, for effects with ``after``
         folder = folder or capture.storage.name
         frames = self._frames(capture, pins, cancel)
         writers = [_RecordWriter(folder, "spi_lane0_", FIELD_DTYPE), _RecordWriter(folder, "spi_lane1_", FIELD_DTYPE)]
@@ -640,21 +840,24 @@ class SpiDecoder:
             return _Plan(_lines(f.widths.address, False) if f.address_bytes else (), f.address_bytes
                          if f.widths.address else 0, f.dummy, dtr, self._data_lanes(f.widths.data, f.direction),
                          f.widths.data, f.direction)
+        state = self.state
         spec = s.command(opcode)
-        width = PROTOCOLS[s.protocol]
+        width = PROTOCOLS[state.protocol]
         if spec is None:
             lanes = ((_DataLane(0, MOSI, (0,)), _DataLane(1, MISO, (1,))) if width == 1
                      else (_DataLane(0, DATA, _lines(width, False)),))
             return _Plan(data=lanes, data_lines=width, known=False)
-        widths = spec.widths(s.protocol)
+        widths = spec.widths(state.protocol)
         address_bytes = spec.address_bytes if widths.address else 0
-        if address_bytes == 3 and s.address_bytes == 4:
+        if address_bytes == 3 and state.address_bytes == 4:
             address_bytes = 4
-        dummy = spec.dummy_for(s.protocol)
-        if spec.configurable_dummy and s.dummy_cycles is not None:
-            dummy = s.dummy_cycles
-        return _Plan(_lines(widths.address, False), address_bytes, dummy, s.dtr or spec.dtr,
-                     self._data_lanes(widths.data, spec.direction), widths.data, spec.direction)
+        dummy = spec.dummy_for(state.protocol)
+        if spec.configurable_dummy and state.dummy is not None:
+            dummy = state.dummy
+        xip = s.track_state and spec.xip and dummy > 0 and (state.xip_enabled or state.xip_opcode is not None)
+        return _Plan(_lines(widths.address, False), address_bytes, dummy, state.dtr or spec.dtr,
+                     self._data_lanes(widths.data, spec.direction), widths.data, spec.direction,
+                     spec=spec, xip=xip)
 
     @staticmethod
     def _data_lanes(width, direction):
@@ -672,13 +875,23 @@ class SpiDecoder:
         flags = TRUNCATED if self.has_cs and (start == 0 or end >= self.count) else 0
         opcode = None
         command_lines = 0
+        state = self.state
         if s.mode == "commands":
-            command_lines = PROTOCOLS[s.protocol]
+            command_lines = PROTOCOLS[state.protocol]
         elif s.mode == "fixed":
             command_lines = s.fixed.widths.command
-        dtr_command = (s.mode == "commands" and s.dtr) or (s.mode == "fixed" and s.fixed.dtr == "all")
+        dtr_command = (s.mode == "commands" and state.dtr) or (s.mode == "fixed" and s.fixed.dtr == "all")
         if command_lines and self._reset_frame(start, end, _lines(command_lines, False), dtr_command, cancel):
-            return self._reset_record(record, flags, start, end, lanes, dtr_command, cancel)
+            record = self._reset_record(record, flags, start, end, lanes, dtr_command, cancel)
+            if state is not None:
+                record["flags"] |= self._advance(record, None, None, None, (), reset=True)
+            return record
+        if state is not None and state.xip_opcode is not None:
+            # XIP: the frame starts with the address of the command XIP continues.
+            opcode = state.xip_opcode
+            record["opcode"] = opcode
+            flags |= XIP_FRAME
+            command_lines = 0
         complete = True
         if command_lines:
             lines = _lines(command_lines, False)
@@ -725,16 +938,23 @@ class SpiDecoder:
                     record["address"] = value
         record["addr_lines"] = len(plan.address_lines)
         record["address_bytes"] = plan.address_bytes
+        confirm = None
         if complete and plan.dummy:
             positions = stream.take(plan.dummy, False)
+            dummy_flags = PARTIAL if len(positions) < plan.dummy else 0
+            if plan.xip and len(positions):
+                # XIP confirmation bit: IO0 on the first dummy clock (0 keeps XIP, 1 ends it).
+                confirm = int(self._bits(positions[:1], (0,))[0, 0])
+                dummy_flags |= {0: XIP_HOLD, 1: XIP_EXIT}.get(confirm, UNKNOWN)
             if len(positions):
-                lanes[0].push(positions[:1], [plan.dummy], DUMMY, PARTIAL if len(positions) < plan.dummy else 0,
+                lanes[0].push(positions[:1], [plan.dummy], DUMMY, dummy_flags,
                               min(255, len(positions)), 0, _unit_ends(positions, len(positions)))
             complete = len(positions) == plan.dummy
         record["dummy"] = min(255, plan.dummy)
         record["dtr"] = int(plan.dtr_rest) | (2 if dtr_command else 0)
         record["data_lines"] = plan.data_lines
         record["direction"] = DIRECTIONS.index(plan.direction)
+        self.head = []
         if complete and plan.data:
             flags |= self._data(stream, plan, lanes)
         final = end
@@ -746,8 +966,36 @@ class SpiDecoder:
             record["first"][0, lane_index] = first
             record["count"][0, lane_index] = count
         record["data_bytes"] = lanes[0].data_bytes + lanes[1].data_bytes
+        if state is not None:
+            # Effects need the whole opcode; an XIP frame has none of its own to apply.
+            command = plan.spec if opcode is not None and not flags & XIP_FRAME else None
+            flags |= self._advance(record, opcode, command, confirm, self.head)
         record["flags"] = flags
         return record
+
+    HEAD = 8  # data bytes kept per frame for register-write effects
+
+    def _advance(self, record, opcode, spec, confirm, data, reset=False):
+        """Apply the frame's effects to the decoder state; returns STATE_CHANGE or 0."""
+        state, s = self.state, self.settings
+        before = state.key()
+        if reset:
+            if s.track_state:
+                state.apply("reset", None, s)  # recovery sequence: back to the starting protocol, XIP off
+        elif s.track_state:
+            if confirm == 0 and opcode is not None:
+                state.xip_opcode = opcode
+            elif confirm == 1:
+                state.xip_opcode, state.xip_enabled = None, False  # the device clears its XIP enable bit
+            for effect in (spec.effects if spec is not None else ()):
+                if effect.after is not None and effect.after != self.previous:
+                    continue
+                value = effect.resolve(data)
+                if value is not _MISSING:
+                    state.apply(effect.target, value, s)
+        self.previous = None if reset else opcode
+        state.store(record)
+        return STATE_CHANGE if state.key() != before else 0
 
     def _reset_frame(self, start, end, lines, dtr, cancel):
         """True when every transfer of the frame reads 1 on every command line.
@@ -798,6 +1046,9 @@ class SpiDecoder:
                 for lane in plan.data:
                     bits = self._bits(used, lane.lines).reshape(groups, 8)
                     values, unknown = _pack(bits, s.msb_first)
+                    if lane.lane == 0 and len(self.head) < self.HEAD:
+                        self.head += [None if bad else int(value) for value, bad in
+                                      zip(values[:self.HEAD - len(self.head)], unknown)]
                     lane_flags = np.where(unknown, UNKNOWN, 0)
                     flags |= UNKNOWN if unknown.any() else 0
                     lanes[lane.lane].push(used[::per_byte], values, lane.kind, lane_flags, 8, width,
@@ -921,10 +1172,16 @@ def decode_summary(result):
     data = int(np.asarray(frames["data_bytes"]).sum()) if count else 0
     flags = np.asarray(frames["flags"]) if count else np.empty(0, dtype=np.uint8)
     resets = int(np.count_nonzero(flags & RESET_FRAME))
-    problems = int(np.count_nonzero(flags & ~np.uint8(RESET_FRAME)))
+    problems = int(np.count_nonzero(flags & PROBLEMS))
+    changes = np.flatnonzero(flags & STATE_CHANGE)
+    xip = int(np.count_nonzero(flags & XIP_FRAME))
     text = f"SPI: {count:,} транзакций, {data:,} байт данных"
     if resets:
         text += f", сбросов режима: {resets:,}"
+    if len(changes):
+        text += f", смен режима: {len(changes):,} (в конце: {state_text(frames[int(changes[-1])])})"
+    if xip:
+        text += f", в XIP без кода команды: {xip:,}"
     if problems:
         text += f", с замечаниями: {problems:,}"
     unknown = int(np.count_nonzero(flags & UNKNOWN_COMMAND))
@@ -936,11 +1193,20 @@ def decode_summary(result):
     return text
 
 
+def _dummy_text(value, flags, bits):
+    text = f"dummy {value}" if not flags & PARTIAL else f"dummy {bits}/{value}"
+    if flags & XIP_HOLD:
+        text += " XIP"
+    elif flags & XIP_EXIT:
+        text += " выход XIP"
+    return text
+
+
 def field_label(result, record, short=False):
     """Text drawn on the decoded row and shown in the Value column."""
     kind, value, flags, bits = int(record["kind"]), int(record["value"]), int(record["flags"]), int(record["bits"])
     if kind == DUMMY:
-        return f"dummy {value}" if not flags & PARTIAL else f"dummy {bits}/{value}"
+        return _dummy_text(value, flags, bits)
     if kind == RESET:
         return "RESET" if short else f"RESET {value} такт."
     if flags & UNKNOWN:
@@ -1188,7 +1454,7 @@ def bubble_label(result, record, short=False):
     """Compact text for a field drawn as a filled box: ``0x45``."""
     kind, value, flags, bits = int(record["kind"]), int(record["value"]), int(record["flags"]), int(record["bits"])
     if kind == DUMMY:
-        return f"dummy {value}" if not flags & PARTIAL else f"dummy {bits}/{value}"
+        return _dummy_text(value, flags, bits)
     if kind == RESET:
         return "сброс" if short else f"сброс режима · {value} такт."
     digits = max(1, (bits + 3) // 4)
@@ -1571,12 +1837,13 @@ def config_to_dict(config):
     settings = {"mode": s.mode, "sample_edge": s.sample_edge, "before_edge": s.before_edge,
                 "msb_first": s.msb_first, "protocol": s.protocol, "address_bytes": s.address_bytes,
                 "dummy_cycles": s.dummy_cycles, "dtr": s.dtr, "raw_lines": s.raw_lines,
-                "reset_frames": s.reset_frames,
+                "reset_frames": s.reset_frames, "track_state": s.track_state, "xip_opcode": s.xip_opcode,
+                "profile": s.profile,
                 "fixed": {"widths": s.fixed.widths.text, "address_bytes": s.fixed.address_bytes,
                           "dummy": s.fixed.dummy, "direction": s.fixed.direction, "dtr": s.fixed.dtr}}
     if s.commands != default_commands():
-        settings["commands"] = [[c.opcode, c.name, list(c.formats), c.address_bytes, list(c.dummy),
-                                 c.direction, c.dtr, c.configurable_dummy] for c in s.commands]
+        from .spi_profiles import commands_to_list
+        settings["commands"] = commands_to_list(s.commands)
     return {"settings": settings,
             "pins": {"sck": _line_dict(pins.sck), "cs": _line_dict(pins.cs), "cs_active_low": pins.cs_active_low,
                      "io": [_line_dict(line) for line in pins.io]}}
@@ -1591,12 +1858,16 @@ def settings_from_dict(data):
         fixed = FixedFormat(BusWidths.parse(fixed["widths"]), int(fixed["address_bytes"]), int(fixed["dummy"]),
                             str(fixed["direction"]), str(fixed["dtr"]))
         known = {"mode", "sample_edge", "before_edge", "msb_first", "protocol", "address_bytes",
-                 "dummy_cycles", "dtr", "raw_lines", "reset_frames"}
+                 "dummy_cycles", "dtr", "raw_lines", "reset_frames", "track_state", "xip_opcode", "profile"}
         kwargs = {key: value for key, value in data.items() if key in known}
         if commands is not None:
-            kwargs["commands"] = tuple(CommandSpec(int(c[0]), str(c[1]), tuple(map(str, c[2])), int(c[3]),
-                                                   tuple(map(int, c[4])), str(c[5]), bool(c[6]), bool(c[7]))
-                                       for c in commands)
+            if commands and isinstance(commands[0], list):  # before effects: positional lists
+                kwargs["commands"] = tuple(CommandSpec(int(c[0]), str(c[1]), tuple(map(str, c[2])), int(c[3]),
+                                                       tuple(map(int, c[4])), str(c[5]), bool(c[6]), bool(c[7]))
+                                           for c in commands)
+            else:
+                from .spi_profiles import commands_from_list
+                kwargs["commands"] = commands_from_list(commands)
         return SpiSettings(fixed=fixed, **kwargs)
     except (KeyError, TypeError, ValueError, IndexError):
         return SpiSettings()

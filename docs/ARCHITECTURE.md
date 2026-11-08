@@ -42,7 +42,8 @@
 | `ila_viewer/bookmarks.py` | `Bookmark`, `BookmarkModel`: именованные маркеры текущего захвата, порядок, переход, ограничение длиной захвата |
 | `ila_viewer/bookmarks_ui.py` | `BookmarkController`: команды меню «Навигация»; `BookmarkManagerDialog`: немодальный список маркеров |
 | `ila_viewer/measurements.py` | `EdgeMeasurementService`, `EdgeMeasurement`, `MeasurementFormatter`: фронты однобитного сигнала между A и B, период и частота |
-| `ila_viewer/spi.py` | Декодер SPI / QSPI без Qt: `LineRef`, `SpiPins`, `SpiSettings`, `CommandSpec`, `FixedFormat`; `SpiDecoder` (кадры CS → поля), `SpiDecodeResult` (дисковые кадры и поля), `DecodedTrack` (строка диаграммы), `FieldOverlay`/`ClockEdgeMarks`/`overlays` (подписи на проводах), `SpiExportService` (текст и `.bin`) |
+| `ila_viewer/spi_profiles.py` | Наборы команд микросхем в JSON без Qt: `load`, `save`, `builtin` (общий набор и `assets/spi/*.json`), строгая проверка с понятными ошибками |
+| `ila_viewer/spi.py` | Декодер SPI / QSPI без Qt: `LineRef`, `SpiPins`, `SpiSettings`, `CommandSpec`, `CommandEffect`, `DecoderState`, `FixedFormat`; `SpiDecoder` (кадры CS → поля), `SpiDecodeResult` (дисковые кадры и поля), `DecodedTrack` (строка диаграммы), `FieldOverlay`/`ClockEdgeMarks`/`overlays` (подписи на проводах), `SpiExportService` (текст и `.bin`) |
 | `ila_viewer/annotations.py` | `SignalAnnotations`: реестр аннотаций поверх строк сигналов по имени источника; владельцы (декодеры) задают и снимают свои аннотации |
 | `ila_viewer/spi_ui.py` | `SpiController`: команды меню, жизненный цикл результата; `SpiDecoderDialog`, `SpiPanel` + `SpiTransactionModel`, `SpiContextActions` |
 | `ila_viewer/highlights_ui.py` | `HighlightConditionDialog`, `HighlightPanel`: редактор условия и список групп над полосой прокрутки |
@@ -387,6 +388,28 @@ SPI-декодер (≈12 тыс. кадров/с) и VCD пока работа�
 (`SpiSettings.reset_frames`, `FF` нет в таблице), записывается одним полем
 `RESET` с флагом кадра `RESET_FRAME`: проверка читает кадр целиком только после
 байта `FF` и останавливается на первом нуле.
+
+В режиме `commands` декодер держит `DecoderState` (протокол, DTR, dummy, размер
+адреса, разрешение и активность XIP). Он начинается с выбора окна
+(`DecoderState.initial`) и меняется только действиями `CommandEffect` из
+`CommandSpec.effects` — после конца кадра, в порядке захвата (кадры декодируются
+последовательно). Действие задаёт значение постоянно или берёт поле `bits` байта
+данных кадра (первые `SpiDecoder.HEAD` байтов полосы 0 запоминаются при
+упаковке); `after` требует код предыдущего кадра. Команда с `xip` читает бит
+подтверждения (IO0 на первом dummy-такте, флаги поля `XIP_HOLD`/`XIP_EXIT`);
+пока XIP активен, кадр начинается с адреса, получает код продолжаемой команды и
+флаг `XIP_FRAME`. Кадр сброса возвращает начальное состояние без XIP. Состояние
+после кадра пишется в `FRAME_DTYPE` (`next_lines`, `next_flags`, `next_dummy`,
+текст — `state_text`), изменение — флаг `STATE_CHANGE`; `PROBLEMS` отделяет
+замечания от этих информационных флагов. `SpiSettings.track_state=False`
+отключает действия, `xip_opcode` задаёт XIP на начало захвата.
+
+`spi_profiles.py` (без Qt) читает и пишет наборы команд в JSON
+(`load`/`save`, `commands_from_list`/`commands_to_list`); тот же формат команд
+хранит `config_to_dict`. Проверка строгая: неизвестные ключи, ширина полей
+`values`, повтор кодов дают `CommandSetError` с именем файла и номером команды.
+`builtin()` — общий набор из `default_commands()` и файлы `assets/spi/*.json`
+(сейчас Micron MT25QL128ABA). Новая микросхема добавляется файлом, без кода.
 Новый протокол добавляется так же: Qt-независимый декодер с дисковым результатом,
 трек с `window`/`busy`/`label_at`/`transition` и свой контроллер.
 
