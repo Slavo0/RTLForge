@@ -172,6 +172,12 @@ class AppearanceDialog(QDialog):
         browse_converter.clicked.connect(self.choose_wlf_converter)
         converter_row.addWidget(browse_converter)
         form.addRow("Questa wlf2vcd", converter_row)
+        self.wlf_sliced_box = QCheckBox("Преобразовывать WLF по частям параллельно")
+        self.wlf_sliced_box.setChecked(self.preferences.wlf_sliced)
+        self.wlf_sliced_box.setToolTip("Части преобразуются через wlfman и wlf2vcd одновременно и склеиваются. "
+                                       "Каждая загрузка сверяет стыки частей; при расхождении файл "
+                                       "преобразуется заново одним запуском wlf2vcd.")
+        form.addRow("", self.wlf_sliced_box)
         form.addRow(_note("Vivado ILA CSV и VCD открываются без дополнительных программ. "
                           "Для .wlf укажите wlf2vcd.exe из установленного Questa/ModelSim."))
         return page
@@ -209,6 +215,7 @@ class AppearanceDialog(QDialog):
                        reverse_bit_rows=self.reverse_rows_box.isChecked(),
                        sample_period_ns=self.sample_period_ns(),
                        wlf2vcd_path=self.wlf_converter_edit.text().strip(),
+                       wlf_sliced=self.wlf_sliced_box.isChecked(),
                        worker_count=self.workers_box.value())
 
     @staticmethod

@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.capture = None
         self.worker = None
+        self.temp_sweep = None  # BackgroundTask of start_temp_sweep; the composition root starts it
         self.closing = False
         self.preferences_store = preferences_store if preferences_store is not None else PreferencesStore.for_application()
         self.preferences = self.preferences_store.load()
@@ -80,7 +81,9 @@ class MainWindow(QMainWindow):
         self.worker_hint = None
         self.worker_pool = WorkerPool(self.worker_count(self.preferences))
         self.source = source or AutoCaptureSource(wlf=WlfCaptureSource(
-            converter=QuestaWlfConverter(self.preferences.wlf2vcd_path or None)), pool=self.worker_pool)
+            converter=QuestaWlfConverter(self.preferences.wlf2vcd_path or None,
+                                         slices=self.wlf_slices(self.preferences)), pool=self.worker_pool),
+            pool=self.worker_pool)
         self.themes = themes or ThemeManager()
         self.themes.select(self.preferences.theme if self.preferences.theme in self.themes.themes else next(iter(self.themes.themes)))
         self.bit_expansion = BitExpansionService()
@@ -216,6 +219,21 @@ class MainWindow(QMainWindow):
 
     def worker_count(self, preferences):
         return preferences.worker_count or self.cpu.recommended_workers(available_cpus())
+
+    def start_temp_sweep(self, storage):
+        """Remove temporary folders left by a dead process, in the background.
+
+        A separate task from ``self.worker``, so opening a file is never blocked by it;
+        closing the window cancels it and waits. Errors only reach ``task.result.errors``.
+        """
+        task = BackgroundTask(lambda task: storage.sweep(task.isInterruptionRequested), self)
+        self.temp_sweep = task
+        task.start()
+        return task
+
+    def wlf_slices(self, preferences):
+        """Time slices for a WLF conversion: one per worker, or 1 when slicing is turned off."""
+        return self.worker_count(preferences) if preferences.wlf_sliced else 1
 
     def suggest_workers(self):
         """First start or a new CPU: a non-modal hint with a button to the performance tab."""
@@ -650,6 +668,7 @@ class MainWindow(QMainWindow):
             converter = self.source.readers[".wlf"].converter
             if isinstance(converter, QuestaWlfConverter):
                 converter.executable = preferences.wlf2vcd_path or None
+                converter.slices = self.wlf_slices(preferences)
         self.view.preferences = preferences
         self.view.full_names = preferences.full_names
         self.view.period_ns = preferences.sample_period_ns
@@ -686,6 +705,7 @@ class MainWindow(QMainWindow):
             self.capture.derived.append(result)
             self.view.tree.add_bits(node, result.signals)
             if self.refresh_bit_styles:
+                self.view.tree.prune_sources(self.refresh_bit_styles.removed, [node])
                 for child in node.children:
                     self.refresh_bit_styles.apply_style(child)
             self.view.refresh_rows(node)
@@ -717,8 +737,8 @@ class MainWindow(QMainWindow):
             return
         if Path(destination).suffix.lower() != ".vcd":
             destination += ".vcd"
-        converter = QuestaWlfConverter(self.preferences.wlf2vcd_path or None)
-        service = WlfExportService(converter)
+        # One wlf2vcd run: an exported VCD is not loaded here, so a sliced join could not be checked.
+        service = WlfExportService(QuestaWlfConverter(self.preferences.wlf2vcd_path or None))
         self.start_work(lambda task: service.export(source, destination, task.isInterruptionRequested),
                         lambda result: self.open_file(result),
                         "Конвертация WLF в VCD…", "отсчётов")
@@ -733,7 +753,7 @@ class MainWindow(QMainWindow):
             return
         self.refresh_state = (CaptureRefreshState.capture(self.view, self.highlights, self.condition_compiler())
                               if refresh and self.capture else None)
-        self.start_work(lambda task: self.source.load(path, task.progress.emit, task.isInterruptionRequested),
+        self.start_work(lambda task: self.source.load(path, task.report, task.isInterruptionRequested),
                         self.loaded, f"Загрузка {Path(path).name}…")
 
     def start_work(self, work, complete, message, progress_unit="отсчётов"):
@@ -751,6 +771,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.show()
         self.statusBar().showMessage(message)
         task.progress.connect(self.load_progress)
+        task.phase.connect(self.load_phase)
         task.finished.connect(lambda: self.finish_work(task, complete))
         task.start()
 
@@ -758,6 +779,10 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(percent)
         self.statusBar().showMessage(f"Подготовка: {rows:,} {self.progress_unit}")
+
+    def load_phase(self, phase, amount):
+        self.progress.setRange(0, 0)  # the total is unknown: a busy indicator, not a percentage
+        self.statusBar().showMessage(phase.describe(amount))
 
     def finish_work(self, task, complete):
         self.worker = None
@@ -845,7 +870,8 @@ class MainWindow(QMainWindow):
         split_bits = {id(bit) for bits in capture.split_buses.values() for bit in bits}
         shown = [sig for sig in capture.signals if id(sig) not in split_bits]
         changes = sum(len(sig.starts) - 1 for sig in shown)
-        self.statusBar().showMessage(f"{capture.count:,} отсчётов · {len(shown)} сигналов · {changes:,} изменений")
+        summary = f"{capture.count:,} отсчётов · {len(shown)} сигналов · {changes:,} изменений"
+        self.statusBar().showMessage(" · ".join([*capture.notices, summary]))
         self.view.setFocus()
         self.edge_measurements.resume()
         self.update_status()
@@ -1025,6 +1051,7 @@ Ctrl + щелчок по waveform — добавить или убрать си�
 Shift + щелчок — курсор B; обычный щелчок по диаграмме — убрать B.
 Shift + щелчок в Name / Value — выделить диапазон строк без изменения B.
 Radix, Signal Color и перетаскивание применяются ко всему выделению.
+Delete — убрать выбранные строки из списка (данные не меняются), Ctrl+Z — вернуть.
 Протянуть ЛКМ по диаграмме — приблизить диапазон (от 2 отсчётов).
 Перетаскивание за линию маркера — переместить маркер; для B удерживать Shift.
 Copy Values… — для каждого сигнала свой Radix и диапазон битов; без B весь захват.
@@ -1114,6 +1141,9 @@ Ctrl+Shift+C — копировать байты между A и B (без B —
         self.save_preferences()
         self.highlights.reset()
         self.spi.dispose()
+        if self.temp_sweep is not None and self.temp_sweep.isRunning():
+            self.temp_sweep.requestInterruption()
+            self.temp_sweep.wait()
         self.worker_pool.shutdown()
         if self.capture:
             self.view.capture = None

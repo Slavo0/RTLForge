@@ -10,7 +10,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication
 
 from .bits import BitCodec
-from .data import LoadCancelled
+from .data import LoadCancelled, search_sorted
 from .formats import FORMATS, RealSettings
 from .sampling import PeriodicSampling, as_sampling
 
@@ -191,7 +191,7 @@ class CopyValuesService:
             if (request.condition is None and period == 1 and request.samples == "changes"
                     and request.exclude_sample != request.start):
                 begin = source.run_index(request.start)
-                transition_end = int(np.searchsorted(source.starts, request.end, side="right"))
+                transition_end = search_sorted(source.starts, request.end, "right")
                 chunks = ((int(source.starts[i]), int(source.codes[i])) for i in range(begin, transition_end)
                           if int(source.starts[i]) != request.exclude_sample)
             elif request.condition is None and period == 1:
@@ -203,7 +203,7 @@ class CopyValuesService:
                         samples = np.arange(a, b)
                         if request.exclude_sample is not None:
                             samples = samples[samples != request.exclude_sample]
-                        codes = source.codes[np.maximum(0, np.searchsorted(source.starts, samples, side="right") - 1)]
+                        codes = source.codes[np.maximum(0, search_sorted(source.starts, samples, "right") - 1)]
                         yield from zip(map(int, samples), map(int, codes))
                 chunks = every_sample()
             else:
@@ -218,7 +218,7 @@ class CopyValuesService:
                         samples = chunk.sample[keep]
                         if not len(samples):
                             continue
-                        runs = np.searchsorted(source.starts, chunk.at[keep], side="right") - 1
+                        runs = search_sorted(source.starts, chunk.at[keep], "right") - 1
                         codes = np.asarray(source.codes[np.maximum(runs, 0)], dtype=np.int64)
                         if request.samples == "changes":
                             fresh = np.empty(len(codes), dtype=bool)

@@ -72,3 +72,53 @@ byte objects. Merge files and CS discovery are streamed in bounded chunks. These
 fixes do **not** cap total capture RAM: distinct-value dictionaries, global lookup
 tables and process transfer buffers still grow with cardinality. Typed or
 disk-backed value dictionaries need a separate design and measurement effort.
+
+## Large WLF / VCD (2026-11-14)
+
+Reproduce with the project interpreter (Questa 2024.1 `wlf2vcd`/`wlfman` installed):
+
+```powershell
+.venv/Scripts/python.exe -m scripts.benchmark_wlf --file vsim.wlf --workers 0 --disk
+.venv/Scripts/python.exe -m scripts.benchmark_wlf --verify-sliced vsim.wlf
+.venv/Scripts/python.exe -m scripts.benchmark_wlf --check-scaling
+```
+
+The file is `vsim.wlf`: 465 MB, which becomes a 3.9 GB VCD with 24 397 216 timestamps,
+244 signals (237 declared) and 528.6 million changes. The machine is a Ryzen 9 9950X3D
+with 15 workers (the "Auto" default).
+
+| Load phase | Before | After |
+|---|---:|---:|
+| WLF conversion | 83.4 s (one `wlf2vcd`) | 12.4–13.9 s (15 time slices) |
+| VCD parse | 262.6 s (one process) | 31.5–34.5 s (pool) |
+| Seam check | — | 0.045 s |
+| **Total** | **346.0 s** | **43.9–48.5 s** |
+| Parent peak memory | 96 MB | 103–143 MB |
+
+| Repaint, ms | 800×500 before → after | 1920×1080 before → after |
+|---|---:|---:|
+| Whole capture | 116.7 → 1.1 | 223.0 → 7.0 |
+| 1 % zoom | 60.9 → 1.8 | 204.4 → 36.7 |
+| 2000 timestamps | 57.2 → 1.2 | 120.1 → 33.4 |
+| 100 timestamps | 4.9 → 3.3 | 9.8 → 6.3 |
+| Marker click at 1 % | 67.3 → 2.4 | 200.9 → 29.8 |
+| Zoom step at 1 % | 170.2 → 2.2 | 368.8 → 23.7 |
+| Scroll step at 1 % | 174.3 → 3.5 | 392.0 → 28.0 |
+
+- Most of the repaint gain came from integer search keys. A float key made numpy
+  convert the whole int64 index on every `searchsorted` call.
+  - `--check-scaling` compares whole-capture FHD repaint of a 250 000-timestamp and a
+    4 000 000-timestamp synthetic capture: 4.7 and 5.0 ms (ratio 1.06, limit 3.0).
+  - With float keys restored, the ratio is 12.99, so the check fails.
+- Parse scaling varies with machine state (224–307 CPU seconds for the same work).
+  Repeated runs on the real VCD gave 73–81 s at 4 workers, 36–48 s at 8 and 25–31 s
+  at 15. Every range's CPU time equals its wall time, so workers do not wait for I/O.
+- The parse is slower right after a conversion (22.0–22.7 s for the parse phase) than
+  on a VCD written earlier (16.7–17.8 s). This was not investigated.
+- Disk: the capture folder peaks at about 12 GB during a load. The indices keep about
+  6.4 GB; the 3.7 GB VCD is removed after the parse.
+- Memory: parent memory grows with the number of distinct values of a signal
+  (`SignalData.values` / `value_ids` are in memory), not with capture length as such.
+- A sliced load and a single-run load give equal captures (`capture_differences`
+  empty). The single-run load through `WlfCaptureSource` took 118.6 s, the sliced one
+  43.1 s.

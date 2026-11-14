@@ -1,0 +1,9 @@
+{
+  "platform": "Windows 11 AMD64",
+  "qpa": "offscreen",
+  "qt": "6.11.2",
+  "pyside": "6.11.2",
+  "font_family": "Consolas",
+  "font_point_size": 9.75,
+  "font_pixel_size": 13
+}

@@ -125,8 +125,19 @@ class VisibleRow:
     depth: int
 
 
+@dataclass
+class RemovedRows:
+    """Rows taken out of the view: (node, parent, index) in restore order."""
+    entries: list
+    names: set
+
+    def __bool__(self):
+        return bool(self.entries)
+
+
 class SignalTree:
     def __init__(self, signals=(), metadata=None, split_buses=None):
+        self.removed_sources = set()  # source names deleted from the view (presentation state)
         self.root = GroupNode("root")
         self.root.expanded = True
         split_buses = split_buses or {}
@@ -187,6 +198,7 @@ class SignalTree:
         for signal in signals:
             label = re.search(r"\[\d+\]$", signal.name).group()
             bus.add(BitNode(label, signal))
+            self.removed_sources.discard(signal.name)  # expanding again brings deleted bits back
         bus.expanded = True
 
     def move(self, node, target, position="before"):
@@ -275,9 +287,73 @@ class SignalTree:
     def remove_container(self, node):
         if node.kind not in ("group", "divider", "decoded") or node is self.root:
             return
-        parent = node.parent
-        parent.children.remove(node)
-        node.parent = None
+        self.remove_many([node])
+
+    def remove_many(self, nodes):
+        """Remove rows (and their subtrees) from the view; capture data is never touched.
+
+        Returns a ``RemovedRows`` record that ``restore`` puts back in place.
+        """
+        nodes = [node for node in self.top_level_selection(list(dict.fromkeys(nodes)))
+                 if node is not self.root and node.parent is not None and self.root.contains(node)]
+        # Remember positions before anything moves; restore in this order keeps indices valid.
+        entries = sorted(((node, node.parent, node.parent.children.index(node)) for node in nodes),
+                         key=lambda entry: (self._path(entry[1]), entry[2]))
+        for node, parent, _ in entries:
+            parent.children.remove(node)
+            node.parent = None
+        names = {name for node, _, _ in entries for name in self.source_names(node)}
+        self.removed_sources |= names
+        return RemovedRows(entries, names)
+
+    def restore(self, removed):
+        """Undo ``remove_many``; rows whose parent left the tree return to the top level."""
+        restored = []
+        for node, parent, index in removed.entries:
+            if parent is not self.root and not self.root.contains(parent):
+                if node.kind == "bit":
+                    continue  # a bit only lives inside its own bus
+                parent, index = self.root, len(self.root.children)
+            parent.add(node, min(index, len(parent.children)))
+            restored.append(node)
+        self.removed_sources -= {name for node in restored for name in self.source_names(node)}
+        return restored
+
+    def prune_sources(self, names, nodes=None):
+        """Drop rows whose source signal name is in ``names`` (used after a capture refresh)."""
+        names = set(names)
+        found = []
+
+        def visit(node):
+            for child in node.children:
+                if child.signal and child.signal.source.name in names:
+                    found.append(child)
+                else:
+                    visit(child)
+        for node in (nodes if nodes is not None else [self.root]):
+            visit(node)
+        if found:
+            self.remove_many(found)
+        return found
+
+    @staticmethod
+    def source_names(node):
+        names = set()
+
+        def visit(item):
+            if item.signal:
+                names.add(item.signal.source.name)
+            for child in item.children:
+                visit(child)
+        visit(node)
+        return names
+
+    def _path(self, node):
+        path = []
+        while node is not None and node.parent is not None:
+            path.append(node.parent.children.index(node))
+            node = node.parent
+        return path[::-1]
 
     def inherited_color(self, node):
         while node and node is not self.root:

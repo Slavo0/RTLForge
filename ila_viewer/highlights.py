@@ -11,7 +11,7 @@ from uuid import uuid4
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-from .data import LoadCancelled
+from .data import LoadCancelled, search_sorted
 from .sampling import as_sampling
 
 
@@ -30,13 +30,14 @@ class HighlightIntervals:
         """
         if not self.count:
             return
-        first = int(np.searchsorted(self.data[:, 1], start, side="right"))
-        stop = int(np.searchsorted(self.data[:, 0], end, side="left"))
+        # Columns of the (count, 2) map are strided; search_sorted bisects them in place.
+        first = search_sorted(self.data[:, 1], start, "right")
+        stop = search_sorted(self.data[:, 0], end, "left")
         if pixels and stop - first > pixels * 2:
             if edges is None:
                 edges = np.linspace(start, end, max(1, pixels) + 1)
             edges = np.asarray(edges, dtype=np.float64)
-            indices = np.searchsorted(self.data[:, 1], edges[:-1], side="right")
+            indices = search_sorted(self.data[:, 1], edges[:-1], "right")
             valid = indices < self.count
             active = np.zeros(len(indices), dtype=bool)
             active[valid] = self.data[indices[valid], 0] < edges[1:][valid]
@@ -57,7 +58,7 @@ class HighlightIntervals:
         """Index of the interval containing ``sample``, or None."""
         if not self.count:
             return None
-        index = int(np.searchsorted(self.data[:, 0], sample, side="right")) - 1
+        index = search_sorted(self.data[:, 0], sample, "right") - 1
         return index if index >= 0 and sample < self.data[index, 1] else None
 
     def step(self, sample, direction, wrap=True):
@@ -66,9 +67,9 @@ class HighlightIntervals:
             return None
         starts = self.data[:, 0]
         if direction > 0:
-            index = int(np.searchsorted(starts, sample, side="right"))
+            index = search_sorted(starts, sample, "right")
             return index if index < self.count else (0 if wrap else None)
-        index = int(np.searchsorted(starts, sample, side="left")) - 1
+        index = search_sorted(starts, sample, "left") - 1
         return index if index >= 0 else (self.count - 1 if wrap else None)
 
     def close(self):

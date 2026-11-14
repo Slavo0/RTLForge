@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QLibraryInfo, QTimer, QTranslator
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
+from .tempstore import DEFAULT as DEFAULT_TEMP_STORAGE
 from .window import MainWindow
 
 
@@ -28,8 +29,9 @@ def install_translations(app):
 
 
 class WaveformApplication:
-    def __init__(self, argv=None, window_factory=MainWindow):
+    def __init__(self, argv=None, window_factory=MainWindow, temp_storage=DEFAULT_TEMP_STORAGE):
         self.argv = list(sys.argv if argv is None else argv)
+        self.temp_storage = temp_storage  # swept once after the window appears; None skips the sweep
         self.qt = QApplication.instance() or QApplication(self.argv)
         self.translators = install_translations(self.qt)
         self.qt.setApplicationName("Waveform Reader")
@@ -39,6 +41,8 @@ class WaveformApplication:
 
     def run(self):
         self.window.show()
+        if self.temp_storage is not None and hasattr(self.window, "start_temp_sweep"):
+            QTimer.singleShot(0, lambda: self.window.start_temp_sweep(self.temp_storage))
         initial = Path(self.argv[1]) if len(self.argv) > 1 else Path(__file__).resolve().parents[1] / "waveform.csv"
         if initial.is_file():
             QTimer.singleShot(0, lambda: self.window.open_file(initial))

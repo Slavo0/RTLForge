@@ -17,6 +17,7 @@ def dispose_result(result):
 
 class BackgroundTask(QThread):
     progress = Signal(int, int)
+    phase = Signal(object, object)  # (progress.Phase, amount): a step whose total is unknown
 
     def __init__(self, work, parent=None):
         super().__init__(parent)
@@ -24,6 +25,13 @@ class BackgroundTask(QThread):
         self.result = None
         self.error = None
         self.cancelled = False
+
+    def report(self, percent, amount, phase=None):
+        """Progress callback for capture sources: ``progress(percent, rows)`` or a named phase."""
+        if phase is None:
+            self.progress.emit(percent, amount)
+        else:
+            self.phase.emit(phase, amount)
 
     def run(self):
         try:

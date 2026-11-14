@@ -143,6 +143,29 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn(b, [row.node for row in tree.rows()])
         self.assertEqual(cap.signals[1].value_at(0), 1)  # Removing a row never edits CSV data.
 
+    def test_remove_many_rows_and_restore_positions(self):
+        cap = self.capture("a,b,c,d[1:0]\nRadix - HEX,HEX,HEX,BINARY\n0,1,0,10\n")
+        tree = SignalTree(cap.signals)
+        a, b, c, d = tree.root.children
+        group = tree.create_group_many("G", [b, c])
+        bits = BitExpansionService().build(d.signal.source, cap.storage.name)
+        cap.derived.append(bits)
+        tree.add_bits(d, bits.signals)
+        bit1, bit0 = d.children
+        # A group plus its own child counts once; a bit leaves its bus only.
+        removed = tree.remove_many([group, c, a, bit0])
+        self.assertEqual(tree.root.children, [d])
+        self.assertEqual(d.children, [bit1])
+        self.assertEqual(tree.removed_sources, {"a", "b", "c", bit0.signal.name})
+        self.assertEqual(cap.signals[0].value_at(0), 0)  # capture data is untouched
+        tree.restore(removed)
+        self.assertEqual(tree.root.children, [a, group, d])
+        self.assertEqual(group.children, [b, c])
+        self.assertEqual(d.children, [bit1, bit0])
+        self.assertEqual(tree.removed_sources, set())
+        self.assertEqual(tree.prune_sources({"b"}), [b])
+        self.assertEqual(group.children, [c])
+
     def test_settings_validate_types_and_recover_corrupt_file(self):
         path = Path(self.temp.name) / "settings.json"
         store = PreferencesStore(path)
@@ -1269,6 +1292,41 @@ class InteractionTests(unittest.TestCase):
             w.refresh_csv()
             self.wait()
             self.assertEqual(w.capture.count, 3)
+
+    def test_delete_key_and_menu_remove_selected_rows_and_ctrl_z_restores(self):
+        w, v = self.window, self.window.view
+        before = [row.node for row in v.rows]
+        v.selected = 1
+        v.selection.ids = {before[1].id, before[3].id}
+        menu = v.menus.build(v)
+        action = next(a for a in menu.actions() if a.text() == "Удалить из списка (2)")
+        menu.deleteLater()
+        action.trigger()
+        self.assertEqual([row.node for row in v.rows], [before[0], before[2]] + before[4:])
+        self.assertEqual(v.current_node, before[2])  # selection moves to the next remaining row
+        QTest.keyClick(v, Qt.Key.Key_Delete)
+        self.assertNotIn(before[2], [row.node for row in v.rows])
+        QTest.keyClick(v, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(v, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual([row.node for row in v.rows], before)
+
+    def test_deleted_rows_stay_deleted_after_refresh(self):
+        w, v = self.window, self.window.view
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "capture.csv"
+            path.write_text("a,b\nRadix - HEX,HEX\n0,1\n1,0\n", encoding="utf-8")
+            w.open_file(path)
+            self.wait()
+            v.selected = 0
+            v.delete_selected()
+            self.assertEqual([row.node.label for row in v.rows], ["b"])
+            w.refresh_csv()
+            self.wait()
+            self.assertEqual([row.node.label for row in v.rows], ["b"])
+            self.assertEqual([s.name for s in w.capture.signals], ["a", "b"])
+            w.open_file(path)  # opening (not refreshing) starts fresh
+            self.wait()
+            self.assertEqual([row.node.label for row in v.rows], ["a", "b"])
 
     def test_copy_name_and_displayed_value_from_context_column(self):
         w, v = self.window, self.window.view

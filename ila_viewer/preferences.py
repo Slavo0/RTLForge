@@ -27,6 +27,7 @@ class ViewerPreferences:
     last_csv_directory: str = ""
     recent_files: list = field(default_factory=list)
     wlf2vcd_path: str = ""
+    wlf_sliced: bool = True        # convert large WLF as parallel time slices (checked on every load)
     separate_signal_styles: bool = False
     fill_bus: bool = False
     signal_colors: dict = field(default_factory=dict)

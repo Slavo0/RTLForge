@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .timebase import format_seconds, group_digits
-from .data import LoadCancelled
+from .data import LoadCancelled, search_sorted
 
 
 @dataclass(frozen=True)
@@ -50,8 +50,8 @@ class EdgeMeasurementService:
         start, end = sorted((int(start), int(end)))
         starts = signal.starts
         # Run indices of transitions with start < sample <= end; run 0 is the capture start.
-        first = max(1, int(np.searchsorted(starts, start, side="right")))
-        last = max(first, int(np.searchsorted(starts, end, side="right")))
+        first = max(1, search_sorted(starts, start, "right"))
+        last = max(first, search_sorted(starts, end, "right"))
         if last == first:
             return EdgeMeasurement(start, end, 0, 0, None, None)
         levels = self._levels(signal)

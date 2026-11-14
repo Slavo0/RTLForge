@@ -20,6 +20,7 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QVBoxLayout)
 
+from .data import search_sorted
 from .measurements import format_frequency
 from .sampling import EdgeSampling, clock_candidates, clock_score
 from .timebase import format_seconds, group_digits, parse_clock
@@ -276,7 +277,7 @@ class CopyPeriodBanner(QFrame):
         left = max(0, int(self.view.left))
         found = []
         # Look a bounded number of transitions ahead, never to the end of a long capture.
-        first = int(np.searchsorted(sampling.signal.starts, left, side="left"))
+        first = search_sorted(sampling.signal.starts, left, "left")
         stop = min(len(sampling.signal.starts), first + 2 * sampling.CHUNK)
         upper = int(sampling.signal.starts[stop - 1]) + 1 if stop > first else left
         for chunk in sampling.edges(left, upper):

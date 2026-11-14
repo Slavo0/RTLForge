@@ -4,7 +4,8 @@
 """Composable context-menu providers. Add a provider without changing the window."""
 from abc import ABC, abstractmethod
 
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                               QFormLayout, QInputDialog, QMenu, QSpinBox)
 
@@ -122,8 +123,19 @@ class StructureActions(ContextActionProvider):
         node = view.current_node
         if node and node.kind in ("group", "divider"):
             menu.addAction("Переименовать…", lambda: self.rename(view, node))
-            menu.addAction("Удалить группу и её сигналы" if node.kind == "group" else "Удалить разделитель",
-                           lambda: (view.tree.remove_container(node), view.refresh_rows()))
+        selected = view.selected_nodes
+        if selected:
+            delete = menu.addAction(self.delete_label(selected), view.delete_selected)
+            delete.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+            delete.setToolTip("Убирает строки только из списка; данные захвата не меняются. Ctrl+Z — вернуть")
+
+    @staticmethod
+    def delete_label(nodes):
+        if len(nodes) > 1:
+            return f"Удалить из списка ({len(nodes)})"
+        kind = nodes[0].kind
+        return {"group": "Удалить группу и её сигналы", "divider": "Удалить разделитель",
+                "bit": "Удалить бит из списка"}.get(kind, "Удалить из списка")
 
     def create(self, view, kind):
         text, ok = QInputDialog.getText(view, "New Group" if kind == "group" else "New Divider", "Имя:")

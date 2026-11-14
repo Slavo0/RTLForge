@@ -14,6 +14,20 @@ The user requires object-oriented, extensible design for this application.
 - Route CSV, VCD and WLF through CaptureSource implementations. WLF uses the
   vendor wlf2vcd utility; never guess its binary layout. Keep VCD timestamps
   disk-backed and draw simulator captures proportional to their real time axis.
+- Large VCDs parse through the pool (`ParallelVcdLoad`) and fall back to the one-process
+  parse with an equal result; tests force small ranges from the parent, since patches do
+  not reach spawned workers. Split buses are assembled after the parse.
+- WLF slicing (`wlf_slices.py`) relies only on wlfman/wlf2vcd behaviour measured on
+  Questa 2024.1. It is checked on every conversion: equal headers, slice starts, and
+  every signal at every seam against the loaded capture. Any failure loads through one
+  wlf2vcd run with a `Capture.notices` message. Never return a capture that failed the
+  check. Export uses one run. Preference `wlf_sliced` turns slicing off.
+- Full-disk errors become `DiskSpaceError` only after every temporary file is removed.
+- Searches in int64 indices use integer keys (`data.search_sorted`), never float keys.
+  Build one `ViewportTransform` per frame. Per-segment drawing must not create colors,
+  pens or fonts (`RowPainter` resolves them per row). Regenerate golden frames
+  (`tests/fixtures/frames`) only from a revision known to render correctly.
+  `python -m scripts.benchmark_wlf --check-scaling` must pass.
 - A plain left click on the waveform removes B; Shift+left click creates/moves B.
 - A plain waveform click selects its row and moves A; Ctrl+click toggles that row;
   Shift+click moves B without changing row selection.
@@ -36,6 +50,8 @@ The user requires object-oriented, extensible design for this application.
 - Name and Value widths are independent and persistent; Name auto-fit is explicit;
   Value grows when displayed text overflows.
 - Deleting a group removes its subtree from the view, never changes the CSV data.
+- Delete (key or context menu) removes the selected rows of any kind from the view only;
+  Ctrl+Z restores them in place. Deleted source names survive refresh, not reopening.
 - Radix/color and row dragging operate on the selected set; preserve selection on
   context-menu clicks. Validate multi-row moves before modifying the tree.
 - Plain drag on the waveform zooms a range; dragging a marker moves it. Ignore
@@ -84,7 +100,7 @@ The user requires object-oriented, extensible design for this application.
   are RESET frames (option reset_frames) unless FF is in the command table.
   Docs say SPI/QSPI only.
 - Heavy work is vectorized with numpy first, then split over the shared WorkerPool
-  (cpu.py, spawn). Worker modules (csv_chunks, data, cpu) stay Qt-free; worker count is
+  (cpu.py, spawn). Worker modules (csv_chunks, data, cpu, vcd, vcd_chunks) stay Qt-free; worker count is
   the general preference worker_count (0 = physical cores - 1). Vectorized paths must
   equal the scalar references in tests/reference.py. Tests inject CpuTopology.
 - Run `python -m unittest -v tests.test_waveform tests.test_extensions tests.test_review tests.test_remediation` for relevant
@@ -95,3 +111,8 @@ The user requires object-oriented, extensible design for this application.
   before closing capture maps, then resume only after a new capture is installed.
 - See `docs/PERFORMANCE.md` for workload/memory evidence and `scripts.benchmark_review`
   for executor comparisons. Input block size alone does not bound padded-cell allocation.
+- Temporary folders are created only through `tempstore.TempStorage.create` (injected as
+  `temp`; tests pass their own root, never the system one). Each folder holds a lock the
+  owning process keeps; the startup sweep removes only prefixed direct children whose
+  lock is free, or unmarked ones untouched for 24 h that can be renamed, and never
+  follows links. New prefixes go into `tempstore.PREFIXES`.

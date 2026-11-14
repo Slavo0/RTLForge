@@ -57,6 +57,7 @@ class CaptureRefreshState:
     styles: dict
     highlights: list
     master_enabled: bool
+    removed: frozenset = frozenset()  # source names the user deleted from the view
 
     @classmethod
     def capture(cls, view, model, compiler):
@@ -82,9 +83,13 @@ class CaptureRefreshState:
             groups.append(HighlightSpec(g.name, g.expression, g.color, g.opacity,
                                         g.marker_a, g.marker_b, g.period, g.phase, g.visible, g.id,
                                         frozenset(radixes), g.mode, radixes))
-        return cls(view.capture.count, styles, groups, model.master_enabled)
+        return cls(view.capture.count, styles, groups, model.master_enabled,
+                   frozenset(getattr(view.tree, "removed_sources", ())))
 
     def apply_styles(self, view):
+        # Rows the user deleted stay deleted; the capture itself still holds them.
+        if self.removed:
+            view.tree.prune_sources(self.removed)
         def visit(node):
             self.apply_style(node)
             for child in node.children:

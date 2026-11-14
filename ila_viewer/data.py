@@ -20,6 +20,7 @@ from .csv_chunks import (CellError, ColumnEncoder, ColumnSpec, LoadCancelled, Va
                          line_aligned_ranges, parse_range, place_range, split_block)
 from .formats import FORMATS
 from .timebase import format_seconds, group_digits, unit_seconds
+from .tempstore import storage_or_default
 
 
 RADICES = {"HEX": 16, "BINARY": 2, "BIN": 2, "OCTAL": 8,
@@ -48,6 +49,67 @@ def parse_value(text: str, radix: str) -> int | str:
     return int(token, base)
 
 
+def search_sorted(array, keys, side="left"):
+    """``numpy.searchsorted`` that never converts or copies the searched array.
+
+    numpy brings both operands to a common type and to contiguous memory, so a float
+    key on an int64 index or a strided view (a column of a 2-D array, a field of a
+    structured array) copies the whole array on every call. Integer arrays are
+    searched with integer keys instead; this gives the same answer for any real key:
+    ``searchsorted(a, x, "right") == searchsorted(a, floor(x), "right")`` and
+    ``searchsorted(a, x, "left") == searchsorted(a, ceil(x), "left")``. Keys beyond the
+    dtype's range, infinities and NaN (sorted last, as numpy does) are answered without
+    searching. Strided arrays are bisected in place, reading O(keys * log n) elements.
+
+    Returns a Python int for a scalar key and an int64 array of the key's shape otherwise.
+    """
+    scalar = np.ndim(keys) == 0
+    flat = np.asarray(keys).reshape(-1)
+    if array.dtype.kind not in "iu":
+        result = np.asarray(_search_inside(array, flat, side), dtype=np.int64)
+        return int(result[0]) if scalar else result.reshape(np.shape(keys))
+    info = np.iinfo(array.dtype)
+    if flat.dtype.kind == "f":
+        flat = np.floor(flat) if side == "right" else np.ceil(flat)
+        low, high = flat < info.min, (flat > info.max) | np.isnan(flat)
+    elif flat.dtype.kind in "iu":
+        low, high = flat < info.min, flat > info.max
+    else:  # Python integers beyond 64 bits arrive as objects
+        low = np.array([key < info.min for key in flat.tolist()], dtype=bool)
+        high = np.array([key > info.max for key in flat.tolist()], dtype=bool)
+    inside = ~(low | high)
+    if flat.dtype != array.dtype:
+        converted = np.zeros(len(flat), dtype=array.dtype)
+        converted[inside] = flat[inside].astype(array.dtype)
+        flat = converted
+    result = np.where(high, len(array), 0).astype(np.int64)
+    if inside.all():
+        result = np.asarray(_search_inside(array, flat, side), dtype=np.int64)
+    elif inside.any():
+        result[inside] = _search_inside(array, flat[inside], side)
+    return int(result[0]) if scalar else result.reshape(np.shape(keys))
+
+
+def _search_inside(array, keys, side):
+    if array.ndim != 1 or array.flags.c_contiguous:
+        return np.searchsorted(array, keys, side=side)
+    if len(keys) * max(1, len(array)).bit_length() > len(array):
+        # Bulk lookups (exports, sampling) read the whole array anyway: copy it once.
+        return np.searchsorted(np.ascontiguousarray(array), keys, side=side)
+    # Vectorized bisection on the strided view, instead of numpy's contiguous copy.
+    lo = np.zeros(len(keys), dtype=np.int64)
+    hi = np.full(len(keys), len(array), dtype=np.int64)
+    active = np.flatnonzero(lo < hi)
+    while len(active):
+        middle = (lo[active] + hi[active]) >> 1
+        values = array[middle]
+        right = values <= keys[active] if side == "right" else values < keys[active]
+        lo[active] = np.where(right, middle + 1, lo[active])
+        hi[active] = np.where(right, hi[active], middle)
+        active = active[lo[active] < hi[active]]
+    return lo
+
+
 @dataclass
 class SignalData:
     name: str
@@ -68,7 +130,7 @@ class SignalData:
         return self.width > 1
 
     def run_index(self, sample: int | float) -> int:
-        return max(0, int(np.searchsorted(self.starts, sample, side="right")) - 1)
+        return max(0, search_sorted(self.starts, sample, "right") - 1)
 
     def value_at(self, sample: int):
         return self.values[int(self.codes[self.run_index(sample)])]
@@ -79,9 +141,9 @@ class SignalData:
     def transition(self, sample: int, direction: int) -> int | None:
         # Row zero is the start of capture, not a transition.
         if direction > 0:
-            index = int(np.searchsorted(self.starts, sample, side="right"))
+            index = search_sorted(self.starts, sample, "right")
         else:
-            index = int(np.searchsorted(self.starts, sample, side="left")) - 1
+            index = search_sorted(self.starts, sample, "left") - 1
         return int(self.starts[index]) if 0 < index < len(self.starts) else None
 
     def search(self, value: int | str, sample: int, direction: int,
@@ -93,10 +155,10 @@ class SignalData:
             return None
         n = len(self.starts)
         if direction > 0:
-            pivot = int(np.searchsorted(self.starts, sample, side="right"))
+            pivot = search_sorted(self.starts, sample, "right")
             ranges = [(pivot, n, False), (0, pivot, True)]
         else:
-            pivot = int(np.searchsorted(self.starts, sample, side="left"))
+            pivot = search_sorted(self.starts, sample, "left")
             ranges = [(0, pivot, False), (pivot, n, True)]
         if not wrap:
             ranges = ranges[:1]
@@ -129,11 +191,12 @@ class Capture:
     signals: list[SignalData]
     count: int
     metadata: dict[str, np.ndarray]
-    storage: tempfile.TemporaryDirectory
+    storage: object  # tempstore.TempFolder (or anything with ``name`` and ``cleanup()``)
     derived: list = field(default_factory=list)
     times: np.ndarray | None = None
     timescale: str = ""
     split_buses: dict[str, list[SignalData]] = field(default_factory=dict)
+    notices: list[str] = field(default_factory=list)  # load messages for the status bar
 
     def _time_parts(self, sample):
         index = float(sample)
@@ -158,10 +221,8 @@ class Capture:
     def sample_at_time(self, timestamp):
         if self.times is None:
             return float(timestamp)
-        # Searching with a float coerces int64 timestamps to float64 inside numpy.
-        tick = math.floor(timestamp)
-        query = max(0, min(2**63 - 1, tick))
-        index = max(0, int(np.searchsorted(self.times, query, side="right")) - 1)
+        # An integer key keeps numpy from converting the whole int64 index (see search_sorted).
+        index = max(0, search_sorted(self.times, math.floor(timestamp), "right") - 1)
         offset = float(timestamp - int(self.times[index]))
         if index == self.count - 1:
             return index + offset
@@ -170,10 +231,20 @@ class Capture:
     def samples_at_offsets(self, offsets, origin=None):
         """Viewport-sized inverse using offsets from an integer timestamp origin."""
         origin = int(self.times[0]) if origin is None else int(origin)
-        ticks = np.asarray(offsets, dtype=np.float64)
-        queries = np.fromiter((max(0, min(2**63 - 1, origin + math.floor(t))) for t in ticks.flat),
-                              dtype=np.int64, count=ticks.size).reshape(ticks.shape)
-        indices = np.clip(np.searchsorted(self.times, queries, side="right") - 1, 0, self.count - 1)
+        shape = np.shape(offsets)
+        ticks = np.asarray(offsets, dtype=np.float64).reshape(-1)
+        # Query origin + floor(t) clamped to [0, 2**63 - 1], in integers (no float rounding).
+        floors = np.floor(ticks)
+        huge = np.abs(floors) > 2.0**62
+        whole = np.where(huge, 0, floors).astype(np.int64)
+        with np.errstate(over="ignore"):  # sums beyond the limit are replaced below
+            queries = whole + np.int64(origin)
+        queries[whole > np.int64(2**63 - 1 - origin)] = 2**63 - 1
+        np.maximum(queries, 0, out=queries)
+        if huge.any():  # offsets beyond ±2**62 ticks take the exact per-element rule
+            queries[huge] = [max(0, min(2**63 - 1, origin + math.floor(t))) for t in ticks[huge]]
+        ticks, queries = ticks.reshape(shape), queries.reshape(shape)
+        indices = np.clip(search_sorted(self.times, queries, "right") - 1, 0, self.count - 1)
         low = (self.times[indices] - origin).astype(np.float64)
         following = np.minimum(indices + 1, self.count - 1)
         widths = np.maximum(1, self.times[following] - self.times[indices])
@@ -184,7 +255,7 @@ class Capture:
         ticks = np.asarray(timestamps)
         if ticks.dtype.kind in "iu":
             ticks = ticks.astype(np.int64)
-            indices = np.clip(np.searchsorted(self.times, ticks, side="right") - 1, 0, self.count - 1)
+            indices = np.clip(search_sorted(self.times, ticks, "right") - 1, 0, self.count - 1)
             following = np.minimum(indices + 1, self.count - 1)
             widths = np.maximum(1, self.times[following] - self.times[indices])
             return indices + (ticks - self.times[indices]) / widths
@@ -320,12 +391,15 @@ def _cell_error(exc, line_offset):
 
 
 def load_csv(path: str | Path, progress: Callable[[int, int], None] = lambda p, n: None,
-             cancel: Callable[[], bool] = lambda: False, pool=None) -> Capture:
-    """Load a Vivado ILA CSV; ``pool`` (a WorkerPool) splits large files over processes."""
+             cancel: Callable[[], bool] = lambda: False, pool=None, temp=None) -> Capture:
+    """Load a Vivado ILA CSV; ``pool`` (a WorkerPool) splits large files over processes.
+
+    ``temp`` (a ``tempstore.TempStorage``) creates the index folder; default: the system one.
+    """
     path = Path(path).resolve()
     header, radices, body = _csv_header(path)
     specs = _column_specs(header, radices)
-    storage = tempfile.TemporaryDirectory(prefix="ila_wave_")
+    storage = storage_or_default(temp).create("ila_wave_")
     folder = Path(storage.name)
     mapped = []
     try:

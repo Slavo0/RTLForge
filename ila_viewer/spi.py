@@ -31,7 +31,7 @@ import tempfile
 import numpy as np
 
 from .bits import BitCodec
-from .data import LoadCancelled
+from .data import LoadCancelled, search_sorted
 from .files import atomic_write
 
 # Field kinds.
@@ -550,7 +550,7 @@ class _LineSampler:
     def at(self, positions):
         if self.signal is None:
             return np.full(len(positions), -1, dtype=np.int8)
-        index = np.searchsorted(self.signal.starts, positions, side="right") - 1
+        index = search_sorted(self.signal.starts, positions, "right") - 1
         np.maximum(index, 0, out=index)
         return self.lut[np.asarray(self.signal.codes[index], dtype=np.int64)]
 
@@ -803,8 +803,8 @@ class SpiDecoder:
 
     def _edge_chunks(self, start, end, cancel):
         starts, codes = self.sck.starts, self.sck.codes
-        first = max(1, int(np.searchsorted(starts, start, side="left")))
-        last = int(np.searchsorted(starts, end, side="left"))
+        first = max(1, search_sorted(starts, start, "left"))
+        last = search_sorted(starts, end, "left")
         rising_edge = self.settings.sample_edge == "rising"
         for a in range(first, last, self.BLOCK):
             if cancel():
@@ -1134,7 +1134,7 @@ class SpiDecodeResult:
     def frame_at(self, sample):
         if not self.frame_count:
             return None
-        index = int(np.searchsorted(self.frames["start"], sample, side="right")) - 1
+        index = search_sorted(self.frames["start"], sample, "right") - 1
         return index if index >= 0 and sample < int(self.frames["end"][index]) else None
 
     def command_name(self, opcode):
@@ -1247,8 +1247,8 @@ class DecodedTrack:
         fields = self.fields
         if not len(fields):
             return 0, 0
-        first = int(np.searchsorted(fields["end"], left, side="right"))
-        stop = int(np.searchsorted(fields["start"], right, side="left"))
+        first = search_sorted(fields["end"], left, "right")
+        stop = search_sorted(fields["start"], right, "left")
         return first, max(first, stop)
 
     def busy(self, edges):
@@ -1260,7 +1260,7 @@ class DecodedTrack:
         edges = np.asarray(edges, dtype=np.float64)
         if not len(fields) or len(edges) < 2:
             return
-        indices = np.searchsorted(fields["end"], edges[:-1], side="right")
+        indices = search_sorted(fields["end"], edges[:-1], "right")
         valid = indices < len(fields)
         active = np.zeros(len(indices), dtype=bool)
         active[valid] = fields["start"][indices[valid]] < edges[1:][valid]
@@ -1272,7 +1272,7 @@ class DecodedTrack:
         fields = self.fields
         if not len(fields):
             return None
-        index = int(np.searchsorted(fields["start"], sample, side="right")) - 1
+        index = search_sorted(fields["start"], sample, "right") - 1
         return index if index >= 0 and sample < int(fields["end"][index]) else None
 
     def label_at(self, sample):
@@ -1293,11 +1293,11 @@ class DecodedTrack:
         if not len(starts):
             return None
         if direction > 0:
-            index = int(np.searchsorted(starts, sample, side="right"))
+            index = search_sorted(starts, sample, "right")
             if index < len(starts):
                 return int(starts[index]), False
             return (int(starts[0]), True) if wrap else None
-        index = int(np.searchsorted(starts, sample, side="left")) - 1
+        index = search_sorted(starts, sample, "left") - 1
         if index >= 0:
             return int(starts[index]), False
         return (int(starts[-1]), True) if wrap else None
@@ -1315,17 +1315,17 @@ class DecodedTrack:
         starts, ends = fields["start"], fields["end"]
         candidates = []
         if direction > 0:
-            i = int(np.searchsorted(starts, sample, side="right"))
+            i = search_sorted(starts, sample, "right")
             if i < len(starts):
                 candidates.append(int(starts[i]))
-            j = int(np.searchsorted(ends, sample, side="right"))
+            j = search_sorted(ends, sample, "right")
             if j < len(ends) and self._frame_last(j):
                 candidates.append(int(ends[j]))
             return min(candidates) if candidates else None
-        i = int(np.searchsorted(starts, sample, side="left")) - 1
+        i = search_sorted(starts, sample, "left") - 1
         if i >= 0:
             candidates.append(int(starts[i]))
-        j = int(np.searchsorted(ends, sample, side="left")) - 1
+        j = search_sorted(ends, sample, "left") - 1
         if j >= 0 and self._frame_last(j):
             candidates.append(int(ends[j]))
         return max(candidates) if candidates else None
@@ -1506,7 +1506,7 @@ class FieldOverlay:
         edges = np.asarray(edges, dtype=np.float64)
         if not len(fields) or len(edges) < 2:
             return
-        indices = np.searchsorted(fields["end"], edges[:-1], side="right")
+        indices = search_sorted(fields["end"], edges[:-1], "right")
         valid = indices < len(fields)
         active = np.zeros(len(indices), dtype=bool)
         probe = np.asarray(fields[indices[valid]])
@@ -1530,8 +1530,8 @@ class ClockEdgeMarks:
     def visible(self, left, right, limit):
         """Sample-edge positions in [left, right), or None when there are more than ``limit``."""
         starts = self.signal.starts
-        first = max(1, int(np.searchsorted(starts, left, side="left")))
-        last = int(np.searchsorted(starts, right, side="left"))
+        first = max(1, search_sorted(starts, left, "left"))
+        last = search_sorted(starts, right, "left")
         if last <= first:
             return np.empty(0, dtype=np.int64)
         if last - first > 2 * limit:
@@ -1544,7 +1544,7 @@ class ClockEdgeMarks:
         if self.result.config.pins.cs is not None and len(positions):
             if not len(frames):
                 return np.empty(0, dtype=np.int64)
-            index = np.searchsorted(frames["start"], positions, side="right") - 1
+            index = search_sorted(frames["start"], positions, "right") - 1
             inside = index >= 0
             inside[inside] = positions[inside] < np.asarray(frames["end"])[index[inside]]
             positions = positions[inside]
@@ -1631,8 +1631,8 @@ class SpiExportService:
             return
         fields = result.lanes[lane]
         end = request.end if request.end is not None else result.capture_count
-        first = int(np.searchsorted(fields["start"], request.start, side="left"))
-        stop = int(np.searchsorted(fields["start"], end, side="left"))
+        first = search_sorted(fields["start"], request.start, "left")
+        stop = search_sorted(fields["start"], end, "left")
         for a in range(first, stop, self.CHUNK):
             if cancel():
                 raise LoadCancelled()

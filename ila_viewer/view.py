@@ -22,6 +22,7 @@ from .selection import RowSelection
 from .timebase import capture_axis
 from .annotations import SignalAnnotations
 from .bookmarks import BookmarkModel
+from .viewport import viewport_transform
 
 
 class WaveformView(QAbstractScrollArea):
@@ -41,12 +42,14 @@ class WaveformView(QAbstractScrollArea):
     ROW = 48
     SCROLL_STEPS = 1_000_000
     INDENT = 28
+    UNDO_DEPTH = 50
 
     def __init__(self, parent=None, themes=None, menus=None, source_navigator=None, preferences=None,
                  bookmarks=None):
         super().__init__(parent)
         self.capture: Capture | None = None
         self.tree = SignalTree()
+        self.removed_history = []  # RemovedRows batches for Ctrl+Z, current capture only
         self.rows = []
         self.filter_text = ""
         self.themes = themes or ThemeManager()
@@ -146,10 +149,12 @@ class WaveformView(QAbstractScrollArea):
         self.drop_target = None
         self.zoom_band = None
         self.capture = capture
+        self._transform = None  # never keep the previous capture alive through the cache
         self.period_markers = [None, None]
         self.period_marker_target = None
         self.period_mode = False
         self.tree = SignalTree(capture.signals, capture.metadata, capture.split_buses)
+        self.removed_history = []
         self.filter_text = ""
         self.selected = 0
         self.selection = RowSelection()
@@ -300,6 +305,36 @@ class WaveformView(QAbstractScrollArea):
     def time_axis(self):
         """Simulator time, or the ILA sample period entered by the user; None means samples only."""
         return capture_axis(self.capture, self.period_ns)
+
+    def delete_selected(self):
+        """Remove the selected rows (signals, bits, groups...) from the view, not from the capture."""
+        nodes = self.selected_nodes
+        if not nodes:
+            return False
+        position = self.selected
+        removed = self.tree.remove_many(nodes)
+        if not removed:
+            return False
+        self.removed_history.append(removed)
+        del self.removed_history[:-self.UNDO_DEPTH]
+        self.rows = self.tree.rows(self.filter_text, reverse_bits=self.preferences.reverse_bit_rows)
+        follow = self.rows[min(position, len(self.rows) - 1)].node if self.rows else None
+        self.selection.ids = set()
+        self.refresh_rows(follow)
+        count = len(removed.entries)
+        self.message.emit(f"Убрано строк из списка: {count} · Ctrl+Z — вернуть")
+        return True
+
+    def undo_delete(self):
+        if not self.removed_history:
+            return False
+        restored = self.tree.restore(self.removed_history.pop())
+        if restored:
+            self.refresh_rows(restored[0])
+            self.selection.ids = {node.id for node in restored}
+            self.selectionChanged.emit()
+            self.viewport().update()
+        return bool(restored)
 
     def reverse_bits(self, checked):
         if self.current_node and self.current_node.kind == "bus":
@@ -457,22 +492,24 @@ class WaveformView(QAbstractScrollArea):
             else:
                 self.set_cursor(sample)
 
+    def transform(self):
+        """The sample <-> x mapping of the current range and geometry, rebuilt only on change."""
+        capture = self.capture
+        times = getattr(capture, "times", None)
+        geometry = (getattr(capture, "count", None), self.left, self.span, self.plot_left, self.plot_width)
+        cached = getattr(self, "_transform", None)
+        # The capture and its times are compared by identity, the numbers by value.
+        if cached is None or cached[0] is not capture or cached[1] is not times or cached[2] != geometry:
+            cached = (capture, times, geometry,
+                      viewport_transform(capture, self.left, self.span, self.plot_left, self.plot_width))
+            self._transform = cached
+        return cached[3]
+
     def sample_x(self, sample):
-        if self.capture and self.capture.times is not None:
-            origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(self.left)))])
-            left = self.capture.time_offset_at(self.left, origin)
-            right = self.capture.time_offset_at(self.left + self.span, origin)
-            return self.plot_left + (self.capture.time_offset_at(sample, origin) - left) / max(1, right - left) * self.plot_width
-        return self.plot_left + (sample - self.left) / self.span * self.plot_width
+        return WaveformView.transform(self).x(sample)
 
     def x_sample(self, x):
-        if self.capture and self.capture.times is not None:
-            origin = int(self.capture.times[max(0, min(self.capture.count - 1, int(self.left)))])
-            left = self.capture.time_offset_at(self.left, origin)
-            right = self.capture.time_offset_at(self.left + self.span, origin)
-            offset = left + (x - self.plot_left) / self.plot_width * (right - left)
-            return float(self.capture.samples_at_offsets([offset], origin)[0])
-        return self.left + (x - self.plot_left) / self.plot_width * self.span
+        return WaveformView.transform(self).sample(x)
 
     def nearest_sample(self, x):
         return max(0, min(self.capture.count - 1, math.floor(self.x_sample(x) + 0.5)))
@@ -672,6 +709,12 @@ class WaveformView(QAbstractScrollArea):
                 self.selection.anchor = self.rows[0].node.id
                 self.selectionChanged.emit()
                 self.viewport().update()
+            event.accept()
+        elif key == Qt.Key.Key_Delete and not self.period_mode:
+            self.delete_selected()
+            event.accept()
+        elif key == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.undo_delete()
             event.accept()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             direction = -1 if key == Qt.Key.Key_Left else 1

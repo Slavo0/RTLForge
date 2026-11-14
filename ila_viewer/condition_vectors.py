@@ -17,6 +17,8 @@ import operator
 
 import numpy as np
 
+from .data import search_sorted
+
 _INT64 = (-(1 << 63), (1 << 63) - 1)
 _NUMERIC_OPS = {"==": np.equal, "!=": np.not_equal, "<": np.less, ">": np.greater,
                 "<=": np.less_equal, ">=": np.greater_equal}
@@ -152,7 +154,7 @@ class VectorEvaluator:
         if key not in self._codes:
             source = leaf.source
             targets = np.maximum(self.previous, 0) if leaf.lag else self.at
-            runs = np.searchsorted(source.starts, targets, side="right") - 1
+            runs = search_sorted(source.starts, targets, "right") - 1
             self._codes[key] = np.asarray(source.codes[np.maximum(runs, 0)], dtype=np.int64)
         return self._codes[key]
 

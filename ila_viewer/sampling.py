@@ -24,7 +24,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .data import LoadCancelled
+from .data import LoadCancelled, search_sorted
 
 CLOCK_NAME = re.compile(r"clk|clock|sck", re.IGNORECASE)
 
@@ -194,12 +194,12 @@ class EdgeSampling(SamplingGrid):
 
     def edges(self, lower, upper, cancel=lambda: False):
         """All edge samples in [lower, upper), chunked to bound memory."""
-        first = int(np.searchsorted(self.signal.starts, lower, side="left"))
-        last = int(np.searchsorted(self.signal.starts, upper, side="left"))
+        first = search_sorted(self.signal.starts, lower, "left")
+        last = search_sorted(self.signal.starts, upper, "left")
         yield from self._edge_chunks(first, last, cancel)
 
     def _edge_before(self, sample, cancel):
-        last = int(np.searchsorted(self.signal.starts, sample, side="left"))
+        last = search_sorted(self.signal.starts, sample, "left")
         for chunk in self._edge_chunks(1, last, cancel, reverse=True):
             if len(chunk):
                 return int(chunk[0])
@@ -236,12 +236,12 @@ class EdgeSampling(SamplingGrid):
     def _span_starts(self, edges, ticks):
         """First row whose time lies within one typical period before each edge."""
         times = np.asarray(self.times[edges], dtype=np.int64)
-        return np.searchsorted(self.times, times - ticks, side="left").astype(np.int64)
+        return search_sorted(self.times, times - ticks, "left").astype(np.int64)
 
     def _span_ends(self, edges, ticks):
         """Exclusive row bound one typical period after each edge."""
         times = np.asarray(self.times[edges], dtype=np.int64)
-        return np.searchsorted(self.times, times + ticks, side="left").astype(np.int64)
+        return search_sorted(self.times, times + ticks, "left").astype(np.int64)
 
     def _span(self):
         """Idle cap: (rows, None) for CSV rows, (None, ticks) for timestamped captures."""
@@ -277,7 +277,7 @@ class EdgeSampling(SamplingGrid):
         previous = -1 if before is None else before
         for chunk in self.edges(lower, count, cancel):
             edges = np.concatenate((carry, np.asarray(chunk, dtype=np.int64)))
-            beyond = int(np.searchsorted(edges, upper, side="left"))
+            beyond = search_sorted(edges, upper, "left")
             if beyond < len(edges):
                 if beyond:
                     yield self._chunk(edges[:beyond], previous, edges[1:beyond + 1], span)
